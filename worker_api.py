@@ -182,6 +182,8 @@ def _build_app():
         max_retries: int = 2
         text2: str = ""          # step 5: optional Rubika second text (always text)
         recipients: list = []    # resume fix: explicit remaining list (frozen order)
+        mode: str = "marker"      # 'marker' (forward) or 'text' (plain send_text)
+        text: str = ""           # body for 'text' mode (no forward)
 
     class AutomationIn(BaseModel):
         phone: str
@@ -195,6 +197,7 @@ def _build_app():
     class PrepareIn(BaseModel):
         phone: str
         marker: str
+        mode: str = "marker"      # 'marker' (needs a marked post) or 'text'
 
     class PhoneIn(BaseModel):
         phone: str
@@ -409,6 +412,11 @@ def _build_app():
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
+            # 'text' mode sends a plain message (no forward) -> no marked post
+            # is required; we only need the recipient count.
+            if (getattr(body, "mode", "marker") or "marker").lower() == "text":
+                ordered, _stats = await rb.get_ordered_recipients(client)
+                return {"ok": True, "marker_found": True, "total": len(ordered)}
             saved_guid, mid = await rb.find_marked_message(client, body.marker)
             if not mid:
                 return {"ok": True, "marker_found": False, "total": 0}
@@ -466,6 +474,7 @@ def _build_app():
                 # contact re-read -> no overlap between channels.
                 guids = list(body.guids)
                 added = 0
+                failed_batches = 0
                 step = max(1, int(body.batch))
                 for i in range(0, len(guids), step):
                     chunk = guids[i:i + step]
@@ -473,9 +482,20 @@ def _build_app():
                         await rb.add_channel_members(client, body.channel_guid, chunk)
                         added += len(chunk)
                     except Exception:
-                        pass
+                        # keep going with the remaining batches, but no longer
+                        # pretend the failed batch succeeded (old code swallowed
+                        # this silently and still reported CHANNEL DONE).
+                        failed_batches += 1
                     if i + step < len(guids):
                         await asyncio.sleep(max(0.0, float(body.delay)))
+                # Incremental, backward-compatible metrics. `added` is kept for
+                # old callers; `accepted` is the same value but named honestly
+                # ("accepted by the add API", NOT a verified member count).
+                requested = len(guids)
+                return {"ok": True, "added": added,
+                        "requested": requested, "accepted": added,
+                        "failed": max(0, requested - added),
+                        "failed_batches": failed_batches}
             else:
                 added = await rb.seed_channel_with_contacts(
                     client, body.channel_guid, target=body.target,
@@ -496,13 +516,19 @@ def _build_app():
         await account_conn.close(body.phone)   # ensure single connection (Feature 6)
         client = rb.open_client(body.phone)
         await rb.connect_ready(client)
-        saved_guid, mid = await rb.find_marked_message(client, body.marker)
-        if not mid:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-            return {"ok": False, "marker_found": False, "total": 0}
+        send_mode = (getattr(body, "mode", "marker") or "marker").lower()
+        # 'text' mode: no marked post needed. Keep saved_guid/mid None; the send
+        # loop uses body.text via rb.send_text (same primitive as /send/to_list).
+        if send_mode == "text":
+            saved_guid = mid = None
+        else:
+            saved_guid, mid = await rb.find_marked_message(client, body.marker)
+            if not mid:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return {"ok": False, "marker_found": False, "total": 0}
         # YoudonoaAx UPDATE (resume fix): if the master supplies an explicit
         # recipient list (a resume / worker-transfer of the REMAINING list),
         # send EXACTLY that list in the given order. Otherwise build the full
@@ -1444,10 +1470,16 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                 guid = recipients[idx]
                 idx += 1
                 try:
-                    await asyncio.wait_for(
-                        rb.forward_message(client, saved_guid, guid, mid),
-                        timeout=body.send_timeout,
-                    )
+                    if (getattr(body, "mode", "marker") or "marker").lower() == "text":
+                        await asyncio.wait_for(
+                            rb.send_text(client, guid, getattr(body, "text", "") or ""),
+                            timeout=body.send_timeout,
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            rb.forward_message(client, saved_guid, guid, mid),
+                            timeout=body.send_timeout,
+                        )
                     # step 5: optional second text (always text) to the SAME
                     # recipient, right after the forward. Best-effort: a failure
                     # of the second text must NOT undo the successful forward.
