@@ -418,7 +418,7 @@ def main_menu(owner: bool = True):
          Button.inline("⚙️ سرعت ارسال", b"speed")],
         [Button.inline("🛠 ورکرها", b"workers"),
          Button.inline("💾 بکاپ", b"backup")],
-        [Button.inline("🏭 موتور مولد", b"generator")],
+        [Button.inline("🧠 مغز کانال", b"cbrain")],
         [Button.inline("🖼 آرشیو عکس پیوی (PDF)", b"pvexport")],
         [Button.inline("📤 ارسال چند اکانت", b"multisend"),
          Button.inline("🧠 مغز", b"brain")],
@@ -1123,12 +1123,14 @@ async def message_router(event):
         await handle_rp_delay(event)
     elif step == "await_psync":
         await handle_psync_input(event)
-    elif step == "await_bc_title":
-        await handle_bc_title(event)
-    elif step == "await_bc_target":
-        await handle_bc_target(event)
-    elif step == "await_bc_gap":
-        await handle_bc_gap(event)
+    elif step == "await_cb_title":
+        await handle_cb_title(event)
+    elif step == "await_cb_count":
+        await handle_cb_count(event)
+    elif step == "await_cb_per":
+        await handle_cb_per(event)
+    elif step == "await_cb_prefix":
+        await handle_cb_prefix(event)
     elif step in ("wk_ip", "wk_port", "wk_user", "wk_pass"):
         await handle_worker_step(event, step)
     elif step == "await_contacts_file":
@@ -4404,260 +4406,466 @@ async def automation_shared_join_cb(event):
 
 
 # --------------------------------------------------------------------------- #
-# 🏭 Generator engine (موتور مولد): one account creates a channel/group, the
-# others join it, the owner makes them admins (we poll user_is_admin), then all
-# accounts seed their contacts (sequentially, anti-duplicate). Fully logged.
-# Local accounts go through account_conn; worker accounts via /gen/* endpoints.
-# Never touches the automation logic or the base source.
+# 🧠 Channel Brain (مغز کانال): ONE account builds N identical channels. For
+# each channel it discovers a FRESH, non-overlapping slice of contacts (the
+# base discovery ledger guarantees no repeats), creates the channel (same
+# title, no tag/username), adds EXACTLY that slice, then sends the content
+# (marker) to the channel. Sequential and resilient: any failure on one
+# channel is logged on a separate error card and the run keeps going. Reuses
+# base primitives only — _discover_for_account / rb.create_channel /
+# rb.add_channel_members / _send_to_guids and the worker endpoints
+# /channel/create · /channel/add · /send/to_list. Replaces the old broadcaster
+# UI; the broadcaster DB helpers stay untouched.
 # --------------------------------------------------------------------------- #
-def generator_menu_text():
-    b = db.get_broadcaster()
-    sel = db.list_broadcaster_account_ids()
-    return card("📢 پخش کانالی (موتور مولد)", [
-        f"اسم مشترک کانال‌ها : {b.get('title') or '—'}",
-        f"اکانت‌های انتخاب‌شده : {len(sel)}",
-        f"سقف عضوگیری (هر کانال) : {b.get('member_target')}",
-        f"فاصله بین اکانت‌ها : {b.get('gap_seconds')} ثانیه",
+def _cbrain_cfg() -> dict:
+    aid = db.get_setting("cbrain_account_id", "") or ""
+    try:
+        acc = db.get_account(int(aid)) if str(aid).strip() else None
+    except Exception:
+        acc = None
+    return {
+        "account": acc,
+        "title": db.get_setting("cbrain_title", "") or "",
+        "count": db.get_int_setting("cbrain_count", 0),
+        "per_channel": db.get_int_setting("cbrain_per_channel", db.get_discovery_target()),
+        "prefix": db.get_setting("cbrain_prefix", "") or "",
+    }
+
+
+def cbrain_menu_text():
+    c = _cbrain_cfg()
+    acc = c["account"]
+    return card("🧠 مغز کانال", [
+        f"👤 اکانت : {acc['phone'] if acc else '—'}",
+        f"🎛 اسم کانال‌ها : {c['title'] or '—'}",
+        f"🔢 تعداد کانال : {c['count'] or '—'}",
+        f"👥 مخاطب هر کانال : {c['per_channel']}",
+        f"☎️ پیش‌شماره کشف : {c['prefix'] or '—'}",
         LINE,
-        "هر اکانتِ انتخابی، کانالِ خودش رو می‌سازه (با اسم مشترک + یوزرنیم رندوم)، "
-        "پیامِ مارکر رو می‌فرسته، و مخاطبینِ خودش رو عضو می‌کنه. نوبتی + لاگ کامل.",
+        "یک اکانت انتخاب کن، اسمِ کانال و تعداد رو بده. برای هر کانال مخاطبِ "
+        "تازه کشف می‌شه (جدا و بدون تکرار)، کانال ساخته می‌شه، مخاطب‌ها اضافه "
+        "می‌شن، بعد مارکر ارسال می‌شه. نوبتی و بدون توقف.",
     ])
 
 
-def generator_menu_buttons():
+def cbrain_menu_buttons():
     return [
-        [Button.inline("✏️ اسم مشترک کانال", b"bc_title")],
-        [Button.inline("👥 انتخاب اکانت‌ها", b"bc_accounts"),
-         Button.inline("🎯 سقف عضوگیری", b"bc_target")],
-        [Button.inline("⏱ فاصله بین اکانت‌ها", b"bc_gap")],
-        [Button.inline("▶️ شروع پخش کانالی", b"bc_start")],
+        [Button.inline("👤 انتخاب اکانت", b"cb_acc")],
+        [Button.inline("✏️ اسم کانال", b"cb_title"),
+         Button.inline("🔢 تعداد کانال", b"cb_count")],
+        [Button.inline("👥 مخاطب هر کانال", b"cb_per"),
+         Button.inline("☎️ پیش‌شماره کشف", b"cb_prefix")],
+        [Button.inline("▶️ شروع مغز کانال", b"cb_start")],
         [Button.inline("🔙 بازگشت", b"home")],
     ]
 
 
-@bot.on(events.CallbackQuery(data=b"generator"))
-async def generator_menu_cb(event):
+@bot.on(events.CallbackQuery(data=b"cbrain"))
+async def cbrain_menu_cb(event):
     if not is_owner(event):
         return
     state.pop(event.sender_id, None)
-    await safe_edit(event, generator_menu_text(), buttons=generator_menu_buttons())
+    await safe_edit(event, cbrain_menu_text(), buttons=cbrain_menu_buttons())
 
 
-@bot.on(events.CallbackQuery(data=b"bc_title"))
-async def bc_title_cb(event):
-    if not is_owner(event):
-        return
-    state[event.sender_id] = {"step": "await_bc_title"}
-    await safe_edit(event, "✏️ اسمِ مشترکِ کانال‌ها رو بفرست (همه‌ی کانال‌ها این اسم رو می‌گیرن):",
-                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
-
-
-async def handle_bc_title(event):
-    title = event.raw_text.strip()
-    if not title:
-        await event.respond("اسم خالیه. دوباره بفرست.")
-        return
-    db.set_broadcaster(title=title)
-    state.pop(event.sender_id, None)
-    await event.respond(f"✅ اسم مشترک روی «{title}» تنظیم شد.",
-                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
-
-
-@bot.on(events.CallbackQuery(data=b"bc_accounts"))
-async def bc_accounts_cb(event):
+@bot.on(events.CallbackQuery(data=b"cb_acc"))
+async def cbrain_acc_cb(event):
     if not is_owner(event):
         return
     accounts = db.list_accounts()
     if not accounts:
         await event.answer("اول یک اکانت اضافه کن.", alert=True)
         return
-    sel = set(db.list_broadcaster_account_ids())
+    sel = db.get_setting("cbrain_account_id", "") or ""
     rows = []
     for a in accounts:
-        mark = "✅" if a["id"] in sel else "⬜️"
+        mark = "🔘" if str(a["id"]) == str(sel) else "⚪️"
         rows.append([Button.inline(f"{mark} {a['phone']}",
-                                   f"bcacc_{a['id']}".encode())])
-    rows.append([Button.inline("🔙 بازگشت", b"generator")])
-    await safe_edit(event, "👥 اکانت‌هایی که کانال می‌سازن رو انتخاب کن (بزن تا تیک بخوره):",
+                                   f"cbacc_{a['id']}".encode())])
+    rows.append([Button.inline("🔙 بازگشت", b"cbrain")])
+    await safe_edit(event, "👤 یک اکانت برای مغز کانال انتخاب کن (تک‌انتخابی):",
                     buttons=rows)
 
 
-@bot.on(events.CallbackQuery(pattern=b"bcacc_(\\d+)"))
-async def bc_acc_toggle_cb(event):
+@bot.on(events.CallbackQuery(pattern=b"cbacc_(\\d+)"))
+async def cbrain_acc_pick_cb(event):
     if not is_owner(event):
         return
-    db.toggle_broadcaster_account(int(event.pattern_match.group(1)))
-    await bc_accounts_cb(event)
+    db.set_setting("cbrain_account_id", str(int(event.pattern_match.group(1))))
+    await cbrain_menu_cb(event)
 
 
-@bot.on(events.CallbackQuery(data=b"bc_target"))
-async def bc_target_cb(event):
+@bot.on(events.CallbackQuery(data=b"cb_title"))
+async def cbrain_title_cb(event):
     if not is_owner(event):
         return
-    state[event.sender_id] = {"step": "await_bc_target"}
-    await safe_edit(event, "🎯 سقفِ عضوگیری برای هر کانال رو بفرست (عدد، مثلاً 300):",
-                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+    state[event.sender_id] = {"step": "await_cb_title"}
+    await safe_edit(event, "✏️ اسمِ کانال‌ها رو بفرست (همه‌ی کانال‌ها این اسم رو می‌گیرن):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
 
 
-async def handle_bc_target(event):
+async def handle_cb_title(event):
+    title = event.raw_text.strip()
+    if not title:
+        await event.respond("اسم خالیه. دوباره بفرست.")
+        return
+    db.set_setting("cbrain_title", title)
+    state.pop(event.sender_id, None)
+    await event.respond(f"✅ اسم کانال‌ها روی «{title}» تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
+
+
+@bot.on(events.CallbackQuery(data=b"cb_count"))
+async def cbrain_count_cb(event):
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_cb_count"}
+    await safe_edit(event, "🔢 چند تا کانال می‌خوای؟ (عدد بفرست، مثلاً 5):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
+
+
+async def handle_cb_count(event):
     try:
         n = max(1, int(event.raw_text.strip()))
     except ValueError:
         await event.respond("یه عدد بفرست.")
         return
-    db.set_broadcaster(member_target=n)
+    db.set_setting("cbrain_count", str(n))
     state.pop(event.sender_id, None)
-    await event.respond(f"✅ سقف عضوگیری روی {n} تنظیم شد.",
-                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+    await event.respond(f"✅ تعداد کانال روی {n} تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
 
 
-@bot.on(events.CallbackQuery(data=b"bc_gap"))
-async def bc_gap_cb(event):
+@bot.on(events.CallbackQuery(data=b"cb_per"))
+async def cbrain_per_cb(event):
     if not is_owner(event):
         return
-    state[event.sender_id] = {"step": "await_bc_gap"}
-    await safe_edit(event, "⏱ فاصله بین اکانت‌ها رو به ثانیه بفرست (مثلاً 8):",
-                    buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+    state[event.sender_id] = {"step": "await_cb_per"}
+    await safe_edit(event, "👥 برای هر کانال چند مخاطب کشف بشه؟ (عدد بفرست، مثلاً 150):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
 
 
-async def handle_bc_gap(event):
+async def handle_cb_per(event):
     try:
         n = max(1, int(event.raw_text.strip()))
     except ValueError:
-        await event.respond("یه عدد (ثانیه) بفرست.")
+        await event.respond("یه عدد بفرست.")
         return
-    db.set_broadcaster(gap_seconds=n)
+    db.set_setting("cbrain_per_channel", str(n))
     state.pop(event.sender_id, None)
-    await event.respond(f"✅ فاصله روی {n} ثانیه تنظیم شد.",
-                        buttons=[[Button.inline("🔙 بازگشت", b"generator")]])
+    await event.respond(f"✅ مخاطب هر کانال روی {n} تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
 
 
-@bot.on(events.CallbackQuery(data=b"bc_start"))
-async def bc_start_cb(event):
+@bot.on(events.CallbackQuery(data=b"cb_prefix"))
+async def cbrain_prefix_cb(event):
     if not is_owner(event):
         return
-    b = db.get_broadcaster()
-    sel = db.list_broadcaster_account_ids()
-    if not b.get("title"):
-        await event.answer("اول اسمِ مشترک رو تنظیم کن.", alert=True)
+    state[event.sender_id] = {"step": "await_cb_prefix"}
+    await safe_edit(event, "☎️ پیش‌شماره‌ی کشف مخاطب رو بفرست (مثلاً 0913 یا 09135646):",
+                    buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
+
+
+async def handle_cb_prefix(event):
+    prefix = _clean_prefix(event.raw_text.strip())
+    if not prefix:
+        await event.respond("پیش‌شماره نامعتبره. دوباره بفرست (مثلاً 0913).")
         return
-    if not sel:
-        await event.answer("اول حداقل یک اکانت انتخاب کن.", alert=True)
+    db.set_setting("cbrain_prefix", prefix)
+    state.pop(event.sender_id, None)
+    await event.respond(f"✅ پیش‌شماره روی «{prefix}» تنظیم شد.",
+                        buttons=[[Button.inline("🔙 بازگشت", b"cbrain")]])
+
+
+@bot.on(events.CallbackQuery(data=b"cb_start"))
+async def cbrain_start_cb(event):
+    if not is_owner(event):
+        return
+    c = _cbrain_cfg()
+    if not c["account"]:
+        await event.answer("اول یک اکانت انتخاب کن.", alert=True)
+        return
+    if not c["title"]:
+        await event.answer("اول اسمِ کانال رو تنظیم کن.", alert=True)
+        return
+    if not c["count"]:
+        await event.answer("اول تعدادِ کانال رو تنظیم کن.", alert=True)
+        return
+    if not c["prefix"]:
+        await event.answer("اول پیش‌شماره‌ی کشف رو تنظیم کن.", alert=True)
+        return
+    if cbrain_jobs.get(event.sender_id):
+        await event.answer("یک مغز کانال همین حالا در حال اجراست.", alert=True)
         return
     await safe_edit(event,
-        f"📢 پخش کانالی شروع شد روی {len(sel)} اکانت. نوبتی و با لاگ کامل پیش می‌ره.",
-        buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
-    asyncio.create_task(run_broadcaster(event.sender_id))
+        f"🧠 مغز کانال شروع شد: {c['count']} کانال روی {c['account']['phone']}.\n"
+        "پنل پیشرفتِ زنده و گزارش‌ها میان.",
+        buttons=[[Button.inline("⏹ توقف مغز کانال", b"cb_stop")],
+                 [Button.inline("🏠 منوی اصلی", b"home")]])
+    asyncio.create_task(_run_channel_brain(event.sender_id, c))
 
 
-async def _broadcast_one(acc, title, member_target, marker):
-    """Make this account's OWN channel, set a random username, forward the
-    marked post, then seed its OWN contacts. Local or worker."""
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        res = await worker.api_call(w, "POST", "/broadcast/run", {
-            "phone": acc["phone"], "title": title, "marker": marker,
-            "member_target": member_target}, timeout=900)
-        if not res.get("ok"):
-            raise RuntimeError(res.get("error", "broadcast failed"))
-        return res.get("object_guid"), res.get("username", ""), \
-            res.get("forwarded", False), res.get("added", 0)
+@bot.on(events.CallbackQuery(data=b"cb_stop"))
+async def cbrain_stop_cb(event):
+    if not is_owner(event):
+        return
+    ctl = cbrain_jobs.get(event.sender_id)
+    if not ctl:
+        await event.answer("کاری برای توقف نیست.", alert=True)
+        return
+    ctl["stop"] = True
+    ctl["pause"] = False
+    await event.answer("⏹ توقف ثبت شد. بعد از مرحله‌ی جاری متوقف می‌شود.", alert=True)
 
-    async def _do(client):
-        guid = await rb.create_channel(client, title)
-        username = ""
+
+def _cbrain_bar(done, total, width=10):
+    total = max(1, int(total or 0))
+    filled = min(width, int(round(width * min(done, total) / total)))
+    return "█" * filled + "░" * (width - filled)
+
+
+def _cbrain_live_card(ctl) -> str:
+    """Live progress card (English), styled after the user's #channel sketch."""
+    idx = ctl.get("channel_index", 0)
+    total = ctl.get("count", 0)
+    per = ctl.get("per_channel", 0)
+    found = ctl.get("found", 0)
+    added = ctl.get("channel_added", 0)
+    status = "STOPPING" if ctl.get("stop") else "RUNNING"
+    return "\n".join([
+        "| ⚙ - #channel",
+        LINE,
+        f"--| Phone - {ctl.get('phone', '')}",
+        f"• Name CH : {ctl.get('title', '')}",
+        f"• Channel : {idx}/{total}",
+        f"• Phase   : {ctl.get('phase', '-')}",
+        f"• Contacts: {found}/{per}  [{_cbrain_bar(found, per)}]",
+        f"• Added   : {added}",
+        f"• Status  : {status}",
+        LINE,
+        f"--| 🌍 - Worker : {ctl.get('worker_tag', 'local')}",
+        f"⏰ : {now()}",
+    ])
+
+
+async def _cbrain_live_loop(owner_id, ctl, msg):
+    while not ctl.get("finished"):
         try:
-            username = await rb.assign_random_channel_username(client, guid)
-        except Exception:
-            username = ""
-        forwarded = False
-        try:
-            saved_guid, mid = await rb.find_marked_message(client, marker)
-            if mid:
-                await rb.forward_message(client, saved_guid, guid, mid)
-                forwarded = True
-        except Exception:
-            forwarded = False
-        added = 0
-        try:
-            added = await rb.seed_channel_with_contacts(
-                client, guid, target=member_target,
-                batch=config.CHANNEL_ADD_BATCH, delay=config.CHANNEL_ADD_DELAY)
-        except Exception:
-            added = 0
-        return guid, username, forwarded, added
-    return await account_conn.call(acc["phone"], _do, timeout=900)
-
-
-async def run_broadcaster(owner_id: int):
-    b = db.get_broadcaster()
-    title = b.get("title")
-    member_target = int(b.get("member_target") or config.CHANNEL_MEMBER_TARGET)
-    gap = int(b.get("gap_seconds") or config.BROADCAST_GAP_SECONDS)
-    marker = db.get_marker()
-    ids = db.list_broadcaster_account_ids()
-    accounts = [db.get_account(i) for i in ids]
-    accounts = [a for a in accounts if a]
-
-    await log(card("📢 پخش کانالی — شروع", [
-        f"🎛 اسم مشترک : {title}",
-        f"👥 اکانت‌ها : {len(accounts)}",
-        f"🎯 سقف هر کانال : {member_target}",
-        f"⏱ فاصله : {gap}s",
-        f"🕒 {now()}"]))
-
-    made = 0
-    total_added = 0
-    failed = 0
-    # SEQUENTIAL — never parallel (safe for worker accounts too). One account's
-    # failure (auth/hang/anything) must NEVER stop the whole run.
-    for acc in accounts:
-        phone = acc["phone"]
-        try:
-            # hard per-account time cap so one stuck account can't freeze the run
-            guid, username, forwarded, added = await asyncio.wait_for(
-                _broadcast_one(acc, title, member_target, marker), timeout=1200)
-            made += 1
-            total_added += added
-            await log(card("📢 پخش کانالی — کانال ساخته شد ✅", [
-                f"👤 {phone}",
-                f"🆔 {guid}",
-                (f"🔗 @{username}" if username else "⚠️ یوزرنیم ست نشد"),
-                ("📎 پیام مارکر فرستاده شد" if forwarded
-                 else f"⚠️ مارکر «{marker}» پیدا/فرستاده نشد"),
-                f"➕ مخاطبینِ اضافه‌شده : {added}",
-                f"🕒 {now()}"]))
-        except account_conn.InvalidAuthError:
-            failed += 1
-            await _log_invalid_auth(phone)
-            await log("📢 پخش کانالی: این اکانت رد شد، ادامه می‌دیم ➡️")
-        except asyncio.TimeoutError:
-            failed += 1
-            await log(card("📢 پخش کانالی — اکانت کند/هنگ (رد شد)", [
-                f"👤 {phone}", "بیش از حد طول کشید، رد شد و ادامه می‌دیم ➡️",
-                f"🕒 {now()}"]))
-        except Exception as e:  # noqa: BLE001
-            failed += 1
-            await log(card("📢 پخش کانالی — خطا (رد شد، ادامه)", [
-                f"👤 {phone}", f"💥 {repr(e)[:160]}",
-                "این اکانت کانال نساخت، ولی پروسه ادامه داره ➡️",
-                f"🕒 {now()}"]))
-        # gap between accounts — never let the sleep itself break the loop
-        try:
-            await asyncio.sleep(gap)
+            await safe_edit(msg, _cbrain_live_card(ctl),
+                            buttons=[[Button.inline("⏹ توقف مغز کانال", b"cb_stop")]])
         except Exception:
             pass
+        await asyncio.sleep(max(1.0, config.CONTACT_PROGRESS_EVERY))
 
-    await log(card("📢 پخش کانالی — پایان ✅", [
-        f"🎛 اسم : {title}",
-        f"✅ کانال‌های ساخته‌شده : {made}/{len(accounts)}",
-        f"❌ ناموفق : {failed}",
-        f"➕ کلِ مخاطبینِ اضافه‌شده : {total_added}",
-        f"🕒 {now()}"]))
+
+def _cbrain_error_card(phone, ch_index, phase, err) -> str:
+    return card("❌ CHANNEL BRAIN — ERROR", [
+        f"☎️ ACCOUNT : {phone}",
+        f"🔢 CHANNEL : {ch_index}",
+        f"⚙️ PHASE   : {phase}",
+        f"💥 ERROR   : {type(err).__name__}: {str(err)[:300]}",
+        f"⏰ : {now()}",
+    ])
+
+
+async def _cbrain_create_channel(acc, title):
+    """Create ONE channel with the given title (create-only, no marker forward).
+    Local or worker. Returns the channel guid."""
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/channel/create", {
+            "phone": acc["phone"], "marker": "", "title": title,
+            "forward": False}, timeout=120)
+        if not res.get("ok") or not res.get("channel_guid"):
+            raise RuntimeError(res.get("error", "channel create failed"))
+        return res["channel_guid"]
+
+    async def _do(client):
+        return await rb.create_channel(client, title)
+    return await account_conn.call(acc["phone"], _do, timeout=120)
+
+
+async def _cbrain_add_exact(acc, channel_guid, guids):
+    """Add EXACTLY these guids to the channel, in batches. Local or worker.
+    Returns how many were added (best-effort)."""
+    if not guids:
+        return 0
+    batch = config.CHANNEL_ADD_BATCH
+    delay = config.CHANNEL_ADD_DELAY
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/channel/add", {
+            "phone": acc["phone"], "channel_guid": channel_guid,
+            "guids": list(guids), "batch": batch, "delay": delay,
+        }, timeout=1800)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "channel add failed"))
+        return res.get("added", 0)
+
+    async def _do(client):
+        added = 0
+        step = max(1, int(batch))
+        for i in range(0, len(guids), step):
+            chunk = guids[i:i + step]
+            try:
+                await rb.add_channel_members(client, channel_guid, chunk)
+                added += len(chunk)
+            except Exception:
+                pass
+            if i + step < len(guids):
+                await asyncio.sleep(max(0.0, float(delay)))
+        return added
+    return await account_conn.call(acc["phone"], _do, timeout=1800)
+
+
+async def _run_channel_brain(owner_id, cfg):
+    acc = cfg["account"]
+    title = cfg["title"]
+    count = int(cfg["count"])
+    per_channel = int(cfg["per_channel"])
+    prefix = cfg["prefix"]
+    marker = db.get_marker()
+    w = worker.worker_for_account(acc)
+    worker_tag = w["tag"] if (w and not worker.is_local(w)) else "local"
+
+    ctl = {"stop": False, "pause": False, "finished": False,
+           "phone": acc["phone"], "title": title, "count": count,
+           "per_channel": per_channel, "worker_tag": worker_tag,
+           "channel_index": 0, "phase": "START",
+           "found": 0, "probed": 0, "channel_added": 0}
+    cbrain_jobs[owner_id] = ctl
+
+    await log(card("🧠 CHANNEL BRAIN — START", [
+        f"☎️ ACCOUNT : {acc['phone']}",
+        f"🎛 NAME    : {title}",
+        f"🔢 CHANNELS: {count}",
+        f"👥 PER CH  : {per_channel}",
+        f"☎️ PREFIX  : {prefix}",
+        f"🌍 WORKER  : {worker_tag}",
+        f"⏰ : {now()}"]))
+
     try:
-        await bot.send_message(owner_id,
-                               f"📢 پخش کانالی تمام شد.\nکانال: {made}/{len(accounts)} | "
-                               f"مخاطب اضافه‌شده: {total_added}",
+        msg = await bot.send_message(
+            owner_id, _cbrain_live_card(ctl),
+            buttons=[[Button.inline("⏹ توقف مغز کانال", b"cb_stop")]])
+    except Exception:
+        msg = None
+    loop_task = asyncio.create_task(_cbrain_live_loop(owner_id, ctl, msg)) if msg else None
+
+    made = 0
+    total_built = 0
+    total_added = 0
+    account_dead = False
+
+    for ch_index in range(1, count + 1):
+        if ctl.get("stop"):
+            break
+        ctl["channel_index"] = ch_index
+        ctl["found"] = 0
+        ctl["probed"] = 0
+        ctl["channel_added"] = 0
+
+        # ---- Phase 1: BUILD CONTACTS (fresh, non-overlapping slice) ----
+        ctl["phase"] = "BUILD CONTACTS"
+        guids = []
+        try:
+            guids = await _discover_for_account(acc, prefix, per_channel, ctl,
+                                                tag=f"#CH{ch_index} ")
+        except account_conn.InvalidAuthError:
+            account_dead = True
+            db.set_status(acc["id"], "inactive")
+            await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS",
+                                         RuntimeError("session invalid")))
+            break
+        except Exception as e:  # noqa: BLE001
+            await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS", e))
+            continue
+        total_built += len(guids)
+        if ctl.get("stop"):
+            break
+
+        # ---- Phase 2: CREATE CHANNEL (create-only, same title) ----
+        ctl["phase"] = "CREATE CHANNEL"
+        try:
+            channel_guid = await _cbrain_create_channel(acc, title)
+        except account_conn.InvalidAuthError:
+            account_dead = True
+            db.set_status(acc["id"], "inactive")
+            await log(_cbrain_error_card(acc["phone"], ch_index, "CREATE CHANNEL",
+                                         RuntimeError("session invalid")))
+            break
+        except Exception as e:  # noqa: BLE001
+            await log(_cbrain_error_card(acc["phone"], ch_index, "CREATE CHANNEL", e))
+            continue
+
+        # ---- Phase 3: ADD CONTACTS (exact frozen slice) ----
+        ctl["phase"] = "ADD CONTACTS"
+        added = 0
+        try:
+            added = await _cbrain_add_exact(acc, channel_guid, guids)
+        except account_conn.InvalidAuthError:
+            account_dead = True
+            db.set_status(acc["id"], "inactive")
+            await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS",
+                                         RuntimeError("session invalid")))
+            break
+        except Exception as e:  # noqa: BLE001
+            await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS", e))
+            added = 0
+        ctl["channel_added"] = added
+        total_added += added
+
+        # ---- Phase 4: SEND CONTENT (marker -> the channel) ----
+        ctl["phase"] = "SEND CONTENT"
+        if marker:
+            try:
+                await _send_to_guids(owner_id, acc, [channel_guid], "marker", "",
+                                     tag=f"#CH{ch_index} ")
+            except account_conn.InvalidAuthError:
+                account_dead = True
+                db.set_status(acc["id"], "inactive")
+                await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
+                                             RuntimeError("session invalid")))
+                break
+            except Exception as e:  # noqa: BLE001
+                await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT", e))
+        else:
+            await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
+                                         RuntimeError("no marker set — content skipped")))
+
+        made += 1
+        await log(card("🧠 CHANNEL BRAIN — CHANNEL DONE ✅", [
+            f"☎️ ACCOUNT : {acc['phone']}",
+            f"🔢 CHANNEL : {ch_index}/{count}",
+            f"🎛 NAME    : {title}",
+            f"👥 BUILT   : {len(guids)}",
+            f"➕ ADDED   : {added}",
+            f"⏰ : {now()}"]))
+
+    # ---- finish ----
+    ctl["finished"] = True
+    if loop_task:
+        loop_task.cancel()
+    cbrain_jobs.pop(owner_id, None)
+    stopped = ctl.get("stop")
+    status_line = ("🔴 SESSION INVALID" if account_dead
+                   else ("⏹ STOPPED" if stopped else "✅ FINISHED"))
+    final = card("🧠 CHANNEL BRAIN — " + status_line, [
+        f"☎️ ACCOUNT       : {acc['phone']}",
+        f"🎛 NAME          : {title}",
+        f"✅ CHANNELS MADE : {made}/{count}",
+        f"👥 CONTACTS BUILT: {total_built}",
+        f"➕ TOTAL ADDED   : {total_added}",
+        f"⏰ : {now()}"])
+    await log(final)
+    if msg is not None:
+        try:
+            await safe_edit(msg, final,
+                            buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+        except Exception:
+            pass
+    try:
+        await bot.send_message(owner_id, final,
                                buttons=main_menu(owner_id == config.OWNER_ID))
     except Exception:
         pass
@@ -5750,6 +5958,7 @@ multisend_sel = {}                 # owner_id -> set(account_id)
 multisend_stop = {}                # owner_id -> bool
 brain_sel = {}                     # owner_id -> set(account_id)
 brain_jobs = {}                    # owner_id -> dict (per-account collected guids)
+cbrain_jobs = {}                   # owner_id -> live ctl dict for 🧠 مغز کانال
 # Brain stop/pause is now owned by the isolated brain_control.controller
 # (per-owner, mid-account interruptible). See brain_control.py.
 

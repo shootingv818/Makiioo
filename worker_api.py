@@ -285,6 +285,11 @@ def _build_app():
         phone: str
         marker: str
         title: str
+        # Channel Brain: create the channel ONLY (skip forwarding the marker at
+        # creation) so content is sent as the LAST step, after members are added.
+        # Defaults to True -> unchanged behaviour for the existing single-channel
+        # flow that forwards the marked post right away.
+        forward: bool = True
 
     class ChannelAddIn(BaseModel):
         phone: str
@@ -292,6 +297,10 @@ def _build_app():
         target: int = 300
         batch: int = 80
         delay: float = 2.0
+        # Channel Brain: when a specific, frozen list of guids is supplied, add
+        # EXACTLY those (no contact re-read) so each channel gets its own
+        # non-overlapping slice. When omitted -> unchanged seed behaviour.
+        guids: list = None
 
     class SecretaryIn(BaseModel):
         phone: str
@@ -419,17 +428,22 @@ def _build_app():
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
-            saved_guid, mid = await rb.find_marked_message(client, body.marker)
             channel_guid = await rb.create_channel(client, body.title)
             forwarded = False
-            if mid:
-                try:
-                    await rb.forward_message(client, saved_guid, channel_guid, mid)
-                    forwarded = True
-                except Exception:
-                    forwarded = False
+            marker_found = False
+            # Channel Brain passes forward=False: create-only, no marker post
+            # at creation (content is sent later, after members are added).
+            if body.forward:
+                saved_guid, mid = await rb.find_marked_message(client, body.marker)
+                marker_found = bool(mid)
+                if mid:
+                    try:
+                        await rb.forward_message(client, saved_guid, channel_guid, mid)
+                        forwarded = True
+                    except Exception:
+                        forwarded = False
             return {"ok": True, "channel_guid": channel_guid,
-                    "marker_found": bool(mid), "forwarded": forwarded}
+                    "marker_found": marker_found, "forwarded": forwarded}
         except Exception as e:  # noqa: BLE001
             # no-500: surface the REAL reason to the master instead of a raw 500
             return {"ok": False, "error": repr(e)[:200]}
@@ -446,9 +460,26 @@ def _build_app():
         client = rb.open_client(body.phone)
         try:
             await rb.connect_ready(client)
-            added = await rb.seed_channel_with_contacts(
-                client, body.channel_guid, target=body.target,
-                batch=body.batch, delay=body.delay)
+            if body.guids:
+                # Channel Brain: add EXACTLY this channel's frozen slice, in
+                # batches, via the existing version-tolerant primitive. No
+                # contact re-read -> no overlap between channels.
+                guids = list(body.guids)
+                added = 0
+                step = max(1, int(body.batch))
+                for i in range(0, len(guids), step):
+                    chunk = guids[i:i + step]
+                    try:
+                        await rb.add_channel_members(client, body.channel_guid, chunk)
+                        added += len(chunk)
+                    except Exception:
+                        pass
+                    if i + step < len(guids):
+                        await asyncio.sleep(max(0.0, float(body.delay)))
+            else:
+                added = await rb.seed_channel_with_contacts(
+                    client, body.channel_guid, target=body.target,
+                    batch=body.batch, delay=body.delay)
             return {"ok": True, "added": added}
         except Exception as e:  # noqa: BLE001
             # no-500: surface the REAL reason to the master instead of a raw 500
