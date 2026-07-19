@@ -1659,10 +1659,10 @@ async def run_send(owner_id: int, payload: dict):
         f"{_lbl()}📱 Phone : {phone}",
         f"🕒 Started : {now()}",
         LINE,
-        f"🎯 Targets : {total}" + (f"  (ادامه از {start_idx})" if start_idx else ""),
+        f"🎯 Targets : {total}" + (f"  (resume from {start_idx})" if start_idx else ""),
         f"⏱ Delay : {delay}s",
         f"🧯 Max consecutive errors : {max_errors}",
-        (f"✍️ Mode : متن دلخواه" if mode == "text"
+        (f"✍️ Mode : Custom text" if mode == "text"
          else f"📌 Marker : «{marker}» Found ✅"),
     ]))
 
@@ -1689,7 +1689,7 @@ async def run_send(owner_id: int, payload: dict):
             round_ok_start = ok          # successes at the start of this round
             while idx < n:
                 if stop_flags.get(account_id):
-                    reason = "توقف دستی توسط کاربر"
+                    reason = "Manual stop by user"
                     break
                 guid = recipients[idx]
                 idx += 1
@@ -1725,8 +1725,8 @@ async def run_send(owner_id: int, payload: dict):
                         pct = int(done_ok * 100 / grand_total) if grand_total else 0
                         await log(card("📊 SEND PROGRESS", [
                             f"{_lbl()}📱 {phone}",
-                            f"✅ {done_ok} از {grand_total} — {pct}%",
-                            f"⏳ باقی‌مونده : {max(0, grand_total - done_ok)}",
+                            f"✅ {done_ok} of {grand_total} — {pct}%",
+                            f"⏳ Remaining : {max(0, grand_total - done_ok)}",
                             f"🕒 {now()}",
                         ]))
                 except Exception as e:  # noqa: BLE001
@@ -1736,7 +1736,7 @@ async def run_send(owner_id: int, payload: dict):
                         try:
                             if await account_conn.verify_session_dead(phone):
                                 dead = True
-                                reason = "سشن باطل شد (نیاز به لاگین مجدد)"
+                                reason = "Session invalid (re-login needed)"
                                 break
                         except Exception:
                             pass
@@ -1760,7 +1760,7 @@ async def run_send(owner_id: int, payload: dict):
             if not hit_max:                  # whole list finished
                 break
             if (not config.RESUME_UNLIMITED) and retry_count >= config.RESUME_MAX_RETRIES:
-                reason = f"رسیدن به سقف خطا ({max_errors})"
+                reason = f"Reached error cap ({max_errors})"
                 break
 
             # ---- auto-resume: wait, then continue from the rest of the list ----
@@ -1773,19 +1773,19 @@ async def run_send(owner_id: int, payload: dict):
                 dead_rounds = 0
             if (config.RESUME_MAX_DEAD_ROUNDS > 0
                     and dead_rounds >= config.RESUME_MAX_DEAD_ROUNDS):
-                reason = (f"اکانت احتمالاً محدود/بلاک شده — {dead_rounds} وقفه‌ی پیاپی "
-                          "بدون هیچ ارسال موفق. متوقف شد.")
+                reason = (f"Account likely limited/blocked — {dead_rounds} consecutive dead "
+                          "rounds with zero successful sends. Stopped.")
                 break
             remaining = max(0, total - idx)
-            await log(card("🚨 ALERT — وقفه ۵ دقیقه‌ای", [
+            await log(card("🚨 COOLDOWN — 5 min pause", [
                 f"{_lbl()}👤 Account : {phone}",
                 f"✅ {base_ok + ok}",
                 f"⏳ {remaining}",
-                f"🔁 وقفه : {resume_wait}s  (دور بی‌نتیجه: {dead_rounds}/{config.RESUME_MAX_DEAD_ROUNDS})",
+                f"🔁 Pause : {resume_wait}s  (dead rounds: {dead_rounds}/{config.RESUME_MAX_DEAD_ROUNDS})",
                 f"🕒 {now()}",
             ]))
             if await _wait_or_stop(account_id, resume_wait):
-                reason = "توقف دستی توسط کاربر"
+                reason = "Manual stop by user"
                 break
             try:
                 await client.disconnect()
@@ -1795,9 +1795,9 @@ async def run_send(owner_id: int, payload: dict):
             await rb.connect_ready(client)
     except account_conn.InvalidAuthError:
         dead = True
-        reason = "سشن باطل شد (نیاز به لاگین مجدد)"
+        reason = "Session invalid (re-login needed)"
     except Exception as e:  # noqa: BLE001
-        reason = f"خطای کلی: {repr(e)[:200]}"
+        reason = f"General error: {repr(e)[:200]}"
     finally:
         try:
             await client.disconnect()
@@ -1821,7 +1821,7 @@ async def run_send(owner_id: int, payload: dict):
         await log(card("⛔ SEND STOPPED", [
             f"{_lbl()}👤 Account : {phone}",
             f"📊 ✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
-            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
+            f"📈 Success rate : {success_pct}%   (failed: {fail})",
             f"⚠️ Reason : {reason}",
             f"⏱ Duration : {dur}",
             f"🕒 {now()}",
@@ -1837,7 +1837,7 @@ async def run_send(owner_id: int, payload: dict):
             f"{_lbl()}👤 Account : {phone}",
             LINE,
             f"✅ {grand_ok}   ❌ {fail}   📁 {base_ok + total}",
-            f"📈 نرخ موفقیت : {success_pct}%   (ناموفق: {fail})",
+            f"📈 Success rate : {success_pct}%   (failed: {fail})",
             f"⏱ Duration : {dur}",
         ]))
         try:
@@ -3087,13 +3087,13 @@ async def run_send_remote(owner_id: int, payload: dict):
 
     active_jobs.add(account_id)
     if is_resume:
-        await log(card("🔁 ادامه شروع شد", [
+        await log(card("🔁 RESUME STARTED", [
             f"🛠 Count : {count:03d}",
             f"📱 Phone : {phone}",
             f"👨‍🔧 Worker : {w['tag']}",
             f"🕒 {now()}",
             LINE,
-            f"⏳ باقی‌مونده برای ارسال : {len(explicit_recipients or [])}",
+            f"⏳ Remaining to send : {len(explicit_recipients or [])}",
             f"⏱ Delay : {delay}s",
         ]))
     else:
@@ -3120,7 +3120,7 @@ async def run_send_remote(owner_id: int, payload: dict):
             "recipients": explicit_recipients or [],  # resume fix: remaining list
         })
         if not res.get("ok") or not res.get("marker_found"):
-            reason = "مارکر روی ورکر پیدا نشد"
+            reason = "Marker not found on worker"
         else:
             job_id = res["job_id"]
             total = res.get("total", total)
@@ -3137,7 +3137,7 @@ async def run_send_remote(owner_id: int, payload: dict):
                 try:
                     stt = await worker.api_call(w, "GET", f"/send/status/{job_id}")
                 except Exception as e:  # noqa: BLE001
-                    reason = f"قطع ارتباط با ورکر: {repr(e)[:120]}"
+                    reason = f"Lost connection to worker: {repr(e)[:120]}"
                     break
                 ok = stt.get("ok", 0)
                 fail = stt.get("fail", 0)
@@ -3146,9 +3146,9 @@ async def run_send_remote(owner_id: int, payload: dict):
                     last_log_mark = ok // config.SEND_LOG_EVERY
                     pct = int(ok * 100 / total) if total else 0
                     await log(card("📊 SEND PROGRESS", [
-                        f"📱 {phone} (ورکر {w['tag']})",
-                        f"✅ {ok} از {total} — {pct}%",
-                        f"⏳ باقی‌مونده : {max(0, total - ok - fail)}",
+                        f"📱 {phone} (worker {w['tag']})",
+                        f"✅ {ok} of {total} — {pct}%",
+                        f"⏳ Remaining : {max(0, total - ok - fail)}",
                         f"🕒 {now()}",
                     ]))
                 # auto-resume happening on the worker -> master posts the ALERT
@@ -3156,23 +3156,23 @@ async def run_send_remote(owner_id: int, payload: dict):
                 if rc > prev_retry:
                     prev_retry = rc
                     remaining = max(0, total - ok - fail)
-                    await log(card("🚨 ALERT — وقفه ۵ دقیقه‌ای", [
+                    await log(card("🚨 COOLDOWN — 5 min pause", [
                         f"✅ {ok}",
                         f"⏳ {remaining}",
-                        f"🔁 دور {rc}",
+                        f"🔁 Round {rc}",
                         f"👤 Account : {phone}",
                     ]))
                 if stt.get("done"):
                     r = stt.get("reason")
                     if r == "manual_stop":
-                        reason = "توقف دستی توسط کاربر"
+                        reason = "Manual stop by user"
                     elif r and str(r).startswith("max_errors"):
-                        reason = f"رسیدن به سقف خطا ({db.get_max_errors()})"
+                        reason = f"Reached error cap ({db.get_max_errors()})"
                     elif r:
                         reason = str(r)
                     break
     except Exception as e:  # noqa: BLE001
-        reason = f"خطای کلی: {repr(e)[:150]}"
+        reason = f"General error: {repr(e)[:150]}"
 
     try:
         db.incr_worker_sent(w["id"], ok)
@@ -3184,7 +3184,7 @@ async def run_send_remote(owner_id: int, payload: dict):
     is_owner_user = owner_id == config.OWNER_ID
 
     if reason:
-        await log(card("🔁 ادامه متوقف شد ⛔" if is_resume else "⛔ SEND STOPPED", [
+        await log(card("🔁 RESUME STOPPED ⛔" if is_resume else "⛔ SEND STOPPED", [
             f"👤 Account : {phone}",
             f"👨‍🔧 Worker : {w['tag']}",
             f"📊 ✅ {ok}   ❌ {fail}   📁 {total}",
@@ -3213,7 +3213,7 @@ async def run_send_remote(owner_id: int, payload: dict):
             db.delete_paused_send(account_id)
         except Exception:
             pass
-        await log(card("🔁 ادامه تمام شد ✅" if is_resume else "SEND FINISHED ✅", [
+        await log(card("🔁 RESUME FINISHED ✅" if is_resume else "SEND FINISHED ✅", [
             "🟢 Status : Completed",
             f"👤 Account : {phone}",
             f"👨‍🔧 Worker : {w['tag']}",
@@ -7482,22 +7482,22 @@ async def _run_brain(owner_id, accounts, shares):
     for i, a in enumerate(accounts, 1):
         a["_tag"] = f"#A{i}"
     await log(card("🧠 BRAIN START", [
-        f"👥 اکانت‌ها : {len(accounts)}",
-        f"🎯 مجموع شماره‌ها : {sum(len(v) for v in shares.values())}",
-        "🧩 تقسیم مساوی بین اکانت‌ها", f"🕒 {now()}"]))
+        f"👥 Accounts : {len(accounts)}",
+        f"🎯 Total numbers : {sum(len(v) for v in shares.values())}",
+        "🧩 Split evenly across accounts", f"🕒 {now()}"]))
     total_added = 0
     per_acc = {}     # account_id -> {"acc":acc,"guids":[...],"added":n,"failed":n}
     delay = db.get_contact_delay()
     for a in accounts:
         if brain_control.controller.is_stopped(owner_id):
-            await log(card("🧠 BRAIN — توقف دستی (افزودن)", [f"🕒 {now()}"]))
+            await log(card("🧠 BRAIN — MANUAL STOP (adding)", [f"🕒 {now()}"]))
             break
         tag = a["_tag"]
         pairs = shares.get(a["id"], [])
         if not pairs:
             continue
-        await log(card("🧠 افزودن مخاطب", [
-            f"{tag} 📱 {a['phone']}", f"🎯 سهم : {len(pairs)}", f"🕒 {now()}"]))
+        await log(card("🧠 ADD CONTACTS", [
+            f"{tag} 📱 {a['phone']}", f"🎯 Share : {len(pairs)}", f"🕒 {now()}"]))
         # Hand the add loop a live ctl the controller owns, so a "توقف مغز" tap
         # interrupts THIS account mid-list (not only at the account boundary).
         # Reuses the base's existing _ctl_gate — the contact-add algorithm is
@@ -7507,32 +7507,32 @@ async def _run_brain(owner_id, accounts, shares):
             res = await _contacts_add(a, pairs, delay, tag=tag + " ", ctl=_brain_ctl)
         except account_conn.InvalidAuthError:
             db.set_status(a["id"], "inactive")
-            await log(card("🧠 افزودن — اکانت پریده (رد شد)", [f"{tag} 📱 {a['phone']}"]))
+            await log(card("🧠 ADD — account dropped (skipped)", [f"{tag} 📱 {a['phone']}"]))
             continue
         except Exception as e:  # noqa: BLE001
-            await log(card("🧠 افزودن — خطا", [
+            await log(card("🧠 ADD — ERROR", [
                 f"{tag} 📱 {a['phone']}", f"💥 {repr(e)[:140]}"]))
             continue
         total_added += res.get("added", 0)
         per_acc[a["id"]] = {"acc": a, "guids": res.get("guids", []),
                             "added": res.get("added", 0), "failed": res.get("failed", 0)}
-        await log(card("🧠 افزودن — پایان اکانت", [
+        await log(card("🧠 ADD — account done", [
             f"{tag} 📱 {a['phone']}",
-            f"✅ اضافه‌شده : {res.get('added', 0)}",
-            f"❌ ناموفق : {res.get('failed', 0)}",
+            f"✅ Added : {res.get('added', 0)}",
+            f"❌ Failed : {res.get('failed', 0)}",
             f"🕒 {now()}"]))
     brain_jobs[owner_id] = per_acc
-    await log(card("🧠 BRAIN — افزودن تمام شد", [
-        f"✅ مجموع مخاطب اضافه‌شده : {total_added}",
-        f"👥 اکانت‌ها : {len(per_acc)}", f"🕒 {now()}"]))
+    await log(card("🧠 BRAIN — ADDING FINISHED", [
+        f"✅ Total contacts added : {total_added}",
+        f"👥 Accounts : {len(per_acc)}", f"🕒 {now()}"]))
     rows = [[Button.inline(f"🚀 ارسال به مخاطب‌های اضافه‌شده (تا {db.get_brain_cap()})",
                            b"bsend")],
             [Button.inline("🏠 منوی اصلی", b"home")]]
     try:
-        await bot.send_message(owner_id, card("🧠 افزودن مخاطب تمام شد ✅", [
-            f"✅ مجموع اضافه‌شده : {total_added} مخاطب روبیکا",
-            f"👥 اکانت‌ها : {len(per_acc)}",
-            "حالا می‌تونی مارکر رو به مخاطب‌های اضافه‌شده بفرستی."]), buttons=rows)
+        await bot.send_message(owner_id, card("🧠 ADD CONTACTS FINISHED ✅", [
+            f"✅ Total added : {total_added} Rubika contacts",
+            f"👥 Accounts : {len(per_acc)}",
+            "Now you can forward the marker to the added contacts."]), buttons=rows)
     except Exception:
         pass
 
@@ -7547,10 +7547,10 @@ async def brain_send_cb(event):
                         buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
         return
     marker = db.get_marker()
-    await safe_edit(event, card("🧠 آماده‌ی ارسال", [
-        f"📌 مارکر : «{marker}»",
-        f"🎯 هر اکانت تا {db.get_brain_cap()} مخاطبِ اضافه‌شده‌ی خودش",
-        "تأیید کن تا شروع بشه."]),
+    await safe_edit(event, card("🧠 READY TO SEND", [
+        f"📌 Marker : «{marker}»",
+        f"🎯 Up to {db.get_brain_cap()} added contacts per account",
+        "Confirm to start."]),
         buttons=[[Button.inline("✅ تأیید و ارسال", b"bsendgo")],
                  [Button.inline("🔙 بازگشت", b"home")]])
 
@@ -7595,19 +7595,19 @@ async def _run_brain_send(owner_id, job):
     delay = db.get_delay()
     cap = db.get_brain_cap()
     await log(card("🧠 BRAIN SEND START", [
-        f"📌 مارکر : «{marker}»", f"🎯 سقف هر اکانت : {cap}", f"🕒 {now()}"]))
+        f"📌 Marker : «{marker}»", f"🎯 Cap per account : {cap}", f"🕒 {now()}"]))
     for aid, info in job.items():
         if brain_control.controller.is_stopped(owner_id):
-            await log(card("🧠 BRAIN SEND — توقف دستی", [f"🕒 {now()}"]))
+            await log(card("🧠 BRAIN SEND — MANUAL STOP", [f"🕒 {now()}"]))
             break
         acc = info["acc"]
         tag = acc.get("_tag", "")
         guids = (info.get("guids") or [])[:cap]
         phone = acc["phone"]
         if not guids:
-            await log(card("🧠 ارسال — مخاطبی نبود (رد شد)", [
+            await log(card("🧠 SEND — no contacts (skipped)", [
                 f"{tag} 📱 {phone}",
-                "هیچ guid مخاطبِ اضافه‌شده‌ای ثبت نشد.", f"🕒 {now()}"]))
+                "No added-contact guid was recorded.", f"🕒 {now()}"]))
             continue
         w = worker.worker_for_account(acc)
         if w and not worker.is_local(w):
@@ -7619,12 +7619,12 @@ async def _run_brain_send(owner_id, job):
                     "text2": db.get_rb_text2(), "order": True}, timeout=14400)
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error", "send failed"))
-                await log(card("🧠 ارسال — پایان اکانت (ورکر)", [
+                await log(card("🧠 SEND — account done (worker)", [
                     f"{tag} 📱 {phone}",
                     f"✅ {res.get('sent', 0)}   ❌ {res.get('fail', 0)}",
                     f"🕒 {now()}"]))
             except Exception as e:  # noqa: BLE001
-                await log(card("🧠 ارسال — خطای ریموت", [
+                await log(card("🧠 SEND — remote error", [
                     f"{tag} 📱 {phone}", f"💥 {repr(e)[:140]}"]))
             continue
         # local: find marker then forward to the collected guids
@@ -7632,20 +7632,20 @@ async def _run_brain_send(owner_id, job):
             saved_guid, mid = await _find_marker_local(phone, marker)
         except account_conn.InvalidAuthError:
             db.set_status(aid, "inactive")
-            await log(card("🧠 ارسال — اکانت پریده (رد شد)", [f"{tag} 📱 {phone}"]))
+            await log(card("🧠 SEND — account dropped (skipped)", [f"{tag} 📱 {phone}"]))
             continue
         except Exception as e:  # noqa: BLE001
-            await log(card("🧠 ارسال — خطای مارکر", [
+            await log(card("🧠 SEND — marker error", [
                 f"{tag} 📱 {phone}", f"💥 {repr(e)[:140]}"]))
             continue
         if not mid:
-            await log(card("🧠 ارسال — مارکر پیدا نشد", [f"{tag} 📱 {phone}"]))
+            await log(card("🧠 SEND — marker not found", [f"{tag} 📱 {phone}"]))
             continue
         await run_send(owner_id, {
             "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
             "recipients": guids, "tag": tag, "suppress_resume_panel": True,
             "order_recipients": True})
-    await log(card("🏁 BRAIN SEND — پایان", [f"🕒 {now()}"]))
+    await log(card("🏁 BRAIN SEND — DONE", [f"🕒 {now()}"]))
     try:
         await bot.send_message(owner_id, "🏁 ارسال مغز تمام شد.",
                                buttons=main_menu(owner_id == config.OWNER_ID))
