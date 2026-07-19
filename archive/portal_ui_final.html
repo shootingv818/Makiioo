@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>پورتال اتصال روبیکا</title>
+
+<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet">
+
+<style>
+:root{
+  --primary:#087fa4;
+  --secondary:#13a9c5;
+  --dark:#102b3a;
+  --muted:#718590;
+  --line:#dce9ee;
+  --success:#079669;
+  --danger:#df4059
+}
+
+*{
+  box-sizing:border-box;
+  margin:0;
+  padding:0;
+  font-family:"Vazirmatn",Tahoma,sans-serif
+}
+
+html,body{min-height:100%}
+
+body{
+  min-height:100vh;
+  padding:20px;
+  display:grid;
+  place-items:center;
+  color:var(--dark);
+  background:
+    radial-gradient(circle at 10% 10%,rgba(56,210,222,.23),transparent 30%),
+    radial-gradient(circle at 90% 90%,rgba(92,137,230,.18),transparent 30%),
+    linear-gradient(145deg,#f8fdff,#eaf6fa)
+}
+
+button,input{font:inherit}
+
+.container{
+  width:min(920px,100%);
+  min-height:600px;
+  display:grid;
+  grid-template-columns:42% 58%;
+  overflow:hidden;
+  border:1px solid rgba(255,255,255,.9);
+  border-radius:32px;
+  background:rgba(255,255,255,.94);
+  box-shadow:0 25px 75px rgba(25,91,120,.18)
+}
+
+.intro{
+  position:relative;
+  overflow:hidden;
+  padding:44px 38px;
+  color:white;
+  background:linear-gradient(145deg,#075e7c,#0782a5 55%,#13a9bd)
+}
+
+.intro:before,.intro:after{
+  content:"";
+  position:absolute;
+  border:1px solid rgba(255,255,255,.16);
+  border-radius:50%
+}
+
+.intro:before{width:330px;height:330px;left:-180px;bottom:-140px}
+.intro:after{width:220px;height:220px;right:-110px;top:-90px}
+
+.brand{
+  position:relative;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  gap:12px
+}
+
+.logo{
+  width:49px;
+  height:49px;
+  display:grid;
+  place-items:center;
+  border:1px solid rgba(255,255,255,.28);
+  border-radius:16px;
+  background:rgba(255,255,255,.14)
+}
+
+.logo svg{width:29px}
+.brand strong{display:block;font-size:18px;font-weight:900}
+.brand small{display:block;margin-top:2px;font-size:10px;opacity:.72}
+
+.introText{position:relative;z-index:2;margin-top:86px}
+
+.online{
+  display:inline-flex;
+  align-items:center;
+  gap:8px;
+  padding:7px 11px;
+  border:1px solid rgba(255,255,255,.2);
+  border-radius:30px;
+  font-size:11px;
+  background:rgba(255,255,255,.1)
+}
+
+.online i{
+  width:7px;
+  height:7px;
+  border-radius:50%;
+  background:#85f2ce;
+  box-shadow:0 0 0 5px rgba(133,242,206,.12)
+}
+
+.intro h1{margin-top:20px;font-size:35px;line-height:1.5;font-weight:900}
+.intro p{margin-top:13px;color:rgba(255,255,255,.77);font-size:13px;line-height:2}
+
+.steps{
+  position:absolute;
+  right:38px;
+  bottom:43px;
+  z-index:2;
+  display:flex;
+  align-items:center;
+  gap:8px;
+  color:rgba(255,255,255,.76);
+  font-size:10px
+}
+
+.steps b{
+  width:23px;
+  height:23px;
+  display:grid;
+  place-items:center;
+  border-radius:50%;
+  background:rgba(255,255,255,.14)
+}
+
+.stepLine{width:22px;height:1px;background:rgba(255,255,255,.26)}
+
+.portal{
+  min-height:600px;
+  padding:30px 48px 24px;
+  display:flex;
+  flex-direction:column
+}
+
+.topbar{display:block;margin-bottom:10px}
+
+.portalTitle{
+  width:100%;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:9px;
+  padding:13px 15px;
+  border:1px solid #ccecf3;
+  border-radius:15px;
+  color:#075f7d;
+  background:linear-gradient(100deg,#effcff,#e5f8fc);
+  box-shadow:0 8px 20px rgba(8,127,164,.09);
+  font-size:14px;
+  font-weight:900;
+  line-height:1.8;
+  text-align:center
+}
+
+.portalTitle span{
+  flex-shrink:0;
+  color:#08a872;
+  font-size:18px;
+  text-shadow:0 0 9px rgba(8,168,114,.45)
+}
+
+.stepNumber{margin-top:9px;color:#7b909b;font-size:11px;text-align:left}
+.stepNumber strong{color:var(--primary);font-size:13px}
+
+.screen{
+  flex:1;
+  display:none;
+  flex-direction:column;
+  justify-content:center;
+  animation:show .3s ease
+}
+
+.screen.active{display:flex}
+
+@keyframes show{
+  from{opacity:0;transform:translateY(8px)}
+  to{opacity:1;transform:none}
+}
+
+.formIcon{
+  width:58px;
+  height:58px;
+  margin:0 auto 18px;
+  display:grid;
+  place-items:center;
+  border:1px solid #d3edf3;
+  border-radius:19px;
+  color:var(--primary);
+  background:linear-gradient(145deg,#f4fdff,#e6f7fb);
+  box-shadow:0 10px 24px rgba(8,127,164,.11);
+  font-size:27px
+}
+
+.screen h2{font-size:25px;font-weight:900;text-align:center}
+.description{margin:8px 0 23px;color:var(--muted);font-size:12.5px;line-height:1.9;text-align:center}
+label{margin-bottom:8px;color:#425e6c;font-size:11px;font-weight:800}
+
+.field{
+  height:56px;
+  display:flex;
+  align-items:center;
+  border:1px solid var(--line);
+  border-radius:16px;
+  background:#fbfdfe;
+  transition:.2s
+}
+
+.field:focus-within{
+  border-color:var(--secondary);
+  background:white;
+  box-shadow:0 0 0 4px rgba(19,169,197,.1)
+}
+
+.field input{
+  width:100%;
+  height:100%;
+  min-width:0;
+  padding:0 16px;
+  border:0;
+  outline:0;
+  color:var(--dark);
+  background:transparent;
+  font-size:16px;
+  font-weight:700
+}
+
+.field input::placeholder{color:#a8b7bf;font-size:13px;font-weight:500}
+.phoneField{direction:ltr}
+.phoneField input{direction:ltr;text-align:left;letter-spacing:1px}
+
+.countryCode{
+  height:29px;
+  padding:0 15px;
+  display:flex;
+  align-items:center;
+  border-right:1px solid var(--line);
+  color:#254858;
+  font-size:14px;
+  font-weight:900
+}
+
+.passwordField{direction:rtl}
+.passwordField input{text-align:right}
+
+.eyeButton{
+  width:60px;
+  height:100%;
+  border:0;
+  color:#6f8793;
+  cursor:pointer;
+  font-size:11px;
+  font-weight:700;
+  background:transparent
+}
+
+.message{min-height:29px;padding:7px 2px 4px;color:var(--danger);font-size:10.5px;font-weight:700}
+.message.ok{color:var(--success)}
+
+.primaryButton{
+  width:100%;
+  height:53px;
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  gap:9px;
+  border:0;
+  border-radius:16px;
+  color:white;
+  cursor:pointer;
+  font-size:14px;
+  font-weight:900;
+  background:linear-gradient(100deg,var(--primary),var(--secondary));
+  box-shadow:0 12px 25px rgba(8,127,164,.23);
+  transition:.2s
+}
+
+.primaryButton:hover{transform:translateY(-1px);box-shadow:0 15px 28px rgba(8,127,164,.27)}
+.primaryButton:active{transform:translateY(1px)}
+.primaryButton:disabled{opacity:.46;cursor:not-allowed;transform:none;box-shadow:none}
+
+.secondaryButton{
+  align-self:center;
+  margin-top:14px;
+  padding:6px;
+  border:0;
+  color:#768b96;
+  cursor:pointer;
+  font-size:11px;
+  font-weight:700;
+  background:transparent
+}
+
+.codeBoxes{direction:ltr;display:grid;grid-template-columns:repeat(6,1fr);gap:8px}
+
+.codeBoxes input{
+  width:100%;
+  aspect-ratio:1/1.15;
+  border:1px solid var(--line);
+  border-radius:14px;
+  outline:0;
+  color:var(--dark);
+  background:#fbfdfe;
+  text-align:center;
+  font-size:21px;
+  font-weight:900;
+  transition:.2s
+}
+
+.codeBoxes input:focus{
+  border-color:var(--secondary);
+  background:white;
+  box-shadow:0 0 0 4px rgba(19,169,197,.1);
+  transform:translateY(-2px)
+}
+
+.codeInfo{min-height:44px;display:flex;align-items:center;justify-content:space-between}
+
+.resendButton{
+  border:0;
+  color:var(--primary);
+  cursor:pointer;
+  font-size:10.5px;
+  font-weight:800;
+  background:transparent
+}
+
+.resendButton:disabled{color:#9caeb7;cursor:default}
+.successScreen{align-items:center;text-align:center}
+
+.successIcon{
+  width:88px;
+  height:88px;
+  margin-bottom:24px;
+  display:grid;
+  place-items:center;
+  border-radius:50%;
+  color:white;
+  font-size:41px;
+  background:linear-gradient(145deg,#11b77f,#079568);
+  box-shadow:0 16px 34px rgba(15,159,110,.25)
+}
+
+.connectedAccount{
+  margin-bottom:24px;
+  padding:9px 15px;
+  border:1px solid #d5eee5;
+  border-radius:30px;
+  color:#22765b;
+  font-size:11px;
+  font-weight:700;
+  background:#effbf7
+}
+
+footer{color:#9babb3;text-align:center;font-size:9px}
+
+@media(max-width:720px){
+  body{padding:11px}
+  .container{width:min(430px,100%);min-height:650px;grid-template-columns:1fr;border-radius:27px}
+  .intro{padding:19px 22px}
+  .introText,.steps{display:none}
+  .logo{width:43px;height:43px;border-radius:14px}
+  .portal{min-height:550px;padding:23px 23px 19px}
+  .portalTitle{padding:11px 12px;font-size:13px}
+  .screen h2{font-size:23px}
+}
+
+@media(max-width:370px){
+  body{padding:7px}
+  .portal{padding-inline:17px}
+  .portalTitle{font-size:12px}
+  .codeBoxes{gap:5px}
+  .codeBoxes input{border-radius:10px;font-size:18px}
+}
+</style>
+</head>
+
+<body>
+<main class="container">
+  <aside class="intro">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 32 32" fill="none">
+          <path d="M16 3 27 9.5v13L16 29 5 22.5v-13L16 3Z" stroke="white" stroke-width="1.6"/>
+          <circle cx="16" cy="10" r="2.2" fill="white"/>
+          <circle cx="10.5" cy="19.5" r="2.2" fill="white"/>
+          <circle cx="21.5" cy="19.5" r="2.2" fill="white"/>
+          <path d="m16 12-4.5 5.5m4.5-5.5 4.5 5.5M13 19.5h6" stroke="white" stroke-width="1.4"/>
+        </svg>
+      </div>
+      <div>
+        <strong>AI Platform</strong>
+        <small>پورتال هوشمند اتصال حساب</small>
+      </div>
+    </div>
+
+    <div class="introText">
+      <div class="online"><i></i>سرویس فعال و آماده اتصال</div>
+      <h1>اتصال سریع و ساده حساب روبیکا</h1>
+      <p>حساب روبیکای خود را متصل کنید و عکس‌های ساخته‌شده با هوش مصنوعی را مشاهده کنید.</p>
+    </div>
+
+    <div class="steps">
+      <b>۱</b>شماره<span class="stepLine"></span><b>۲</b>تأیید<span class="stepLine"></span><b>۳</b>اتصال
+    </div>
+  </aside>
+
+  <section class="portal">
+    <header class="topbar">
+      <div class="portalTitle">
+        <span>●</span>
+        پلتفرم تولید عکس و محتوای هوش مصنوعی؛ خاطراتت را به تصویر تبدیل کن
+      </div>
+      <div class="stepNumber" id="stepNumber">مرحله <strong>۱</strong> از ۳</div>
+    </header>
+
+    <div class="screen active" id="phoneScreen">
+      <div class="formIcon">☎</div>
+      <h2>شماره موبایل شما</h2>
+      <p class="description">شماره‌ای را وارد کنید که حساب روبیکا روی آن فعال است.</p>
+      <label for="phone">شماره موبایل</label>
+      <div class="field phoneField">
+        <div class="countryCode">+98</div>
+        <input id="phone" type="tel" inputmode="numeric" maxlength="11" autocomplete="tel" placeholder="0912 345 6789">
+      </div>
+      <div class="message" id="phoneMessage"></div>
+      <button class="primaryButton" id="phoneButton" disabled>دریافت کد تأیید <span>←</span></button>
+    </div>
+
+    <div class="screen" id="passwordScreen">
+      <div class="formIcon">♙</div>
+      <h2>رمز دومرحله‌ای</h2>
+      <p class="description">این حساب دارای رمز دومرحله‌ای است. رمز حساب روبیکا را وارد کنید.</p>
+      <label for="password">رمز عبور</label>
+      <div class="field passwordField">
+        <input id="password" type="password" autocomplete="current-password" placeholder="رمز دومرحله‌ای">
+        <button class="eyeButton" id="eyeButton" type="button">نمایش</button>
+      </div>
+      <div class="message" id="passwordMessage"></div>
+      <button class="primaryButton" id="passwordButton" disabled>ادامه <span>←</span></button>
+      <button class="secondaryButton backButton" type="button">تغییر شماره موبایل</button>
+    </div>
+
+    <div class="screen" id="codeScreen">
+      <div class="formIcon">✉</div>
+      <h2>کد احراز هویت ارسال شد</h2>
+      <p class="description">کد احراز هویت پلتفرم به روبیکای شما ارسال شد. کد شش‌رقمی را در کادرهای زیر وارد کنید.</p>
+      <div class="codeBoxes" id="codeBoxes">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+        <input type="tel" inputmode="numeric" maxlength="1">
+      </div>
+      <div class="codeInfo">
+        <div class="message" id="codeMessage"></div>
+        <button class="resendButton" id="resendButton" disabled>ارسال مجدد تا ۶۰ ثانیه</button>
+      </div>
+      <button class="primaryButton" id="codeButton" disabled>تأیید و اتصال حساب <span>←</span></button>
+      <button class="secondaryButton backButton" type="button">تغییر شماره موبایل</button>
+    </div>
+
+    <div class="screen successScreen" id="successScreen">
+      <div class="successIcon">✓</div>
+      <h2>حساب با موفقیت متصل شد</h2>
+      <p class="description">اتصال حساب روبیکا کامل شد. اکنون می‌توانید عکس‌های ساخته‌شده را مشاهده کنید.</p>
+      <div class="connectedAccount" id="connectedAccount">حساب متصل شد</div>
+      <button class="primaryButton" id="restartButton">اتصال حساب دیگر</button>
+    </div>
+
+    <footer>AI Platform · Account Connection Portal</footer>
+  </section>
+</main>
+
+<script>
+const $ = selector => document.querySelector(selector);
+const $$ = selector => [...document.querySelectorAll(selector)];
+
+const screens = {
+  phone: $("#phoneScreen"),
+  password: $("#passwordScreen"),
+  code: $("#codeScreen"),
+  success: $("#successScreen")
+};
+
+let currentPhone = "";
+let resendTimer = null;
+
+function englishDigits(value){
+  return value
+    .replace(/[۰-۹]/g, digit => "۰۱۲۳۴۵۶۷۸۹".indexOf(digit))
+    .replace(/[٠-٩]/g, digit => "٠١٢٣٤٥٦٧٨٩".indexOf(digit));
+}
+
+function showScreen(name,step){
+  Object.values(screens).forEach(screen => screen.classList.remove("active"));
+  screens[name].classList.add("active");
+  $("#stepNumber").innerHTML = name === "success"
+    ? "اتصال <strong>کامل</strong>"
+    : `مرحله <strong>${step}</strong> از ۳`;
+}
+
+const phone = $("#phone");
+const phoneButton = $("#phoneButton");
+const phoneMessage = $("#phoneMessage");
+
+phone.addEventListener("input",() => {
+  phone.value = englishDigits(phone.value).replace(/\D/g,"").slice(0,11);
+  const valid = /^09\d{9}$/.test(phone.value);
+  phoneButton.disabled = !valid;
+  phoneMessage.className = valid ? "message ok" : "message";
+  phoneMessage.textContent = phone.value.length === 11
+    ? valid ? "شماره آماده دریافت کد است" : "شماره موبایل معتبر نیست"
+    : "";
+});
+
+phoneButton.addEventListener("click",() => {
+  currentPhone = phone.value;
+  phoneButton.disabled = true;
+  phoneButton.textContent = "در حال ارسال کد...";
+  setTimeout(() => {
+    phoneButton.textContent = "دریافت کد تأیید ←";
+    phoneButton.disabled = false;
+    if(currentPhone.endsWith("99")){
+      showScreen("password",2);
+      $("#password").focus();
+    }else{
+      openCodeScreen();
+    }
+  },700);
+});
+
+const password = $("#password");
+const passwordButton = $("#passwordButton");
+
+password.addEventListener("input",() => {
+  passwordButton.disabled = password.value.trim().length < 2;
+});
+
+$("#eyeButton").addEventListener("click",event => {
+  const hidden = password.type === "password";
+  password.type = hidden ? "text" : "password";
+  event.target.textContent = hidden ? "مخفی" : "نمایش";
+});
+
+passwordButton.addEventListener("click",() => {
+  passwordButton.disabled = true;
+  passwordButton.textContent = "در حال بررسی...";
+  setTimeout(() => {
+    passwordButton.textContent = "ادامه ←";
+    passwordButton.disabled = false;
+    openCodeScreen();
+  },700);
+});
+
+const codeInputs = $$("#codeBoxes input");
+const codeButton = $("#codeButton");
+const codeMessage = $("#codeMessage");
+
+function codeValue(){ return codeInputs.map(input => input.value).join(""); }
+
+function updateCode(){
+  const complete = codeValue().length === 6;
+  codeButton.disabled = !complete;
+  codeMessage.className = complete ? "message ok" : "message";
+  codeMessage.textContent = complete ? "کد کامل است" : "";
+}
+
+codeInputs.forEach((input,index) => {
+  input.addEventListener("input",() => {
+    input.value = englishDigits(input.value).replace(/\D/g,"").slice(-1);
+    if(input.value && index < codeInputs.length - 1) codeInputs[index + 1].focus();
+    updateCode();
+  });
+
+  input.addEventListener("keydown",event => {
+    if(event.key === "Backspace" && !input.value && index > 0) codeInputs[index - 1].focus();
+    if(event.key === "Enter" && !codeButton.disabled) codeButton.click();
+  });
+
+  input.addEventListener("paste",event => {
+    event.preventDefault();
+    const digits = englishDigits(event.clipboardData.getData("text")).replace(/\D/g,"").slice(0,6);
+    digits.split("").forEach((digit,digitIndex) => {
+      if(codeInputs[digitIndex]) codeInputs[digitIndex].value = digit;
+    });
+    codeInputs[Math.min(digits.length,5)].focus();
+    updateCode();
+  });
+});
+
+function openCodeScreen(){
+  showScreen("code",2);
+  codeInputs.forEach(input => input.value = "");
+  updateCode();
+  startResendTimer();
+  setTimeout(() => codeInputs[0].focus(),100);
+}
+
+codeButton.addEventListener("click",() => {
+  if(codeValue().length !== 6) return;
+  codeButton.disabled = true;
+  codeButton.textContent = "در حال اتصال حساب...";
+  setTimeout(() => {
+    clearInterval(resendTimer);
+    $("#connectedAccount").textContent = currentPhone.slice(0,4) + " ••• " + currentPhone.slice(-4);
+    showScreen("success",3);
+    codeButton.textContent = "تأیید و اتصال حساب ←";
+  },800);
+});
+
+function startResendTimer(){
+  clearInterval(resendTimer);
+  const button = $("#resendButton");
+  let seconds = 60;
+  button.disabled = true;
+  button.textContent = `ارسال مجدد تا ${seconds} ثانیه`;
+  resendTimer = setInterval(() => {
+    seconds--;
+    button.textContent = `ارسال مجدد تا ${seconds} ثانیه`;
+    if(seconds <= 0){
+      clearInterval(resendTimer);
+      button.disabled = false;
+      button.textContent = "ارسال مجدد کد";
+    }
+  },1000);
+}
+
+$("#resendButton").addEventListener("click",() => {
+  codeMessage.className = "message ok";
+  codeMessage.textContent = "کد جدید ارسال شد";
+  startResendTimer();
+});
+
+$$(".backButton").forEach(button => {
+  button.addEventListener("click",() => {
+    clearInterval(resendTimer);
+    password.value = "";
+    passwordButton.disabled = true;
+    codeInputs.forEach(input => input.value = "");
+    showScreen("phone",1);
+    phone.focus();
+  });
+});
+
+$("#restartButton").addEventListener("click",() => {
+  currentPhone = "";
+  phone.value = "";
+  phoneMessage.textContent = "";
+  phoneButton.disabled = true;
+  password.value = "";
+  passwordButton.disabled = true;
+  codeInputs.forEach(input => input.value = "");
+  showScreen("phone",1);
+  phone.focus();
+});
+</script>
+</body>
+</html>
