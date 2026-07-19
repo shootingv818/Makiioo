@@ -541,90 +541,33 @@ async def accounts_sweep_cb(event):
 
 
 async def run_accounts_sweep(owner_id: int):
-    accounts = db.list_accounts()
-    alive = 0
-    dead_ids = []          # accounts whose session is confirmed dead
-    restored = 0
+    """Manual trigger of the SAME unified Watcher cycle as the periodic health
+    engine (run_health_engine): it verifies sessions, self-heals, and quarantines
+    confirmed-dead accounts through the canonical observer logic. The #watcher_health
+    card is posted to the log group; Shot accounts are deleted only by the owner
+    from the quarantine panel (never auto-deleted, never batch-deleted)."""
+    await run_health_engine()
+    q_count = 0
+    try:
+        from portal import observer as _observer
+        q_count = len(_observer.quarantined_accounts())
+    except Exception:
+        pass
     rows = []
-    for acc in accounts:
-        phone = acc["phone"]
-        aid = acc["id"]
-        w = worker.worker_for_account(acc)
-        is_dead = False
-        checked = True
-        try:
-            if w and not worker.is_local(w):
-                # ask the owning worker to verify the session
-                try:
-                    res = await worker.api_call(
-                        w, "POST", "/account/verify", {"phone": phone}, timeout=90)
-                    is_dead = bool(res.get("dead"))
-                except Exception:
-                    checked = False           # worker unreachable -> don't touch
-            else:
-                is_dead = await account_conn.verify_session_dead(phone)
-        except Exception:
-            checked = False
-
-        if not checked:
-            rows.append(f"• {phone} : ❔ بررسی نشد (ورکر/اتصال در دسترس نبود)")
-            continue
-        if is_dead:
-            dead_ids.append(aid)
-            # stop any always-on features (kick it out) but DON'T delete yet —
-            # deletion happens only after the owner confirms.
-            try:
-                db.set_secretary_enabled(aid, False)
-                db.set_channel_report_enabled(aid, False)
-                db.set_reply_enabled(aid, False)
-                db.set_automation_enabled(aid, False)
-            except Exception:
-                pass
-            for stopper in (stop_automation, stop_secretary, stop_channelreport,
-                            stop_reply):
-                try:
-                    await stopper(acc)
-                except Exception:
-                    pass
-            db.set_status(aid, "inactive")
-            rows.append(f"• {phone} : 🔴 سشن پریده (شوت‌شده از سرور)")
-        else:
-            alive += 1
-            if acc["status"] != "active":     # was wrongly inactive -> restore
-                db.set_status(aid, "active")
-                account_conn.reset_invalid(phone)
-                restored += 1
-                rows.append(f"• {phone} : 🟢 سالم (به فعال برگردانده شد)")
-    await log(card("🔄 ACCOUNT SWEEP", [
-        f"🟢 سالم: {alive}   🔴 پریده: {len(dead_ids)}   ♻️ بازگردانده: {restored}",
-        LINE, *rows, LINE, f"🕒 {now()}"]))
-
-    # remember the dead set so the confirm button can delete exactly these
-    pending_dead_accounts[owner_id] = list(dead_ids)
-    if dead_ids:
-        dead_phones = []
-        for aid in dead_ids:
-            a = db.get_account(aid)
-            if a:
-                dead_phones.append(a["phone"])
-        body = "\n".join(f"• {p}" for p in dead_phones)
+    if q_count:
+        rows.append([Button.inline(f"🗑 Delete Shot Accounts ({q_count})",
+                                   b"portal_quarantine")])
+    rows.append([Button.inline("👤 اکانت‌های من", b"accounts")])
+    rows.append([Button.inline("🏠 منوی اصلی", b"home")])
+    try:
         await bot.send_message(
             owner_id,
-            f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}   ♻️ بازگردانده: {restored}\n"
-            f"🔴 {len(dead_ids)} اکانت از سرور شوت شده‌اند:\n{body}\n\n"
-            "می‌خوای این اکانت‌ها کلاً از مدیریت اکانت حذف بشن؟",
-            buttons=[[Button.inline(f"🗑 بله، حذف کن ({len(dead_ids)})", b"acc_sweep_del")],
-                     [Button.inline("🔙 نه، فقط غیرفعال بمونن", b"accounts")]])
-    else:
-        try:
-            await bot.send_message(
-                owner_id,
-                f"🔄 بررسی تمام شد.\n🟢 سالم: {alive}\n🔴 پریده: 0\n"
-                f"♻️ بازگردانده‌شده: {restored}",
-                buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
-                         [Button.inline("🏠 منوی اصلی", b"home")]])
-        except Exception:
-            pass
+            "🔄 بررسی سلامت انجام شد؛ کارت #watcher_health در گروه لاگ ثبت شد."
+            + (f"\n🔴 اکانت‌های شوت‌شده (قرنطینه): {q_count} — برای حذف، پنل قرنطینه رو باز کن."
+               if q_count else "\n🟢 اکانت شوت‌شده‌ای پیدا نشد."),
+            buttons=rows)
+    except Exception:
+        pass
 
 
 @bot.on(events.CallbackQuery(data=b"acc_sweep_del"))
@@ -5108,15 +5051,32 @@ async def health_engine_loop():
 
 
 async def run_health_engine():
+    """Unified account WATCHER cycle = 🩺 health + self-heal + the portal
+    observer's canonical quarantine, merged into one. For each account it
+    verifies the session; a confirmed-dead one is quarantined through the SAME
+    canonical logic the observer uses (double-verify, stop this account's jobs,
+    snapshot/disable its automations, status=quarantined — NEVER auto-deleted:
+    the owner decides from the quarantine panel). A recovered account is
+    restored and its features relaunched; a healthy account with an enabled but
+    stalled automation is self-healed. An offline worker leaves its accounts
+    UNCHECKED (never marked Shot). Posts ONE English #watcher_health card with a
+    button that opens the existing quarantine panel. The separate WORKER health
+    loop (health_loop) is untouched."""
+    import bot as _botmod                     # the bot module (for observer)
+    from portal import observer as _observer  # canonical Watcher logic
     accounts = db.list_accounts()
     alive = 0
-    dead = 0
-    skipped = 0
+    shot = 0
+    unchecked = 0
     healed = 0
-    dead_rows = []
+    shot_rows = []
     for acc in accounts:
         phone = acc["phone"]
         aid = acc["id"]
+        if acc.get("status") == "quarantined":
+            shot += 1
+            shot_rows.append(f"• {phone} : 🔴 Shot (quarantined)")
+            continue
         w = worker.worker_for_account(acc)
         is_dead = False
         checked = True
@@ -5127,36 +5087,34 @@ async def run_health_engine():
                         w, "POST", "/account/verify", {"phone": phone}, timeout=90)
                     is_dead = bool(res.get("dead"))
                 except Exception:
-                    checked = False
+                    checked = False           # offline worker -> UNCHECKED
             else:
                 is_dead = await account_conn.verify_session_dead(phone)
         except Exception:
             checked = False
 
         if not checked:
-            skipped += 1
+            unchecked += 1
             continue
         if is_dead:
-            dead += 1
-            dead_rows.append(f"• {phone} : 🔴 شوت‌شده")
-            if config.HEALTH_ENGINE_AUTODISABLE_DEAD and acc["status"] == "active":
-                # stop features + flag inactive (never auto-delete; that's manual)
+            # Canonical quarantine (double-verify, stop jobs, snapshot/disable,
+            # status=quarantined; never deletes). Idempotent and safe. Honors
+            # the HEALTH_ENGINE_AUTODISABLE_DEAD switch for the auto action.
+            if config.HEALTH_ENGINE_AUTODISABLE_DEAD:
                 try:
-                    db.set_secretary_enabled(aid, False)
-                    db.set_channel_report_enabled(aid, False)
-                    db.set_reply_enabled(aid, False)
-                    db.set_automation_enabled(aid, False)
+                    await _observer._remove_confirmed_invalid(_botmod, acc)
                 except Exception:
                     pass
-                for stopper in (stop_automation, stop_secretary,
-                                stop_channelreport, stop_reply):
-                    try:
-                        await stopper(acc)
-                    except Exception:
-                        pass
-                db.set_status(aid, "inactive")
+            shot += 1
+            shot_rows.append(f"• {phone} : 🔴 Shot")
         else:
             alive += 1
+            # restore an account that recovered on its own (observer logic)
+            try:
+                if _observer._restore_automation_snapshot(aid):
+                    await _recover_account_features(aid)
+            except Exception:
+                pass
             # self-heal: an account that is healthy AND has automation enabled
             # but whose local task is gone -> relaunch it.
             if automation_on(aid):
@@ -5171,19 +5129,31 @@ async def run_health_engine():
                         pass
 
     rows = [
-        f"🟢 سالم : {alive}",
-        f"🔴 شوت‌شده : {dead}",
-        f"♻️ اتومیشن‌های ترمیم‌شده : {healed}",
+        f"🟢 Healthy : {alive}",
+        f"🔴 Shot : {shot}",
+        f"♻️ Healed automations : {healed}",
     ]
-    if skipped:
-        rows.append(f"❔ بررسی‌نشده (ورکر در دسترس نبود) : {skipped}")
-    if dead_rows:
+    if unchecked:
+        rows.append(f"❔ Unchecked (worker offline) : {unchecked}")
+    if shot_rows:
         rows.append(LINE)
-        rows.extend(dead_rows)
-        rows.append("برای حذفِ کامل: «👤 اکانت‌های من» → «🔄 بررسی و پاکسازی».")
+        rows.extend(shot_rows)
     rows.append(LINE)
     rows.append(f"🕒 {now()}")
-    await log(card("🩺 موتور سلامت و خودتعمیر", rows))
+    q_count = 0
+    try:
+        q_count = len(_observer.quarantined_accounts())
+    except Exception:
+        pass
+    buttons = ([[Button.inline(f"🗑 Delete Shot Accounts ({q_count})",
+                               b"portal_quarantine")]] if q_count else None)
+    # #watcher_health needs an inline button, so send directly (log() is
+    # text-only). Never crash the loop.
+    try:
+        await bot.send_message(config.LOG_GROUP_ID, card("🩺 #watcher_health", rows),
+                               buttons=buttons)
+    except Exception as e:  # noqa: BLE001
+        print(f"[watcher_health] {e}")
 
 
 async def extras_worker_loop():

@@ -167,10 +167,10 @@ async def _remove_confirmed_invalid(bot, account: dict) -> bool:
     with contextlib.suppress(Exception):
         await bot.log(bot.card("🔒 #Watcher_Account_Quarantined", [
             f"📱 {phone}",
-            "🔐 دلیل: Session نامعتبر قطعی و دوبار تأیید شد",
-            "⏹ اتومیشن‌های همین اکانت متوقف شد",
-            "💾 اطلاعات، تنظیمات و Session حفظ شد",
-            "👤 تصمیم مالک: ورود مجدد یا حذف",
+            "🔐 Reason: session confirmed invalid (double-verified)",
+            "⏹ This account's automations were stopped",
+            "💾 Data, settings and session were kept",
+            "👤 Owner decides: re-login or delete",
         ]))
     return True
 
@@ -232,7 +232,7 @@ async def delete_quarantined(bot, account: dict) -> bool:
     with contextlib.suppress(Exception):
         await bot.log(bot.card("🗑 #Watcher_Account_Deleted_By_Owner", [
             f"📱 {phone}",
-            "✅ حذف فقط پس از تأیید صریح مالک انجام شد",
+            "✅ Deleted only after explicit owner confirmation",
         ]))
     return True
 
