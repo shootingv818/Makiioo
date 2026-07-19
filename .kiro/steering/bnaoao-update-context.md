@@ -2,19 +2,31 @@
 inclusion: always
 ---
 
-# Bnaoao Update Archive Context
+# Makiioo — Project Context
 
-- User/repository owner: `willbedoneuw`.
-- This repository (`willbedoneuw/Meowv3`) is the persistent archive and session handoff for the next Bnaoao update.
-- The implementation target is `willbedoneuw/Bnaoao`; canonical deployment branch is `production`.
-- Before any implementation, read `archive/BNAOAO_UPDATE_PLAN_FA.md` completely.
-- The approved portal UI is `archive/portal_ui_final.html`; its canonical SHA-256 is `52f8671d9a21509059cb2f6a619387b08fd3b71e7ffb110fcc5fcd361d3d7d55`.
-- Preserve the approved UI's phone/password/code/success flow. Do not rewrite its working JavaScript unless the user explicitly requests it.
-- Changes to inherited Bnaoao code must be strictly additive and isolated. Never rewrite core connection/session files.
-- Keep `account_conn.py`, `rubika_client.py`, `worker.py`, `db.py`, and `main.py` byte-identical whenever possible; verify hashes before and after.
+- Repository: `shootingv818/Makiioo`. Owner works in Persian; reply concisely in Persian.
+- Base code = an exact copy of the latest `willbedoneuw/Meowv3` (branch
+  `fix/tg-multi-send-robust-v1`, merged in `a6152c4`). Worker-provisioning fix
+  was ported from `shootingv818/Haopooonwkkoo` (reference only).
+- **Before any change, read `project_notes/MAKIIOO_MAP.md`** — it is the
+  authoritative map (architecture, what changed in the 4-part update, session
+  conflict notes, and the mandatory deploy note about `GIT_REPO_URL`).
+
+## Working rules
+- Do NOT rewrite the base connection/session/architecture logic. Keep changes
+  additive and isolated; reuse the project's own code as much as possible and
+  write new code only when unavoidable.
 - Enforce one live connection per session and one running instance per service.
-- Never push directly or force-push to `production`; use a new branch and PR.
-- Before deployment: back up runtime data and `.env`, record rollback commit, run failure simulations and syntax checks, clear stale `__pycache__`, then restart exactly one service instance.
-- Do not implement, commit, push, merge, or deploy merely because this archive exists. Wait for explicit user approval to start.
-- Brain feature ideas are not part of the archived update unless the user explicitly adds them again.
-- Communicate in concise Persian. Avoid unrelated ideas and avoid repeating features already present in the project.
+- Delete an account only on a confirmed-invalid session AND explicit owner
+  confirmation (quarantine panel). Temporary errors (timeout, network, FloodWait,
+  Worker unavailable) never delete/quarantine.
+- Never push directly or force-push to `main`; use a new branch and a PR.
+- Do not add test files; verify with `python -m compileall` + manual smoke checks.
+- Always confirm with the owner before writing code for a NEW request.
+
+## Already-done in this update (do not redo)
+- Worker `provision_worker` / `update_worker` robustness fix (2 functions only).
+- 🧠 Channel Brain replaced the old broadcaster UI.
+- Rubika-send + Brain log cards converted to English (automation cards excluded).
+- Account health engine merged with the portal Watcher (worker health loop kept
+  separate). See MAKIIOO_MAP.md for exact scope and what was intentionally left.
