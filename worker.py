@@ -147,14 +147,37 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
         await say("🔌 اتصال SSH به سرور ...")
         conn = await _ssh_connect(ip, ssh_port, ssh_user, ssh_pass)
 
-        await say("🐳 بررسی/نصب Docker ...")
-        code, out, err = await _run(
-            conn,
-            "command -v docker >/dev/null 2>&1 && echo HAVE || "
-            "(curl -fsSL https://get.docker.com | sh)",
+        await say("🐳 بررسی/نصب Docker (با صبر برای قفلِ apt) ...")
+        # Fresh Ubuntu servers run unattended-upgrades right after boot, which
+        # holds the dpkg lock for minutes; that previously made the docker
+        # install silently fail and the later `docker build` die with
+        # "docker: command not found". So: stop auto-upgrades for this run, tell
+        # apt to WAIT for the lock (DPkg::Lock::Timeout), install docker from the
+        # distro repo (most reliable), fall back to get.docker.com, then VERIFY.
+        install_script = (
+            "export DEBIAN_FRONTEND=noninteractive\n"
+            "systemctl stop unattended-upgrades >/dev/null 2>&1 || true\n"
+            "if ! command -v docker >/dev/null 2>&1; then\n"
+            "  apt-get -o DPkg::Lock::Timeout=180 update -qq || true\n"
+            "  apt-get -o DPkg::Lock::Timeout=180 install -y -qq "
+            "ca-certificates curl git docker.io || true\n"
+            "fi\n"
+            "command -v docker >/dev/null 2>&1 || "
+            "{ curl -fsSL https://get.docker.com | sh; } || true\n"
+            "command -v git >/dev/null 2>&1 || "
+            "apt-get -o DPkg::Lock::Timeout=180 install -y -qq git || true\n"
+            "systemctl enable --now docker >/dev/null 2>&1 || true\n"
+            "if command -v docker >/dev/null 2>&1; then docker --version; "
+            "echo DOCKER_OK; else echo DOCKER_MISSING; fi\n"
         )
-        # ensure git
-        await _run(conn, "command -v git >/dev/null 2>&1 || (apt-get update && apt-get install -y git)")
+        code, out, err = await _run(conn, install_script)
+        if "DOCKER_OK" not in (out or ""):
+            return {"ok": False,
+                    "error": ("نصبِ Docker روی سرور ناموفق بود (احتمالاً قفلِ apt یا "
+                              "نبودِ اینترنت). روی همون سرور دستی بزن:  "
+                              "apt-get install -y docker.io && systemctl enable --now docker  "
+                              "بعد دوباره «افزودن ورکر». جزئیات: "
+                              + ((err or out) or "")[-300:])}
 
         await say("📥 دریافت سورس از گیت‌هاب ...")
         code, out, err = await _run(
@@ -251,14 +274,25 @@ async def restart_worker(worker: dict) -> tuple:
 
 
 async def update_worker(worker: dict) -> tuple:
-    """git pull + rebuild image + recreate container."""
+    """Force the worker checkout to config.GIT_BRANCH's latest, rebuild the
+    image, recreate the container. Robust to a worker stuck on the wrong branch
+    (uses fetch + checkout -B FETCH_HEAD) and surfaces a build failure as a
+    non-zero exit (so a silent old image isn't reported as success)."""
     conn = await _with_conn(worker)
     try:
+        br = config.GIT_BRANCH
+        repo = config.GIT_REPO_URL
         cmd = (
-            f"cd {REMOTE_DIR} && git pull && docker build --network=host -t {IMAGE} . && "
-            f"docker rm -f {CONTAINER} 2>/dev/null; "
-            f"docker run -d --name {CONTAINER} --restart always "
-            f"--network=host "
+            f"cd {REMOTE_DIR} && "
+            # Repoint origin to the CURRENT repo first, so a worker cloned from
+            # an older repo/branch is moved onto the active code with one click
+            # from the panel (no manual SSH per worker ever again).
+            f"git remote set-url origin '{repo}' && "
+            f"git fetch --depth 1 origin {br} && "
+            f"git checkout -B {br} FETCH_HEAD && "
+            f"docker build --network=host -t {IMAGE} . && "
+            f"(docker rm -f {CONTAINER} 2>/dev/null || true) && "
+            f"docker run -d --name {CONTAINER} --restart always --network=host "
             f"--env-file {REMOTE_DIR}/.env -v {REMOTE_DATA}:/app/data {IMAGE}"
         )
         return await _run(conn, cmd)
