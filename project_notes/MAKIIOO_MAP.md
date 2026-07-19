@@ -105,6 +105,33 @@
 
 ---
 
+---
+
+## آپدیت این نشست (۲) — ارسال «متن ساده» + صفحه‌بندی لیست اکانت‌ها
+> همان شاخه `fix/channel-brain-worker-display`. فقط `bot.py` + `worker_api.py` (+ این نقشه).
+
+### ۱) ارسال «متن ساده» (بدون فوروارد) به مخاطبین
+- **ایده:** یه متنِ ساده (بدون نیاز به پیام نشان‌دار) به همهٔ مخاطبین. **موتورش از قبل کامل آماده بود** — فقط به UI وصل شد:
+  - محلی: `bot.run_send` با `mode="text"` + `payload["text"]` (از قبل بود).
+  - ریموت مغز: `/send/to_list` با `mode="text"` (از قبل بود).
+- **منبع متن:** setting مستقل `rb_plain_text` (کلید app_settings). helperها در bot.py: `get_plain_text()`/`set_plain_text()`. از بخش «📌 مارکر» → دکمهٔ «📝 متن ساده» ست/پاک می‌شه (`plaintext` callback + step `await_plain_text`). **کاملاً جدا از پورتال؛ `portal_auto_send_text` و کل پورتال دست‌نخورده.**
+- **ارسال عادی:** منوی `send_mode_cb` حالا سه گزینه دارد: «📎 فوروارد مارکر» (`send_{id}`، بدون تغییر)، «✍️ متن ساده» (`sendtext_{id}`، جدید)، «📢 کانال» (بدون تغییر). هندلر `send_text_prepare_cb` محلی recipients را می‌خواند و payload با `mode="text"` می‌سازد؛ ریموت از `send_text_prepare_remote` استفاده می‌کند.
+- **مغز:** `brain_send_cb` حالا می‌پرسد «📎 فوروارد مارکر» (`bsendgo`) یا «✍️ متن ساده» (`bsendgotext`، جدید). `_run_brain_send(owner_id, job, mode="marker", body="")` گسترش یافت: در حالت text محلی run_send(mode=text) و ریموت /send/to_list(mode=text)؛ در حالت marker دقیقاً مثل قبل.
+- **worker_api (additive، پیش‌فرض `marker` → رفتار قبلی byte-preserved):**
+  - `PrepareIn.mode` + `prepare`: در حالت text مارکر لازم نیست، فقط recipients شمرده می‌شود.
+  - `SendIn.mode`+`SendIn.text` + `send_start`: در حالت text `find_marked_message` رد می‌شود (saved_guid/mid=None).
+  - `_run_send`: شاخهٔ `if mode=="text": rb.send_text else rb.forward_message` (عین الگوی موجود `/send/to_list`).
+  - `run_send_remote` (bot): `mode`/`text` را پاس می‌دهد و در حالت text شرط `marker_found` را نادیده می‌گیرد.
+
+### ۲) صفحه‌بندی لیست اکانت‌ها
+- helper `_paginate(items, page, cb_prefix, per_page=15)`: هر صفحه ۱۵ دکمه، صفحهٔ اول بدون «◀️ قبلی»، صفحهٔ آخر بدون «بعدی ▶️».
+- اعمال شد روی: منوی ارسال (`send_menu` → `_render_send_menu` + callback `smpage_`) و لیست «👤 اکانت‌های من» (`accounts` → `_render_accounts` + callback `accpage_`). شماره‌گذاری اکانت‌ها بین صفحات پیوسته می‌ماند. `ACC_PAGE_SIZE=15`.
+
+### تست
+- ۹۰ تست PASS (۳۸ مغز کانال + ۸ parity + ۲۰ نمایش ورکر + ۱۷ متن‌ساده/مغز + ۷ worker `_run_send`). گیت‌ها: compileall، ruff `F821/F811/F823`، `_safe_worker_update_command` byte-identical، مسیر مارکرِ فعلی دست‌نخورده. هارنس‌ها: `/projects/sandbox/_stubs/test_sendtext.py`, `test_worker_send.py`.
+
+---
+
 ## نکات تداخل سشن (مهم برای آپدیت بعدی)
 - یک اتصال زنده برای هر session؛ قبل از اتصال جدید، قبلی بسته شود (`account_conn.close`).
 - حذف اکانت فقط با InvalidAuth قطعی و **تأیید صریح مالک** (پنل قرنطینه). timeout/شبکه/FloodWait/Worker unavailable = خطای موقت، هرگز حذف/قرنطینه‌ی قطعی.

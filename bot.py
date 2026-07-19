@@ -507,6 +507,10 @@ async def login_session_cb(event):
 async def accounts_cb(event):
     if not is_owner(event):
         return
+    await _render_accounts(event, 0)
+
+
+async def _render_accounts(event, page: int = 0):
     accounts = db.list_accounts()
     if not accounts:
         await safe_edit(event, 
@@ -515,15 +519,30 @@ async def accounts_cb(event):
                      [Button.inline("🔙 بازگشت", b"home")]],
         )
         return
+    page_items, nav, page, total_pages = _paginate(accounts, page, "accpage_")
+    # keep the ORIGINAL 1-based numbering across pages
+    offset = page * ACC_PAGE_SIZE
     buttons = []
-    for i, acc in enumerate(accounts, start=1):
+    for i, acc in enumerate(page_items, start=offset + 1):
         mark = "" if acc["status"] == "active" else " ⚠️"
         buttons.append([Button.inline(f"{i}- {acc['phone']}{mark}",
                                       f"acc_{acc['id']}".encode())])
+    if nav:
+        buttons.append(nav)
     buttons.append([Button.inline("🔄 بررسی و پاکسازی اکانت‌های پریده",
                                   b"acc_sweep")])
     buttons.append([Button.inline("🔙 بازگشت", b"home")])
-    await safe_edit(event, "👤 اکانت‌های تو:", buttons=buttons)
+    title = "👤 اکانت‌های تو:"
+    if total_pages > 1:
+        title += f"  (صفحه {page + 1}/{total_pages})"
+    await safe_edit(event, title, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(pattern=b"accpage_(\\d+)"))
+async def accounts_page_cb(event):
+    if not is_owner(event):
+        return
+    await _render_accounts(event, int(event.pattern_match.group(1)))
 
 
 @bot.on(events.CallbackQuery(data=b"acc_sweep"))
@@ -934,20 +953,58 @@ async def build_backup_archive():
 # --------------------------------------------------------------------------- #
 # Send menu (pick which account)
 # --------------------------------------------------------------------------- #
-@bot.on(events.CallbackQuery(data=b"send_menu"))
-async def send_menu_cb(event):
-    if not is_owner(event):
-        return
+# --------------------------------------------------------------------------- #
+# Account-list pagination (presentation-only). 15 buttons per page with
+# ◀️/▶️ navigation. First page has no ◀️ and last page has no ▶️.
+# --------------------------------------------------------------------------- #
+ACC_PAGE_SIZE = 15
+
+
+def _paginate(items, page, cb_prefix, per_page=ACC_PAGE_SIZE):
+    """Return (page_items, nav_row, page, total_pages) for a long button list."""
+    total_pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(int(page), total_pages - 1))
+    start = page * per_page
+    page_items = items[start:start + per_page]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("◀️ قبلی", f"{cb_prefix}{page - 1}".encode()))
+    if page < total_pages - 1:
+        nav.append(Button.inline("بعدی ▶️", f"{cb_prefix}{page + 1}".encode()))
+    return page_items, nav, page, total_pages
+
+
+async def _render_send_menu(event, page: int = 0):
     accounts = db.list_accounts()
     if not accounts:
         await safe_edit(event, "اول یک اکانت اضافه کن.",
                          buttons=[[Button.inline("➕ افزودن اکانت", b"add_account")],
                                   [Button.inline("🔙 بازگشت", b"home")]])
         return
+    page_items, nav, page, total_pages = _paginate(accounts, page, "smpage_")
     buttons = [[Button.inline(f"🚀 {a['phone']}", f"sm_{a['id']}".encode())]
-               for a in accounts]
+               for a in page_items]
+    if nav:
+        buttons.append(nav)
     buttons.append([Button.inline("🔙 بازگشت", b"home")])
-    await safe_edit(event, "با کدوم اکانت ارسال بشه؟", buttons=buttons)
+    title = "با کدوم اکانت ارسال بشه؟"
+    if total_pages > 1:
+        title += f"  (صفحه {page + 1}/{total_pages})"
+    await safe_edit(event, title, buttons=buttons)
+
+
+@bot.on(events.CallbackQuery(data=b"send_menu"))
+async def send_menu_cb(event):
+    if not is_owner(event):
+        return
+    await _render_send_menu(event, 0)
+
+
+@bot.on(events.CallbackQuery(pattern=b"smpage_(\\d+)"))
+async def send_menu_page_cb(event):
+    if not is_owner(event):
+        return
+    await _render_send_menu(event, int(event.pattern_match.group(1)))
 
 
 @bot.on(events.CallbackQuery(pattern=b"sm_(\\d+)"))
@@ -963,7 +1020,8 @@ async def send_mode_cb(event):
     await safe_edit(event, 
         f"📤 نوع ارسال با اکانت {acc['phone']} رو انتخاب کن:",
         buttons=[
-            [Button.inline("🚀 ارسال معمولی (به مخاطبین)", f"send_{account_id}".encode())],
+            [Button.inline("📎 فوروارد مارکر به مخاطبین", f"send_{account_id}".encode())],
+            [Button.inline("✍️ متن ساده به مخاطبین", f"sendtext_{account_id}".encode())],
             [Button.inline("📢 ارسال به شیوه کانال", f"chan_{account_id}".encode())],
             [Button.inline("🔙 بازگشت", b"send_menu")],
         ],
@@ -997,6 +1055,8 @@ async def message_router(event):
         await handle_marker(event)
     elif step == "await_rb_text2":
         await handle_rb_text2(event)
+    elif step == "await_plain_text":
+        await handle_plain_text(event)
     elif step == "await_channel_name":
         await handle_channel_name(event)
     elif step == "await_campaign_channel_name":
@@ -1473,6 +1533,76 @@ async def send_prepare_cb(event):
             "ترتیب : چت‌دار ← آنلاین ← Last Seen",
             LINE,
             "به این مخاطب‌ها ارسال بشه؟",
+        ]),
+        buttons=[[Button.inline("✅ تأیید و ارسال", f"go_{account_id}".encode())],
+                 [Button.inline("🔙 لغو", f"acc_{account_id}".encode())]],
+    )
+
+
+@bot.on(events.CallbackQuery(pattern=b"sendtext_(\\d+)"))
+async def send_text_prepare_cb(event):
+    """Prepare a PLAIN-TEXT send (no forward) to ALL contacts. Reuses the same
+    confirm -> go_ -> run_send/run_send_remote pipeline in 'text' mode; no
+    marked message is required."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("اکانت پیدا نشد.", alert=True)
+        return
+    if continuous_busy(account_id):
+        await safe_edit(event,
+            "🔁 یک قابلیت اتومیشن (اتومیشن/منشی/ریپلای/گزارش) روی این اکانت روشنه. "
+            "اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+        return
+    body = get_plain_text()
+    if not body:
+        await safe_edit(event,
+            "📝 هنوز متنِ ساده‌ای تنظیم نشده. اول از «📌 مارکر» → «📝 متن ساده» تنظیمش کن.",
+            buttons=[[Button.inline("📌 مارکر", b"marker")],
+                     [Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+        return
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        await send_text_prepare_remote(event, acc, w, body)
+        return
+    await safe_edit(event, "⏳ در حال آماده‌سازی (اتصال، خواندن مخاطب‌ها) ...")
+    await account_conn.close(acc["phone"])   # ensure single connection (Feature 6)
+    client = rb.open_client(acc["phone"])
+    try:
+        await rb.connect_ready(client)
+        ordered, stats = await rb.get_ordered_recipients(client)
+    except Exception as e:  # noqa: BLE001
+        await safe_edit(event, f"❌ خطا در آماده‌سازی: {e}",
+                         buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+        return
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    if not ordered:
+        await safe_edit(event, "هیچ مخاطبی برای ارسال پیدا نشد.",
+                         buttons=[[Button.inline("🔙 بازگشت", f"acc_{account_id}".encode())]])
+        return
+    pending_send[event.sender_id] = {
+        "account_id": account_id,
+        "phone": acc["phone"],
+        "mode": "text",
+        "text": body,
+        "saved_guid": "",
+        "mid": "",
+        "recipients": [r["guid"] for r in ordered],
+    }
+    await safe_edit(event, 
+        card("✍️ آماده‌ی ارسالِ متن ساده", [
+            f"📝 متن : «{body[:80]}{'…' if len(body) > 80 else ''}»",
+            f"🎯 گیرنده‌ها : {len(ordered)} مخاطب",
+            "ترتیب : چت‌دار ← آنلاین ← Last Seen",
+            LINE,
+            "به این مخاطب‌ها ارسال بشه؟ (بدون فوروارد)",
         ]),
         buttons=[[Button.inline("✅ تأیید و ارسال", f"go_{account_id}".encode())],
                  [Button.inline("🔙 لغو", f"acc_{account_id}".encode())]],
@@ -2113,12 +2243,17 @@ async def marker_cb(event):
         return
     state[event.sender_id] = {"step": "await_marker"}
     cur2 = db.get_rb_text2()
+    plain = get_plain_text()
     await safe_edit(event, 
         f"📌 مارکر فعلی: «{db.get_marker()}»\n{LINE}\n"
         "مارکر جدید رو بفرست (متنی که آخر کپشن پیام نشان‌دارت می‌ذاری):",
         buttons=[[Button.inline(
             ("✍️ متن دوم روبیکا : روشن" if cur2 else "✍️ متن دوم روبیکا : خاموش"),
             b"rbtext2")],
+                 [Button.inline(
+            ("📝 متن ساده (بدون فوروارد) : تنظیم‌شده" if plain
+             else "📝 متن ساده (بدون فوروارد) : خالی"),
+            b"plaintext")],
                  [Button.inline("🔙 بازگشت", b"home")]],
     )
 
@@ -2154,6 +2289,51 @@ async def handle_rb_text2(event):
         return
     db.set_rb_text2(txt)
     await event.respond("✅ متنِ دومِ روبیکا ذخیره شد. (موقعِ ارسال بعد از مارکر فرستاده می‌شه.)",
+                        buttons=main_menu(is_real_owner(event)))
+
+
+# --------------------------------------------------------------------------- #
+# Plain text (no forward): an independent text the owner sets here and can send
+# to ALL contacts from the normal-send / brain flows. This is SEPARATE from the
+# portal auto-send text (portal stays exactly as-is). Stored in app_settings.
+# --------------------------------------------------------------------------- #
+PLAIN_TEXT_KEY = "rb_plain_text"
+
+
+def get_plain_text() -> str:
+    return (db.get_setting(PLAIN_TEXT_KEY, "") or "").strip()
+
+
+def set_plain_text(value: str) -> None:
+    db.set_setting(PLAIN_TEXT_KEY, (value or "").strip())
+
+
+@bot.on(events.CallbackQuery(data=b"plaintext"))
+async def plain_text_cb(event):
+    if not is_owner(event):
+        return
+    cur = get_plain_text()
+    state[event.sender_id] = {"step": "await_plain_text"}
+    await safe_edit(event,
+        "📝 متنِ ساده رو بفرست (بدونِ فوروارد، مستقیم به همهٔ مخاطبین فرستاده می‌شه — همیشه متنه).\n"
+        f"الان: {('«'+cur[:120]+'»') if cur else '—'}\n"
+        "برای پاک‌کردن، فقط یه نقطه (.) بفرست.",
+        buttons=[[Button.inline("🔙 بازگشت", b"marker")]])
+
+
+async def handle_plain_text(event):
+    state.pop(event.sender_id, None)
+    txt = (event.raw_text or "").strip()
+    if txt == ".":
+        set_plain_text("")
+        await event.respond("🗑 متنِ ساده پاک شد.",
+                            buttons=main_menu(is_real_owner(event)))
+        return
+    if not txt:
+        await event.respond("متن خالیه.", buttons=main_menu(is_real_owner(event)))
+        return
+    set_plain_text(txt)
+    await event.respond("✅ متنِ ساده ذخیره شد. (موقعِ ارسال، گزینهٔ «متن ساده» اینو بدون فوروارد می‌فرسته.)",
                         buttons=main_menu(is_real_owner(event)))
 
 
@@ -2991,6 +3171,58 @@ async def send_prepare_remote(event, acc, w, marker):
     )
 
 
+async def send_text_prepare_remote(event, acc, w, body):
+    """Prepare a PLAIN-TEXT (no forward) send for an account owned by a remote
+    worker. Mirrors send_prepare_remote but skips the marked-post requirement."""
+    if continuous_busy(acc["id"]):
+        await safe_edit(event,
+            "🔁 یک قابلیت اتومیشن (اتومیشن/منشی/ریپلای/گزارش) روی این اکانت روشنه. "
+            "اول از بخش «🔁 اتومیشن» خاموشش کن، بعد ارسال بزن.",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        return
+    await safe_edit(event, f"⏳ بررسی ورکر {w['tag']} و آماده‌سازی ...")
+    try:
+        await worker.check_worker(w)
+    except Exception:
+        pass
+    w = db.get_worker(w["id"])
+    if not (w and w["enabled"] and w["status"] == "ok"):
+        await safe_edit(event, 
+            f"❌ ورکر {w['tag'] if w else '?'} الان سالم/فعال نیست"
+            f" (وضعیت: {w['status'] if w else 'نامشخص'}).\n"
+            "این اکانت روی همین ورکر لاگین شده و فقط از همین‌جا می‌تونه بفرسته.",
+            buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        return
+    try:
+        res = await worker.api_call(w, "POST", "/prepare",
+                                    {"phone": acc["phone"], "marker": "", "mode": "text"})
+    except Exception as e:  # noqa: BLE001
+        await safe_edit(event, f"❌ خطا در آماده‌سازی روی ورکر: {repr(e)[:150]}",
+                         buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        return
+    total = res.get("total", 0)
+    if total == 0:
+        await safe_edit(event, "هیچ مخاطبی پیدا نشد.",
+                         buttons=[[Button.inline("🔙 بازگشت", f"acc_{acc['id']}".encode())]])
+        return
+    pending_send[event.sender_id] = {
+        "account_id": acc["id"], "phone": acc["phone"],
+        "remote": True, "worker_id": w["id"], "total": total,
+        "mode": "text", "text": body,
+    }
+    await safe_edit(event, 
+        card(f"✍️ آماده‌ی ارسالِ متن ساده (ورکر {w['tag']})", [
+            f"📝 متن : «{body[:80]}{'…' if len(body) > 80 else ''}»",
+            f"🎯 گیرنده‌ها : {total} مخاطب",
+            "ترتیب : چت‌دار ← آنلاین ← Last Seen",
+            LINE,
+            "به این مخاطب‌ها ارسال بشه؟ (بدون فوروارد)",
+        ]),
+        buttons=[[Button.inline("✅ تأیید و ارسال", f"go_{acc['id']}".encode())],
+                 [Button.inline("🔙 لغو", f"acc_{acc['id']}".encode())]],
+    )
+
+
 async def run_send_remote(owner_id: int, payload: dict):
     account_id = payload["account_id"]
     # clear any stale stop flag so a resumed / multi-account / brain send is not
@@ -3002,6 +3234,9 @@ async def run_send_remote(owner_id: int, payload: dict):
     delay = db.get_delay()
     count = _next_counter()
     total = payload.get("total", 0)
+    # plain-text mode: send a configured text (no forward). Default stays marker.
+    mode = (payload.get("mode") or "marker").lower()
+    send_body = payload.get("text") or ""
     # resume fix: an explicit remaining list means this run is a resume /
     # worker-transfer (full engine, same as a normal send).
     explicit_recipients = payload.get("recipients") or None
@@ -3037,7 +3272,8 @@ async def run_send_remote(owner_id: int, payload: dict):
             LINE,
             f"🎯 Targets : {total}",
             f"⏱ Delay : {delay}s",
-            f"📌 Marker : «{marker}» Found ✅",
+            ("✍️ Mode : Custom text" if mode == "text"
+             else f"📌 Marker : «{marker}» Found ✅"),
         ]))
 
     prev_retry = 0
@@ -3050,8 +3286,10 @@ async def run_send_remote(owner_id: int, payload: dict):
             "max_retries": 0 if config.RESUME_UNLIMITED else config.RESUME_MAX_RETRIES,
             "text2": db.get_rb_text2(),   # step 5: optional Rubika second text
             "recipients": explicit_recipients or [],  # resume fix: remaining list
+            "mode": mode, "text": send_body,   # plain-text (no forward) mode
         })
-        if not res.get("ok") or not res.get("marker_found"):
+        # in text mode there is no marked post to find; only require ok
+        if not res.get("ok") or (mode != "text" and not res.get("marker_found")):
             reason = "Marker not found on worker"
         else:
             job_id = res["job_id"]
@@ -7626,11 +7864,14 @@ async def brain_send_cb(event):
                         buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
         return
     marker = db.get_marker()
+    plain = get_plain_text()
     await safe_edit(event, card("🧠 READY TO SEND", [
         f"📌 Marker : «{marker}»",
+        f"📝 Plain text : {('«'+plain[:60]+'»') if plain else '—'}",
         f"🎯 Up to {db.get_brain_cap()} added contacts per account",
-        "Confirm to start."]),
-        buttons=[[Button.inline("✅ تأیید و ارسال", b"bsendgo")],
+        "روش ارسال رو انتخاب کن:"]),
+        buttons=[[Button.inline("📎 فوروارد مارکر", b"bsendgo")],
+                 [Button.inline("✍️ متن ساده", b"bsendgotext")],
                  [Button.inline("🔙 بازگشت", b"home")]])
 
 
@@ -7648,6 +7889,29 @@ async def brain_send_go_cb(event):
     # Register SYNCHRONOUSLY before scheduling (see _run_brain note).
     brain_control.controller.start(event.sender_id, list(job.keys()))
     asyncio.create_task(_run_brain_send(event.sender_id, job))
+
+
+@bot.on(events.CallbackQuery(data=b"bsendgotext"))
+async def brain_send_go_text_cb(event):
+    """Brain SEND phase in PLAIN-TEXT mode (no forward) to the added contacts."""
+    if not is_owner(event):
+        return
+    body = get_plain_text()
+    if not body:
+        await safe_edit(event,
+            "📝 هنوز متنِ ساده‌ای تنظیم نشده. اول از «📌 مارکر» → «📝 متن ساده» تنظیمش کن.",
+            buttons=[[Button.inline("📌 مارکر", b"marker")],
+                     [Button.inline("🏠 منوی اصلی", b"home")]])
+        return
+    job = brain_jobs.pop(event.sender_id, None)
+    if not job:
+        await event.answer("اطلاعات منقضی شده.", alert=True)
+        return
+    await safe_edit(event, "🚀 ارسال مغز (متن ساده) شروع شد. گزارش‌ها تو گروه لاگ میاد.",
+                    buttons=[[Button.inline("⏹ توقف مغز", b"bstop")],
+                             [Button.inline("🏠 منوی اصلی", b"home")]])
+    brain_control.controller.start(event.sender_id, list(job.keys()))
+    asyncio.create_task(_run_brain_send(event.sender_id, job, mode="text", body=body))
 
 
 @bot.on(events.CallbackQuery(data=b"bstop"))
@@ -7669,12 +7933,15 @@ async def brain_stop_cb(event):
     await event.answer("⏹ توقف مغز ثبت شد. اکانتِ جاری هم بلافاصله متوقف می‌شه.", alert=True)
 
 
-async def _run_brain_send(owner_id, job):
+async def _run_brain_send(owner_id, job, mode="marker", body=""):
     marker = db.get_marker()
     delay = db.get_delay()
     cap = db.get_brain_cap()
+    mode = (mode or "marker").lower()
     await log(card("🧠 BRAIN SEND START", [
-        f"📌 Marker : «{marker}»", f"🎯 Cap per account : {cap}", f"🕒 {now()}"]))
+        (f"✍️ Plain text : «{body[:60]}»" if mode == "text"
+         else f"📌 Marker : «{marker}»"),
+        f"🎯 Cap per account : {cap}", f"🕒 {now()}"]))
     for aid, info in job.items():
         if brain_control.controller.is_stopped(owner_id):
             await log(card("🧠 BRAIN SEND — MANUAL STOP", [f"🕒 {now()}"]))
@@ -7695,7 +7962,8 @@ async def _run_brain_send(owner_id, job):
                     "phone": phone, "marker": marker, "guids": guids,
                     "delay": delay, "max_errors": db.get_max_errors(),
                     "send_timeout": config.SEND_TIMEOUT,
-                    "text2": db.get_rb_text2(), "order": True}, timeout=14400)
+                    "text2": db.get_rb_text2(), "order": True,
+                    "mode": mode, "text": body}, timeout=14400)
                 if not res.get("ok"):
                     raise RuntimeError(res.get("error", "send failed"))
                 await log(card("🧠 SEND — account done (worker)", [
@@ -7705,6 +7973,14 @@ async def _run_brain_send(owner_id, job):
             except Exception as e:  # noqa: BLE001
                 await log(card("🧠 SEND — remote error", [
                     f"{tag} 📱 {phone}", f"💥 {repr(e)[:140]}"]))
+            continue
+        # local plain-text mode: no marker needed, send_text via run_send
+        if mode == "text":
+            await run_send(owner_id, {
+                "account_id": aid, "phone": phone, "saved_guid": "", "mid": "",
+                "mode": "text", "text": body,
+                "recipients": guids, "tag": tag, "suppress_resume_panel": True,
+                "order_recipients": True})
             continue
         # local: find marker then forward to the collected guids
         try:
