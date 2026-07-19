@@ -466,6 +466,7 @@ def _build_app():
                 # contact re-read -> no overlap between channels.
                 guids = list(body.guids)
                 added = 0
+                failed_batches = 0
                 step = max(1, int(body.batch))
                 for i in range(0, len(guids), step):
                     chunk = guids[i:i + step]
@@ -473,9 +474,20 @@ def _build_app():
                         await rb.add_channel_members(client, body.channel_guid, chunk)
                         added += len(chunk)
                     except Exception:
-                        pass
+                        # keep going with the remaining batches, but no longer
+                        # pretend the failed batch succeeded (old code swallowed
+                        # this silently and still reported CHANNEL DONE).
+                        failed_batches += 1
                     if i + step < len(guids):
                         await asyncio.sleep(max(0.0, float(body.delay)))
+                # Incremental, backward-compatible metrics. `added` is kept for
+                # old callers; `accepted` is the same value but named honestly
+                # ("accepted by the add API", NOT a verified member count).
+                requested = len(guids)
+                return {"ok": True, "added": added,
+                        "requested": requested, "accepted": added,
+                        "failed": max(0, requested - added),
+                        "failed_batches": failed_batches}
             else:
                 added = await rb.seed_channel_with_contacts(
                     client, body.channel_guid, target=body.target,

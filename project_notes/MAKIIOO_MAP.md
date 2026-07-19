@@ -66,11 +66,52 @@
 
 ---
 
+---
+
+## آپدیت این نشست — فیکس مغز کانال + نمایش ورکر + حذف کد مرده
+> شاخه: `fix/channel-brain-worker-display` (از `feat/build-from-meow@dcbc0aa`).
+> فقط ۲ فایل کد تغییر کرد: `bot.py`, `worker_api.py` (+ همین فایل نقشه).
+> اصل کار: «منطق اصلی دست نخورد، فقط صحت/تحمل‌خطا بهتر شد و نمایش حرفه‌ای‌تر».
+
+### ۱) فیکس صحت/تحمل‌خطای مغز کانال — `bot.py` + `worker_api.py`
+- **باگ قبلی:** runner نتیجه‌ی واقعی ADD/SEND را مصرف نمی‌کرد؛ حتی با marker گمشده یا batch شکست‌خورده، کارت `CHANNEL DONE ✅` و `made += 1` ثبت می‌شد (موفقیت جعلی). خطای هر batch در `/channel/add` و `_cbrain_add_exact` بی‌صدا بلعیده می‌شد. CREATE بدون retry بود. runner در `try/finally` بیرونی نبود → احتمال نشتِ `cbrain_jobs`/live task.
+- **`worker_api.py::/channel/add`** (افزایشی، backward-compatible): مسیر `guids` دیگر batch شکست‌خورده را موفق حساب نمی‌کند؛ `failed_batches` می‌شمارد و علاوه بر `ok`/`added`، کلیدهای `requested`/`accepted`/`failed`/`failed_batches` هم برمی‌گرداند. مسیر بدون `guids` (`seed_channel_with_contacts`) **دست‌نخورده**. کالرهایی که فقط `ok`/`added` می‌خوانند بی‌اثر می‌مانند.
+- **`bot.py::_cbrain_add_exact`**: حالا dict `{requested, accepted, failed_batches}` برمی‌گرداند (parity کامل local/worker). با worker **قدیمی** که فقط `ok`/`added` دارد graceful است (`accepted <- added`, `failed_batches <- 0`).
+- **`bot.py::_run_channel_brain`** بازنویسی شد:
+  - کل حلقه در `try/except/finally`؛ `finally` همیشه `ctl["finished"]=True`، cancel live task، `cbrain_jobs.pop`، و ارسال کارت پایانی (حتی روی استثنای غیرمنتظره → کارت `PHASE: RUNNER`).
+  - **CREATE retry:** `1 + config.RESUME_MAX_RETRIES` تلاش (پیش‌فرض ۳)، فاصله `config.CHANNEL_ADD_DELAY`، با همان GUIDهای frozen (بدون کشف دوباره). **config جدیدی ساخته نشد.**
+  - مصرف واقعی `(ok, fail)` از `_send_to_guids`.
+  - وضعیت صادقانه‌ی هر کانال با helper جدید `_cbrain_result_card`: `COMPLETED` فقط وقتی `built==target` و همه‌ی requested پذیرفته شده و `send ok>=1/fail==0`؛ وگرنه `PARTIAL`؛ `FAILED` فقط برای build-exception یا شکست CREATE بعد از همه‌ی retryها. **دیگر `CHANNEL DONE` جعلی نیست.**
+  - `InvalidAuth` هر فاز = توقف کنترل‌شده‌ی کل run (final = SESSION INVALID).
+  - final card: شمارش `COMPLETED/PARTIAL/FAILED` + built/accepted/sent واقعی.
+- **⚠️ trade-off شناخته‌شده (عمدی، طبق نقشه):** چون `/channel/create` idempotent نیست، اگر create روی سرور موفق شود ولی پاسخش timeout/قطع شود، retry یک **کانال تکراری** (هم‌عنوان، بدون عضو) می‌سازد. ریسک کم و بی‌ضرر است. اگر روزی خواستی صفرش کنی: retry را روی خطاهای مبهم (timeout/network) gate کن — ولی این تغییرِ منطق است و نیاز به تأیید دارد.
+- **دست‌نخورده:** ترتیب `BUILD→CREATE→ADD→SEND`، منبع محتوا (`db.get_marker()`)، discovery/ledger، هیچ DB/schema/persistence جدید. `accepted` = «پذیرفته‌شده توسط add API»، نه شمارش عضو واقعی (primitive واقعی نداریم؛ در کامنت‌ها تصریح شده).
+
+### ۲) نمایش ورکر — صرفاً presentation انگلیسی/حرفه‌ای — `bot.py`
+- helperهای جدید فقط-نمایشی (بعد از `_ping_text`): `_wk_type` (MASTER/REMOTE)، `_wk_state` (DISABLED/UPDATING/ACTIVE/BLOCKED/OFFLINE/UNKNOWN از `enabled`/`_worker_updating_ids`/`status`)، `_wk_route` (OK/BLOCKED/UNCHECKED از `file_ok`/`status`)، `_wk_status_block`.
+- بازنویسی نمایشی: `worker_status_all_card`, `added_worker_card`, لیبل دکمه‌های `workers_cb`, `wk_detail_cb`, `w_versions_cb`, و پیام‌های کاربرپسند `provision_and_register`/`wk_update_cb`/`_update_all_workers`/`w_updall_cb`/timeout در `_safe_update_worker`.
+- **هیچ منطقی تغییر نکرد:** `_safe_worker_update_command` **byte-identical** (با اسکریپت مقایسه تأیید شد)، قرارداد بازگشتی updater (`updated`/`current`/`failed`) و markerهای STAGE و parsing دست‌نخورده، همه‌ی `callback_data` عیناً یکسان (فقط لیبل/متن پنل)، health/selection/routing دست‌نخورده. promptهای ورودی و دکمه‌های action فارسی باقی ماندند.
+
+### ۳) حذف کد قطعاً مرده — `bot.py`
+- حذف‌شده: متغیر `pending_dead_accounts`، callback `b"acc_sweep_del"`، تابع `accounts_sweep_delete_cb`. (هیچ دکمه‌ای این callback را تولید نمی‌کرد و متغیر فقط داخل همین تابع مرده pop می‌شد.)
+- **حذف نشد (زنده):** `acc_sweep`/`run_accounts_sweep`، `portal_quarantine` و delete canonical، `health_engine_loop`/`run_health_engine`، `observer.run`، جدول‌ها/helperهای generator/broadcaster در `db.py`، `/broadcast/run` و `/gen/*`.
+- **۴ lint ارثی base** (دو F541، دو import تلگرام) عمداً دست‌نخورده (خارج scope).
+
+### روش تست این آپدیت (بدون افزودن test-file به ریپو)
+- شبکه‌ی سندباکس `INTEGRATIONS_ONLY` است؛ `telethon`/`rubpy`/`dotenv` نصب نیستند. برای import و تست runner واقعی، **stub سبک** ساخته شد در `/projects/sandbox/_stubs` (خارج ریپو): `dotenv.py`, `rubpy/`, `telethon/`.
+- اجرا: `PYTHONPATH=/projects/sandbox/_stubs:<repo> API_ID=1 API_HASH=x BOT_TOKEN=1:AAA OWNER_ID=1 python3 ...`.
+- هارنس‌ها (خارج ریپو): `test_cbrain.py` (۳۸ سناریوی runner: success/partial/failed/retry/InvalidAuth/stop/unexpected/cleanup)، `test_addexact.py` (۸ تست parity worker/local + backward-compat)، `test_worker_display.py` (۲۰ تست mapping/cards). همه PASS.
+- گیت‌ها: `python3 -m compileall`، `ruff --select F821,F811,F823` (پاک)، grep نبود کد مرده و حفظ نمادهای زنده، git diff allowlist (فقط ۲ فایل کد)، semantic review.
+
+---
+
 ## نکات تداخل سشن (مهم برای آپدیت بعدی)
 - یک اتصال زنده برای هر session؛ قبل از اتصال جدید، قبلی بسته شود (`account_conn.close`).
 - حذف اکانت فقط با InvalidAuth قطعی و **تأیید صریح مالک** (پنل قرنطینه). timeout/شبکه/FloodWait/Worker unavailable = خطای موقت، هرگز حذف/قرنطینه‌ی قطعی.
 - دو نمونه‌ی هم‌زمان master اجرا نشود.
 - runnerهای درون‌حافظه‌ای (مغز کانال، brain، broadcaster قدیمی) با restart از دست می‌روند — این عمدی است.
+- **مغز کانال تک‌اجراست:** `cbrain_jobs[owner_id]` به‌عنوان قفل عمل می‌کند؛ تا وقتی پاک نشود اجرای دوم شروع نمی‌شود. بعد از این آپدیت، `finally` تضمین می‌کند این قفل و live task **همیشه** آزاد شوند (حتی روی خطای غیرمنتظره)، پس دیگر «مغز گیرکرده» رخ نمی‌دهد.
+- **stubهای تست** (`/projects/sandbox/_stubs`) عمداً خارج ریپو هستند تا با کد پروژه commit نشوند؛ اگر سشن/کلونِ تازه گرفتی و خواستی دوباره تست کنی، طبق «روش تست این آپدیت» بالا بازشان بساز.
 
 ## ⚠️ نکته‌ی deploy (اجباری قبل از اجرا)
 `config.GIT_REPO_URL` پیش‌فرض = `https://github.com/willbedoneuw/YoudonoaAx` و `GIT_BRANCH=main`
@@ -82,6 +123,7 @@
 - push مستقیم به main/production ممنوع؛ فقط شاخه‌ی جدید + PR.
 - بدون افزودن تست‌فایل؛ صحت‌سنجی با `python -m compileall` + smoke دستی.
 
-## وضعیت این آپدیت
-- شاخه: `feat/build-from-meow`. کامیت‌ها: base → worker fix → channel-brain → english-logs → watcher-merge.
-- صحت‌سنجی: compileall پاک، ruff F-category پاک (فقط ۴ مورد cosmetic ارثی base)، import ماژول‌های هسته پاک، round-trip config مغز کانال، `bash -n` اسکریپت‌های ورکر.
+## وضعیت آپدیت‌ها
+- شاخه‌ی قبلی: `feat/build-from-meow`. کامیت‌ها: base → worker fix → channel-brain → english-logs → watcher-merge.
+- شاخه‌ی این نشست: `fix/channel-brain-worker-display` (از `dcbc0aa`). سه بخش: فیکس مغز کانال + نمایش ورکر + حذف کد مرده. فقط `bot.py`/`worker_api.py` (+ این نقشه).
+- صحت‌سنجی این نشست: compileall پاک، ruff `F821/F811/F823` پاک، `_safe_worker_update_command` byte-identical، ۶۶ تست (۳۸+۸+۲۰) PASS، grep دیف allowlist، semantic review سبز (تنها نکته: trade-off عمدیِ retry تکراری‌سازی کانال، بالا توضیح داده شد).

@@ -93,8 +93,6 @@ pending_channel: dict = {}
 stop_flags: dict = {}
 # accounts currently running a send/channel job (in-memory busy lock)
 active_jobs: set = set()
-# owner_id -> [account_id, ...] dead accounts awaiting delete confirmation
-pending_dead_accounts: dict = {}
 # running LOCAL automation tasks: account_id -> {"task":Task, "state":dict}
 automation_tasks: dict = {}
 # running LOCAL automation-EXTRAS tasks: account_id -> {"task":Task, "state":dict}
@@ -568,47 +566,6 @@ async def run_accounts_sweep(owner_id: int):
             buttons=rows)
     except Exception:
         pass
-
-
-@bot.on(events.CallbackQuery(data=b"acc_sweep_del"))
-async def accounts_sweep_delete_cb(event):
-    """Confirmed deletion of the kicked-out accounts found by the last sweep."""
-    if not is_owner(event):
-        return
-    dead_ids = pending_dead_accounts.pop(event.sender_id, [])
-    if not dead_ids:
-        await safe_edit(event, "لیست اکانت‌های پریده منقضی شده. دوباره «🔄 بررسی» رو بزن.",
-                        buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")]])
-        return
-    deleted = []
-    for aid in dead_ids:
-        acc = db.get_account(aid)
-        if not acc:
-            continue
-        phone = acc["phone"]
-        # make sure nothing is still running for it, then delete fully
-        for stopper in (stop_automation, stop_secretary, stop_channelreport,
-                        stop_reply):
-            try:
-                await stopper(acc)
-            except Exception:
-                pass
-        try:
-            await account_conn.close(phone)
-        except Exception:
-            pass
-        try:
-            db.delete_account(aid)
-            deleted.append(phone)
-        except Exception:
-            pass
-    await log(card("🗑 DEAD ACCOUNTS REMOVED", [
-        f"🗑 حذف‌شده: {len(deleted)}",
-        LINE, *[f"• {p}" for p in deleted], LINE, f"🕒 {now()}"]))
-    await safe_edit(event,
-        f"✅ {len(deleted)} اکانتِ پریده کاملاً حذف شدند.",
-        buttons=[[Button.inline("👤 اکانت‌های من", b"accounts")],
-                 [Button.inline("🏠 منوی اصلی", b"home")]])
 
 
 # --------------------------------------------------------------------------- #
@@ -2278,35 +2235,64 @@ def _ping_text(w) -> str:
     return f"{p}ms" if (p is not None and p >= 0) else "—"
 
 
+# --------------------------------------------------------------------------- #
+# Presentation-only worker helpers. These derive human, English labels from
+# EXISTING worker fields (status / file_ok / enabled) and the local
+# _worker_updating_ids set. They do NOT touch health semantics, selection,
+# routing or the updater — they only shape how a worker is *shown*.
+# --------------------------------------------------------------------------- #
+def _wk_type(w) -> str:
+    return "MASTER" if w.get("is_master") else "REMOTE"
+
+
+def _wk_state(w) -> str:
+    """English state label from existing fields only (presentation)."""
+    if not w.get("enabled"):
+        return "DISABLED"
+    try:
+        if w.get("id") in _worker_updating_ids:
+            return "UPDATING"
+    except Exception:
+        pass
+    return {"ok": "ACTIVE", "blocked": "BLOCKED",
+            "down": "OFFLINE"}.get(w.get("status") or "unknown", "UNKNOWN")
+
+
+def _wk_route(w) -> str:
+    """Rubika reachability label from the existing file_ok/status fields."""
+    if w.get("file_ok"):
+        return "OK"
+    if (w.get("status") or "") == "blocked":
+        return "BLOCKED"
+    return "UNCHECKED"
+
+
+def _wk_status_block(w) -> list:
+    """Shared, professional per-worker status lines (English)."""
+    lines = [
+        f"{worker.status_emoji(w)} [{_wk_state(w)}] {_wk_type(w)} · {w['tag']}",
+        f"   IP    : {w['ip']}",
+        f"   Ping  : {_ping_text(w)} · Route: {_wk_route(w)}",
+    ]
+    if not w.get("file_ok"):
+        d = worker.health_detail(w["id"])
+        if d:
+            lines.append(f"   Note  : {d}")
+    return lines
+
+
 def worker_status_all_card(workers) -> str:
-    lines = ["🛠 STATU WORKER ALL", LINE]
+    lines = ["🛰 WORKERS — STATUS", LINE]
     for w in workers:
-        lines.append(f"🖥 {w['ip']} {w['tag']}")
-        lines.append(LINE)
-        lines.append(f"{worker.status_emoji(w)} {w['ip']} -{_ping_text(w)} - {worker.file_label(w)}")
-        # When unhealthy, show the diagnostic reason so the cause is visible.
-        if not w.get("file_ok"):
-            d = worker.health_detail(w["id"])
-            if d:
-                lines.append(f"ℹ️ {d}")
+        lines += _wk_status_block(w)
         lines.append(LINE)
     lines.append(f"🕒 {now()}")
     return "\n".join(lines)
 
 
 def added_worker_card(w) -> str:
-    rows = [
-        "🛠 ADDED WORKER", LINE,
-        f"🖥 {w['ip']} {w['tag']}", LINE,
-        "🛠 Statu Worker", LINE,
-        f"{worker.status_emoji(w)} {w['ip']} -{_ping_text(w)} - {worker.file_label(w)}",
-    ]
-    if not w.get("file_ok"):
-        d = worker.health_detail(w["id"])
-        if d:
-            rows.append(f"ℹ️ {d}")
-    rows += [LINE, f"🕒 {now()}"]
-    return "\n".join(rows)
+    return "\n".join(["🆕 WORKER ADDED", LINE] + _wk_status_block(w)
+                     + [LINE, f"🕒 {now()}"])
 
 
 async def log_status_all(refresh: bool = True):
@@ -2333,10 +2319,9 @@ async def workers_cb(event):
     workers = db.list_workers()
     rows = []
     for w in workers:
-        off = "" if w["enabled"] else " (خاموش)"
         kind = "🏠" if w["is_master"] else "🖥"
         rows.append([Button.inline(
-            f"{worker.status_emoji(w)} {kind} {w['tag']} • {w['ip']}{off}",
+            f"{worker.status_emoji(w)} {kind} {w['tag']} · {w['ip']} · [{_wk_state(w)}]",
             f"wk_{w['id']}".encode())])
     rows.append([Button.inline("➕ افزودن ورکر", b"wk_add"),
                  Button.inline("🔄 رفرش وضعیت", b"wk_refresh")])
@@ -2563,8 +2548,8 @@ async def _safe_update_worker(w):
         return "updated", detail
     except asyncio.TimeoutError:
         return ("failed",
-                "timeout: عملیات Worker از سقف امن زمانی عبور کرد؛ "
-                "rollback ایمن برای مرحله تعویض فعال است.")
+                "timeout: the Worker operation exceeded the safe time budget; "
+                "safe rollback is in effect for the swap stage.")
     except Exception as exc:  # noqa: BLE001
         return "failed", f"{type(exc).__name__}: {str(exc)[:300]}"
     finally:
@@ -2605,8 +2590,8 @@ async def w_updall_cb(event):
 
     task.add_done_callback(clear_update_task)
     await safe_edit(event,
-        f"⬆️ آپدیت امن {len(workers)} ورکر شروع شد (برنچ: {config.GIT_BRANCH}).\n"
-        "هر Worker فقط یک‌بار و ترتیبی اجرا می‌شود؛ نسخه قبلی تا آماده‌شدن image جدید حفظ می‌شود.",
+        f"⬆️ Safe update of {len(workers)} worker(s) started (branch: {config.GIT_BRANCH}).\n"
+        "Each worker runs once, sequentially; the current version is kept until the new image is ready.",
         buttons=[[Button.inline("🔙 ورکرها", b"workers")]])
 
 
@@ -2622,17 +2607,17 @@ async def _update_all_workers(chat_id, workers):
         _worker_updating_ids.add(wid)
         try:
             with contextlib.suppress(Exception):
-                await bot.send_message(chat_id, f"⏳ آپدیت امن {tag} • {ip} ...")
+                await bot.send_message(chat_id, f"⏳ Safe update {tag} · {ip} …")
             status, detail = await _safe_update_worker(w)
             if status == "updated":
                 updated_n += 1
-                msg = f"✅ {tag} • {ip} آپدیت شد.\n{detail}"
+                msg = f"✅ {tag} · {ip} updated.\n{detail}"
             elif status == "current":
                 current_n += 1
-                msg = f"⏭ {tag} • {ip} از قبل به‌روز بود؛ رد شد.\n{detail}"
+                msg = f"⏭ {tag} · {ip} already up to date; skipped.\n{detail}"
             else:
                 fail_n += 1
-                msg = f"❌ {tag} • {ip} ناموفق؛ rollback ایمن فعال بود.\n{detail[-700:]}"
+                msg = f"❌ {tag} · {ip} failed; safe rollback was in effect.\n{detail[-700:]}"
         finally:
             _worker_updating_ids.discard(wid)
         with contextlib.suppress(Exception):
@@ -2640,10 +2625,10 @@ async def _update_all_workers(chat_id, workers):
         if chat_id != config.LOG_GROUP_ID:
             with contextlib.suppress(Exception):
                 await log(msg)
-    final = card("⬆️ آپدیت امن همه Workerها — پایان", [
-        f"✅ آپدیت‌شده : {updated_n}",
-        f"⏭ از قبل به‌روز : {current_n}",
-        f"❌ ناموفق : {fail_n}",
+    final = card("⬆️ SAFE UPDATE — ALL WORKERS — DONE", [
+        f"✅ Updated      : {updated_n}",
+        f"⏭ Already up to date : {current_n}",
+        f"❌ Failed       : {fail_n}",
         f"🕒 {now()}",
     ])
     with contextlib.suppress(Exception):
@@ -2655,7 +2640,7 @@ async def w_versions_cb(event):
     if not is_owner(event):
         return
     await event.answer("در حال گرفتنِ نسخه‌ها ...")
-    rows = [f"🏠 مستر : {master_code_version()}", LINE]
+    rows = [f"🏠 MASTER : {master_code_version()}", LINE]
     for w in db.list_workers():
         if w["is_master"]:
             continue
@@ -2664,9 +2649,9 @@ async def w_versions_cb(event):
             res = await worker.api_call(w, "GET", "/health")
             ver = str(res.get("version") or "—")
         except Exception as e:  # noqa: BLE001
-            ver = f"خطا: {repr(e)[:40]}"
-        rows.append(f"🖥 {w['tag']} • {w['ip']} : {ver}")
-    await safe_edit(event, card("🧾 نسخه‌ها", rows + [LINE, f"🕒 {now()}"]),
+            ver = f"error: {repr(e)[:40]}"
+        rows.append(f"🖥 {w['tag']} · {w['ip']} : {ver}")
+    await safe_edit(event, card("🧾 CODE VERSIONS", rows + [LINE, f"🕒 {now()}"]),
                     buttons=[[Button.inline("🔙 ورکرها", b"workers")]])
 
 
@@ -2723,13 +2708,13 @@ async def handle_worker_step(event, step):
 
 
 async def provision_and_register(event, wk):
-    msg = await event.respond("🚀 شروع نصب ورکر روی سرور ...")
+    msg = await event.respond("🚀 Provisioning worker on the server …")
 
     # Reserve the worker tag up-front so the "building" log and the final
     # "added" card share the SAME tag.
     tag = worker.gen_tag()
-    await log(card("🛠 WORKER BUilDING....", [
-        f"🖥 {wk['ip']} {tag}",
+    await log(card("🛠 WORKER — BUILDING …", [
+        f"🖥 {wk['ip']} · {tag}",
         LINE,
         f"🕒 {now()}",
     ]))
@@ -2744,7 +2729,7 @@ async def provision_and_register(event, wk):
                                          wk["user"], wk["pass"],
                                          tag=tag, on_progress=progress)
     if not prov.get("ok"):
-        await safe_edit(msg, f"❌ نصب ناموفق: {prov.get('error')}",
+        await safe_edit(msg, f"❌ Provisioning failed: {prov.get('error')}",
                        buttons=[[Button.inline("🔙 بازگشت", b"workers")]])
         return
     wid = await worker.register_provisioned(wk["ip"], wk.get("port", 22),
@@ -2753,14 +2738,14 @@ async def provision_and_register(event, wk):
     # Give the freshly started container time to fully come up before the
     # first health check; checking immediately on connect gave a misleading
     # status. Wait 30s, then verify.
-    await safe_edit(msg, "⏳ ورکر نصب شد. ۳۰ ثانیه صبر برای آماده‌شدن کامل و بررسی وضعیت ...")
+    await safe_edit(msg, "⏳ Worker installed. Waiting 30s for it to fully come up, then checking …")
     await asyncio.sleep(30)
     try:
         await worker.check_worker(w)
     except Exception:
         pass
     w = db.get_worker(wid)
-    await safe_edit(msg, f"✅ ورکر {w['tag']} اضافه و بررسی شد.",
+    await safe_edit(msg, f"✅ Worker {w['tag']} added and checked.",
                    buttons=[[Button.inline("🛠 مدیریت ورکر", b"workers")],
                             [Button.inline("🏠 منوی اصلی", b"home")]])
     await log(added_worker_card(w))
@@ -2779,17 +2764,21 @@ async def wk_detail_cb(event):
     n_acc = db.count_accounts_on_worker(wid)
     sent = db.worker_sent_today(wid)
     lines = [
-        f"🛠 ورکر {w['tag']}", LINE,
-        f"🖥 IP : {w['ip']}",
-        f"نوع : {'Master (محلی)' if w['is_master'] else 'Worker'}",
-        f"وضعیت : {worker.status_emoji(w)} {w['status']}",
-        f"پینگ : {_ping_text(w)}",
-        f"فایل : {worker.file_label(w)}",
-        f"اکانت‌ها : {n_acc}",
-        f"ارسال امروز : {sent}",
-        f"فعال : {'بله' if w['enabled'] else 'خیر'}",
-        f"آخرین بررسی : {w.get('last_checked') or '—'}",
+        f"🛠 WORKER · {w['tag']}", LINE,
+        f"Type       : {_wk_type(w)}{' (local)' if w['is_master'] else ''}",
+        f"State      : {worker.status_emoji(w)} {_wk_state(w)}",
+        f"IP         : {w['ip']}",
+        f"Ping       : {_ping_text(w)}",
+        f"Route      : {_wk_route(w)}",
+        f"Accounts   : {n_acc}",
+        f"Sent today : {sent}",
+        f"Enabled    : {'yes' if w['enabled'] else 'no'}",
+        f"Last check : {w.get('last_checked') or '—'}",
     ]
+    if not w.get("file_ok"):
+        d = worker.health_detail(wid)
+        if d:
+            lines.append(f"Note       : {d}")
     rows = []
     if not w["is_master"]:
         toggle = "⏸ قطع" if w["enabled"] else "▶️ وصل"
@@ -2869,21 +2858,21 @@ async def wk_update_cb(event):
     detail = "آپدیت شروع نشد."
     try:
         with contextlib.suppress(Exception):
-            await safe_edit(event, f"⬆️ آپدیت امن Worker {w['tag']} شروع شد؛ نسخه قبلی تا تست image جدید حفظ می‌شود...")
+            await safe_edit(event, f"⬆️ Safe update of Worker {w['tag']} started; the current version is kept until the new image passes its test …")
         status, detail = await _safe_update_worker(w)
     finally:
         _worker_updating_ids.discard(wid)
         _release_worker_update_lock()
     if status == "failed":
-        await safe_edit(event, f"❌ آپدیت ناموفق؛ rollback ایمن فعال بود.\n{detail[-700:]}",
+        await safe_edit(event, f"❌ Update failed; safe rollback was in effect.\n{detail[-700:]}",
                          buttons=[[Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
     if status == "current":
-        await safe_edit(event, f"⏭ Worker {w['tag']} از قبل به‌روز بود؛ تغییری انجام نشد.\n{detail}",
+        await safe_edit(event, f"⏭ Worker {w['tag']} was already up to date; no change.\n{detail}",
                          buttons=[[Button.inline("🧾 نسخه‌ها", b"w_versions")],
                                   [Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
         return
-    await safe_edit(event, f"✅ Worker {w['tag']} با موفقیت آپدیت شد.\n{detail}",
+    await safe_edit(event, f"✅ Worker {w['tag']} updated successfully.\n{detail}",
                     buttons=[[Button.inline("🧾 نسخه‌ها", b"w_versions")],
                              [Button.inline("🔙 بازگشت", f"wk_{wid}".encode())]])
 
@@ -4611,6 +4600,34 @@ def _cbrain_error_card(phone, ch_index, phase, err) -> str:
     ])
 
 
+# Per-channel result card. Title carries the HONEST status so we never print a
+# green "DONE" when the channel is only partially built or the content was not
+# delivered. "ADDED" is reported as "accepted by the add API", not a verified
+# member count (the base primitive gives no real count).
+_CBRAIN_STATUS = {
+    "COMPLETED": "🧠 CHANNEL BRAIN — CHANNEL COMPLETED ✅",
+    "PARTIAL":   "🧠 CHANNEL BRAIN — CHANNEL PARTIAL ⚠️",
+    "FAILED":    "🧠 CHANNEL BRAIN — CHANNEL FAILED ❌",
+}
+
+
+def _cbrain_result_card(status, phone, ch_index, count, title,
+                        built, per, accepted, requested,
+                        send_ok, send_fail, note="") -> str:
+    lines = [
+        f"☎️ ACCOUNT : {phone}",
+        f"🔢 CHANNEL : {ch_index}/{count}",
+        f"🎛 NAME    : {title}",
+        f"👥 BUILT   : {built}/{per}",
+        f"➕ ADDED   : {accepted}/{requested}  (accepted by API)",
+        f"📤 SENT    : ok={send_ok} · fail={send_fail}",
+    ]
+    if note:
+        lines.append(f"ℹ️ NOTE    : {note}")
+    lines.append(f"⏰ : {now()}")
+    return card(_CBRAIN_STATUS.get(status, _CBRAIN_STATUS["PARTIAL"]), lines)
+
+
 async def _cbrain_create_channel(acc, title):
     """Create ONE channel with the given title (create-only, no marker forward).
     Local or worker. Returns the channel guid."""
@@ -4630,9 +4647,12 @@ async def _cbrain_create_channel(acc, title):
 
 async def _cbrain_add_exact(acc, channel_guid, guids):
     """Add EXACTLY these guids to the channel, in batches. Local or worker.
-    Returns how many were added (best-effort)."""
+    Returns a dict {"requested", "accepted", "failed_batches"}. 'accepted' is
+    what the add API accepted (NOT a verified member count). Local and worker
+    paths report the SAME shape so the runner can judge success identically."""
+    requested = len(guids or [])
     if not guids:
-        return 0
+        return {"requested": 0, "accepted": 0, "failed_batches": 0}
     batch = config.CHANNEL_ADD_BATCH
     delay = config.CHANNEL_ADD_DELAY
     w = worker.worker_for_account(acc)
@@ -4643,21 +4663,28 @@ async def _cbrain_add_exact(acc, channel_guid, guids):
         }, timeout=1800)
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "channel add failed"))
-        return res.get("added", 0)
+        accepted = res.get("accepted", res.get("added", 0))
+        return {"requested": res.get("requested", requested),
+                "accepted": accepted,
+                "failed_batches": res.get("failed_batches", 0)}
 
     async def _do(client):
-        added = 0
+        accepted = 0
+        failed_batches = 0
         step = max(1, int(batch))
         for i in range(0, len(guids), step):
             chunk = guids[i:i + step]
             try:
                 await rb.add_channel_members(client, channel_guid, chunk)
-                added += len(chunk)
+                accepted += len(chunk)
             except Exception:
-                pass
+                # count the failed batch instead of silently pretending it
+                # succeeded; keep going with the remaining batches.
+                failed_batches += 1
             if i + step < len(guids):
                 await asyncio.sleep(max(0.0, float(delay)))
-        return added
+        return {"requested": requested, "accepted": accepted,
+                "failed_batches": failed_batches}
     return await account_conn.call(acc["phone"], _do, timeout=1800)
 
 
@@ -4695,123 +4722,205 @@ async def _run_channel_brain(owner_id, cfg):
         msg = None
     loop_task = asyncio.create_task(_cbrain_live_loop(owner_id, ctl, msg)) if msg else None
 
-    made = 0
+    # honest per-outcome counters (COMPLETED means truly finished, not just
+    # "the loop ran once"). PARTIAL/FAILED are tracked separately.
+    completed = 0
+    partial = 0
+    failed = 0
     total_built = 0
-    total_added = 0
+    total_accepted = 0
+    total_sent = 0
     account_dead = False
 
-    for ch_index in range(1, count + 1):
-        if ctl.get("stop"):
-            break
-        ctl["channel_index"] = ch_index
-        ctl["found"] = 0
-        ctl["probed"] = 0
-        ctl["channel_added"] = 0
+    # CREATE is retried with the SAME frozen slice (no re-discovery); total
+    # attempts = 1 + RESUME_MAX_RETRIES, spaced by CHANNEL_ADD_DELAY. No new
+    # config knob is introduced.
+    create_attempts = 1 + max(0, int(config.RESUME_MAX_RETRIES))
 
-        # ---- Phase 1: BUILD CONTACTS (fresh, non-overlapping slice) ----
-        ctl["phase"] = "BUILD CONTACTS"
-        guids = []
-        try:
-            guids = await _discover_for_account(acc, prefix, per_channel, ctl,
-                                                tag=f"#CH{ch_index} ")
-        except account_conn.InvalidAuthError:
-            account_dead = True
-            db.set_status(acc["id"], "inactive")
-            await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS",
-                                         RuntimeError("session invalid")))
-            break
-        except Exception as e:  # noqa: BLE001
-            await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS", e))
-            continue
-        total_built += len(guids)
-        if ctl.get("stop"):
-            break
+    try:
+        for ch_index in range(1, count + 1):
+            if ctl.get("stop"):
+                break
+            ctl["channel_index"] = ch_index
+            ctl["found"] = 0
+            ctl["probed"] = 0
+            ctl["channel_added"] = 0
 
-        # ---- Phase 2: CREATE CHANNEL (create-only, same title) ----
-        ctl["phase"] = "CREATE CHANNEL"
-        try:
-            channel_guid = await _cbrain_create_channel(acc, title)
-        except account_conn.InvalidAuthError:
-            account_dead = True
-            db.set_status(acc["id"], "inactive")
-            await log(_cbrain_error_card(acc["phone"], ch_index, "CREATE CHANNEL",
-                                         RuntimeError("session invalid")))
-            break
-        except Exception as e:  # noqa: BLE001
-            await log(_cbrain_error_card(acc["phone"], ch_index, "CREATE CHANNEL", e))
-            continue
-
-        # ---- Phase 3: ADD CONTACTS (exact frozen slice) ----
-        ctl["phase"] = "ADD CONTACTS"
-        added = 0
-        try:
-            added = await _cbrain_add_exact(acc, channel_guid, guids)
-        except account_conn.InvalidAuthError:
-            account_dead = True
-            db.set_status(acc["id"], "inactive")
-            await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS",
-                                         RuntimeError("session invalid")))
-            break
-        except Exception as e:  # noqa: BLE001
-            await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS", e))
-            added = 0
-        ctl["channel_added"] = added
-        total_added += added
-
-        # ---- Phase 4: SEND CONTENT (marker -> the channel) ----
-        ctl["phase"] = "SEND CONTENT"
-        if marker:
+            # ---- Phase 1: BUILD CONTACTS (fresh, non-overlapping slice) ----
+            ctl["phase"] = "BUILD CONTACTS"
+            guids = []
             try:
-                await _send_to_guids(owner_id, acc, [channel_guid], "marker", "",
-                                     tag=f"#CH{ch_index} ")
+                guids = await _discover_for_account(acc, prefix, per_channel, ctl,
+                                                    tag=f"#CH{ch_index} ")
             except account_conn.InvalidAuthError:
                 account_dead = True
                 db.set_status(acc["id"], "inactive")
-                await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
+                await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS",
                                              RuntimeError("session invalid")))
                 break
             except Exception as e:  # noqa: BLE001
-                await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT", e))
-        else:
-            await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
-                                         RuntimeError("no marker set — content skipped")))
+                # BUILD exception -> this channel is FAILED (nothing created).
+                failed += 1
+                await log(_cbrain_error_card(acc["phone"], ch_index, "BUILD CONTACTS", e))
+                continue
+            total_built += len(guids)
+            if ctl.get("stop"):
+                break
 
-        made += 1
-        await log(card("🧠 CHANNEL BRAIN — CHANNEL DONE ✅", [
-            f"☎️ ACCOUNT : {acc['phone']}",
-            f"🔢 CHANNEL : {ch_index}/{count}",
-            f"🎛 NAME    : {title}",
-            f"👥 BUILT   : {len(guids)}",
-            f"➕ ADDED   : {added}",
-            f"⏰ : {now()}"]))
+            # ---- Phase 2: CREATE CHANNEL (create-only, same title) + retry ----
+            ctl["phase"] = "CREATE CHANNEL"
+            channel_guid = None
+            create_err = None
+            for attempt in range(1, create_attempts + 1):
+                try:
+                    channel_guid = await _cbrain_create_channel(acc, title)
+                    create_err = None
+                    break
+                except account_conn.InvalidAuthError:
+                    account_dead = True
+                    db.set_status(acc["id"], "inactive")
+                    await log(_cbrain_error_card(acc["phone"], ch_index, "CREATE CHANNEL",
+                                                 RuntimeError("session invalid")))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    create_err = e
+                    if attempt < create_attempts:
+                        await asyncio.sleep(max(0.0, float(config.CHANNEL_ADD_DELAY)))
+            if account_dead:
+                break
+            if not channel_guid:
+                # CREATE failed after every retry -> FAILED, move to next channel.
+                failed += 1
+                await log(_cbrain_error_card(
+                    acc["phone"], ch_index,
+                    f"CREATE CHANNEL (after {create_attempts} attempts)",
+                    create_err or RuntimeError("channel create failed")))
+                await log(_cbrain_result_card(
+                    "FAILED", acc["phone"], ch_index, count, title,
+                    len(guids), per_channel, 0, len(guids), 0, 0,
+                    note="channel not created"))
+                continue
 
-    # ---- finish ----
-    ctl["finished"] = True
-    if loop_task:
-        loop_task.cancel()
-    cbrain_jobs.pop(owner_id, None)
-    stopped = ctl.get("stop")
-    status_line = ("🔴 SESSION INVALID" if account_dead
-                   else ("⏹ STOPPED" if stopped else "✅ FINISHED"))
-    final = card("🧠 CHANNEL BRAIN — " + status_line, [
-        f"☎️ ACCOUNT       : {acc['phone']}",
-        f"🎛 NAME          : {title}",
-        f"✅ CHANNELS MADE : {made}/{count}",
-        f"👥 CONTACTS BUILT: {total_built}",
-        f"➕ TOTAL ADDED   : {total_added}",
-        f"⏰ : {now()}"])
-    await log(final)
-    if msg is not None:
+            # ---- Phase 3: ADD CONTACTS (exact frozen slice) ----
+            ctl["phase"] = "ADD CONTACTS"
+            add_res = {"requested": len(guids), "accepted": 0, "failed_batches": 0}
+            add_error = None
+            try:
+                add_res = await _cbrain_add_exact(acc, channel_guid, guids)
+            except account_conn.InvalidAuthError:
+                account_dead = True
+                db.set_status(acc["id"], "inactive")
+                await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS",
+                                             RuntimeError("session invalid")))
+                break
+            except Exception as e:  # noqa: BLE001
+                add_error = e
+                await log(_cbrain_error_card(acc["phone"], ch_index, "ADD CONTACTS", e))
+            requested = int(add_res.get("requested", len(guids)))
+            accepted = int(add_res.get("accepted", 0))
+            failed_batches = int(add_res.get("failed_batches", 0))
+            ctl["channel_added"] = accepted
+            total_accepted += accepted
+
+            # ---- Phase 4: SEND CONTENT (marker -> the channel) ----
+            ctl["phase"] = "SEND CONTENT"
+            send_ok = send_fail = 0
+            marker_missing = False
+            if marker:
+                try:
+                    send_ok, send_fail = await _send_to_guids(
+                        owner_id, acc, [channel_guid], "marker", "",
+                        tag=f"#CH{ch_index} ")
+                    # (0, 0) means the marker message was not found -> nothing sent.
+                    marker_missing = (send_ok == 0 and send_fail == 0)
+                except account_conn.InvalidAuthError:
+                    account_dead = True
+                    db.set_status(acc["id"], "inactive")
+                    await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
+                                                 RuntimeError("session invalid")))
+                    break
+                except Exception as e:  # noqa: BLE001
+                    await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT", e))
+            else:
+                marker_missing = True
+                await log(_cbrain_error_card(acc["phone"], ch_index, "SEND CONTENT",
+                                             RuntimeError("no marker set — content skipped")))
+            total_sent += send_ok
+
+            # ---- Honest per-channel verdict (no fake DONE) ----
+            built_full = len(guids) >= per_channel
+            add_full = (add_error is None and failed_batches == 0
+                        and requested > 0 and accepted >= requested)
+            send_done = (send_ok >= 1 and send_fail == 0)
+            if built_full and add_full and send_done:
+                status = "COMPLETED"
+                completed += 1
+                note = ""
+            else:
+                status = "PARTIAL"
+                partial += 1
+                reasons = []
+                if not built_full:
+                    reasons.append("build shortfall")
+                if add_error is not None:
+                    reasons.append("add error")
+                elif failed_batches > 0:
+                    reasons.append(f"{failed_batches} add batch(es) failed")
+                elif requested == 0:
+                    reasons.append("no contacts to add")
+                elif accepted < requested:
+                    reasons.append("some contacts not accepted")
+                if marker_missing:
+                    if not marker:
+                        reasons.append("no marker set — content skipped")
+                    else:
+                        reasons.append("marker message not found — content not sent")
+                elif send_fail > 0:
+                    reasons.append("send failure")
+                note = ", ".join(reasons)
+            await log(_cbrain_result_card(
+                status, acc["phone"], ch_index, count, title,
+                len(guids), per_channel, accepted, requested,
+                send_ok, send_fail, note=note))
+    except Exception as e:  # noqa: BLE001
+        # Unexpected failure of the whole runner: surface it, then let `finally`
+        # clean up the live task / job registry and post the final card.
+        await log(_cbrain_error_card(acc["phone"], ctl.get("channel_index", 0),
+                                     "RUNNER", e))
+    finally:
+        # ---- finish (ALWAYS runs, even on an unexpected exception) ----
+        ctl["finished"] = True
+        if loop_task:
+            loop_task.cancel()
+        cbrain_jobs.pop(owner_id, None)
+        stopped = ctl.get("stop")
+        status_line = ("🔴 SESSION INVALID" if account_dead
+                       else ("⏹ STOPPED" if stopped else "✅ FINISHED"))
+        final = card("🧠 CHANNEL BRAIN — " + status_line, [
+            f"☎️ ACCOUNT        : {acc['phone']}",
+            f"🎛 NAME           : {title}",
+            f"✅ COMPLETED      : {completed}/{count}",
+            f"⚠️ PARTIAL        : {partial}",
+            f"❌ FAILED         : {failed}",
+            f"👥 CONTACTS BUILT : {total_built}",
+            f"➕ TOTAL ACCEPTED : {total_accepted}",
+            f"📤 TOTAL SENT     : {total_sent}",
+            f"⏰ : {now()}"])
         try:
-            await safe_edit(msg, final,
-                            buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+            await log(final)
         except Exception:
             pass
-    try:
-        await bot.send_message(owner_id, final,
-                               buttons=main_menu(owner_id == config.OWNER_ID))
-    except Exception:
-        pass
+        if msg is not None:
+            try:
+                await safe_edit(msg, final,
+                                buttons=[[Button.inline("🏠 منوی اصلی", b"home")]])
+            except Exception:
+                pass
+        try:
+            await bot.send_message(owner_id, final,
+                                   buttons=main_menu(owner_id == config.OWNER_ID))
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
