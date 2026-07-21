@@ -184,6 +184,8 @@ def _build_app():
         recipients: list = []    # resume fix: explicit remaining list (frozen order)
         mode: str = "marker"      # 'marker' (forward) or 'text' (plain send_text)
         text: str = ""           # body for 'text' mode (no forward)
+        order_by_presence: bool = False  # POOL BRAIN: order explicit recipients
+        #                                  online -> last-seen (never chat-first)
 
     class AutomationIn(BaseModel):
         phone: str
@@ -535,6 +537,17 @@ def _build_app():
         # ordered list as before.
         if getattr(body, "recipients", None):
             recipients = list(body.recipients)
+            # POOL BRAIN (Q1/Q2): order this account's OWN slice by
+            # online -> last-seen (NOT chat-first). Presence data lives on this
+            # worker's connection, so ordering must happen here. Resume/transfer
+            # sends leave order_by_presence False to keep the frozen order.
+            if getattr(body, "order_by_presence", False):
+                try:
+                    rank = await rb.presence_rank(client)
+                    recipients = sorted(
+                        recipients, key=lambda g: rank.get(g, 10 ** 9))
+                except Exception:  # noqa: BLE001
+                    pass
         else:
             ordered, _stats = await rb.get_ordered_recipients(client)
             recipients = [r["guid"] for r in ordered]
@@ -542,7 +555,7 @@ def _build_app():
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
                "done": False, "stopped": False, "reason": None,
-               "retry_count": 0, "state": "sending"}
+               "retry_count": 0, "state": "sending", "sent_guids": []}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
         # return the EXACT ordered guids so the master can mirror the list and
@@ -935,6 +948,11 @@ def _build_app():
             not_user = 0     # added to address book but no Rubika account
             failed = 0
             guids = []
+            # POOL BRAIN (P2): per-number outcome so the master can map each
+            # phone -> on_rubika -> guid. Fixes the live bug where remote leech
+            # marked EVERY number on_rubika=false. `guids` is kept for callers
+            # that predate `results`.
+            results = []
             attempt_fail = 0
             for raw in (body.numbers or []):
                 ph = rb.normalize_phone(str(raw))
@@ -945,21 +963,26 @@ def _build_app():
                         rb.add_contact(client, ph, body.default_first or "Friend"),
                         timeout=config.SEND_TIMEOUT)
                     attempt_fail = 0
-                    if r.get("on_rubika"):
+                    on_r = bool(r.get("on_rubika"))
+                    g = r.get("guid") if on_r else None
+                    if on_r:
                         added += 1
-                        if r.get("guid"):
-                            guids.append(r["guid"])
+                        if g:
+                            guids.append(g)
                     else:
                         not_user += 1
+                    results.append({"phone": ph, "on_rubika": on_r, "guid": g})
                 except Exception:
                     failed += 1
                     attempt_fail += 1
+                    results.append({"phone": ph, "on_rubika": False,
+                                    "guid": None, "error": True})
                     if attempt_fail >= config.MAX_ERRORS:
                         await asyncio.sleep(config.RESUME_WAIT)
                         attempt_fail = 0
                 await asyncio.sleep(max(0.0, float(body.delay)))
             return {"added": added, "not_user": not_user,
-                    "failed": failed, "guids": guids}
+                    "failed": failed, "guids": guids, "results": results}
         try:
             res = await account_conn.call(body.phone, _do, timeout=7200)
             return {"ok": True, **res}
@@ -1492,6 +1515,14 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         except Exception:  # noqa: BLE001
                             pass
                     job["ok"] += 1
+                    # POOL BRAIN (P1): record the CONFIRMED-successful main-send
+                    # guid so the master can turn it into a phone and write the
+                    # global "already sent" ledger. text2 is best-effort and its
+                    # result never affects this list.
+                    try:
+                        job.setdefault("sent_guids", []).append(guid)
+                    except Exception:
+                        pass
                     attempt_fail = 0          # reset: count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001
                     job["fail"] += 1

@@ -1131,6 +1131,12 @@ async def message_router(event):
         await handle_discover_prefix(event, st)
     elif step == "await_discover_text":
         await handle_discover_text(event, st)
+    elif step == "await_pool_prefix":
+        await handle_pool_prefix(event, st)
+    elif step == "await_pool_target":
+        await handle_pool_target(event, st)
+    elif step == "await_pool_text":
+        await handle_pool_text(event, st)
     elif step == "await_ld_channels":
         await handle_ld_channels(event, st)
     elif step == "await_ld_text":
@@ -1685,6 +1691,11 @@ async def run_send(owner_id: int, payload: dict):
     # a custom configured text ('text' mode). Default stays 'marker'.
     mode = (payload.get("mode") or "marker").lower()
     send_body = payload.get("text") or ""
+    # POOL BRAIN (P1): when this send belongs to a pool job, record every
+    # CONFIRMED-successful recipient into the durable pool contacts + the GLOBAL
+    # "already sent" ledger, so unsent numbers come back next run and no one is
+    # messaged twice.
+    pool_job_id = payload.get("pool_job_id")
     marker = db.get_marker()
     delay = db.get_delay()
     max_errors = db.get_max_errors()
@@ -1769,6 +1780,11 @@ async def run_send(owner_id: int, payload: dict):
                                 "Rubika send", f"{_lbl()}{phone}",
                                 f"second text -> {guid}", _e2)
                     ok += 1
+                    if pool_job_id:
+                        try:
+                            db.pool_mark_contact_sent(pool_job_id, guid)
+                        except Exception:
+                            pass
                     attempt_fail = 0          # count CONSECUTIVE errors only
                     done_ok = base_ok + ok
                     if config.SEND_LOG_EVERY > 0 and done_ok % config.SEND_LOG_EVERY == 0:
@@ -1904,6 +1920,10 @@ async def run_send(owner_id: int, payload: dict):
             "account_id": account_id, "phone": phone, "saved_guid": saved_guid,
             "mid": mid, "recipients": remaining_list, "base_ok": grand_ok,
             "tag": tag, "dead": dead, "reason": reason,
+            # worker-transfer bug fix: carry the ORIGINAL send method so a
+            # transfer/resume continues with the SAME mode (text stays text,
+            # never silently reverts to marker).
+            "mode": mode, "text": send_body, "text2": rb_text2,
         })
     return {"ok": grand_ok, "fail": fail, "remaining": len(remaining_list),
             "dead": dead, "reason": reason}
@@ -3299,6 +3319,14 @@ async def run_send_remote(owner_id: int, payload: dict):
     # plain-text mode: send a configured text (no forward). Default stays marker.
     mode = (payload.get("mode") or "marker").lower()
     send_body = payload.get("text") or ""
+    # POOL BRAIN (P1): record confirmed-sent guids of a pool job into the global
+    # ledger as they arrive from the worker's /send/status sent_guids.
+    pool_job_id = payload.get("pool_job_id")
+    _pool_recorded = set()
+    order_by_presence = bool(payload.get("order_by_presence"))
+    # Q3: pool sends manage continuation via their own job + global ledger, so
+    # they suppress the per-account Transfer/Continue panel (P3: no transfer).
+    suppress_panel = bool(payload.get("suppress_resume_panel"))
     # resume fix: an explicit remaining list means this run is a resume /
     # worker-transfer (full engine, same as a normal send).
     explicit_recipients = payload.get("recipients") or None
@@ -3349,6 +3377,7 @@ async def run_send_remote(owner_id: int, payload: dict):
             "text2": db.get_rb_text2(),   # step 5: optional Rubika second text
             "recipients": explicit_recipients or [],  # resume fix: remaining list
             "mode": mode, "text": send_body,   # plain-text (no forward) mode
+            "order_by_presence": order_by_presence,   # POOL BRAIN slice ordering
         })
         # in text mode there is no marked post to find; only require ok
         if not res.get("ok") or (mode != "text" and not res.get("marker_found")):
@@ -3373,6 +3402,16 @@ async def run_send_remote(owner_id: int, payload: dict):
                     break
                 ok = stt.get("ok", 0)
                 fail = stt.get("fail", 0)
+                # POOL BRAIN (P1): record newly-confirmed sent guids -> global
+                # ledger + pool_contacts. Idempotent; a guid seen twice is safe.
+                if pool_job_id:
+                    for g in (stt.get("sent_guids") or []):
+                        if g not in _pool_recorded:
+                            _pool_recorded.add(g)
+                            try:
+                                db.pool_mark_contact_sent(pool_job_id, g)
+                            except Exception:
+                                pass
                 # progress log every SEND_LOG_EVERY successful sends (+ percent)
                 if config.SEND_LOG_EVERY > 0 and ok // config.SEND_LOG_EVERY > last_log_mark:
                     last_log_mark = ok // config.SEND_LOG_EVERY
@@ -3433,12 +3472,15 @@ async def run_send_remote(owner_id: int, payload: dict):
         # resume / worker-transfer continues from where it stopped — not from
         # scratch. (ok+fail == processed index on the worker.)
         remaining = guids[(ok + fail):] if guids else []
-        await _offer_resume_after_send(owner_id, {
-            "account_id": account_id, "phone": phone, "remote": True,
-            "worker_id": w["id"], "recipients": remaining, "base_ok": ok, "tag": "",
-            "dead": ("blocked" in str(reason)) or ("invalid" in str(reason)),
-            "reason": reason,
-        })
+        if not suppress_panel:
+            await _offer_resume_after_send(owner_id, {
+                "account_id": account_id, "phone": phone, "remote": True,
+                "worker_id": w["id"], "recipients": remaining, "base_ok": ok, "tag": "",
+                "dead": ("blocked" in str(reason)) or ("invalid" in str(reason)),
+                "reason": reason,
+                # worker-transfer bug fix: keep the ORIGINAL mode/text on resume.
+                "mode": mode, "text": send_body, "text2": db.get_rb_text2(),
+            })
     else:
         # fully finished -> nothing remaining; clear any stale paused record.
         try:
@@ -6332,6 +6374,12 @@ async def amain():
     asyncio.create_task(linkdooni_summary_loop())
     await recover_extras()
     await recover_linkdooni()
+    # POOL BRAIN: resume any pool job that was mid-leech/mid-send before restart
+    # (durable cursor + global sent-ledger prevent duplicate sends).
+    try:
+        await _recover_pool_jobs()
+    except Exception as _pe2:
+        print(f"[pool recover] {_pe2}")
     try:
         await bot.run_until_disconnected()
     finally:
@@ -6361,6 +6409,9 @@ multisend_stop = {}                # owner_id -> bool
 brain_sel = {}                     # owner_id -> set(account_id)
 brain_jobs = {}                    # owner_id -> dict (per-account collected guids)
 cbrain_jobs = {}                   # owner_id -> live ctl dict for 🧠 مغز کانال
+# POOL BRAIN («مغز استخری»): parallel multi-account leech-then-send.
+pool_sel = {}                      # owner_id -> set(account_id) selected for the pool
+pool_ctl = {}                      # job_id -> {"stop": bool, "owner_id": int, "lock": asyncio.Lock}
 # Brain stop/pause is now owned by the isolated brain_control.controller
 # (per-owner, mid-account interruptible). See brain_control.py.
 
@@ -6427,6 +6478,13 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
     dead = info.get("dead")
     is_remote = bool(info.get("remote"))
     if remaining or is_remote:
+        # worker-transfer bug fix: ALWAYS store the send method explicitly so a
+        # later resume/transfer never falls back to the marker default. `mode`
+        # is written as an explicit value; the fallback (text present -> text,
+        # else marker) below only rescues OLD paused rows saved before this fix.
+        _mode = (info.get("mode") or "").lower()
+        if not _mode:
+            _mode = "text" if info.get("text") else "marker"
         payload = {
             "saved_guid": info.get("saved_guid"), "mid": info.get("mid"),
             "recipients": remaining, "base_ok": int(info.get("base_ok") or 0),
@@ -6435,6 +6493,9 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
             # worker_transfer: persist the full list of tried workers so that
             # repeated transfers never revisit the same server.
             "tried_workers": worker_transfer.get_tried(account_id),
+            # worker-transfer bug fix: original send method + bodies.
+            "mode": _mode, "text": info.get("text") or "",
+            "text2": info.get("text2") or "",
         }
         # Also record current worker as tried (it just failed/stopped)
         if info.get("worker_id"):
@@ -6611,14 +6672,25 @@ async def _do_resume(owner_id: int, account_id: int):
     acc = db.get_account(account_id)
     w = worker.worker_for_account(acc) if acc else None
     is_remote_now = bool(w and not worker.is_local(w))
+    # worker-transfer bug fix: restore the ORIGINAL send method. Explicit `mode`
+    # is authoritative; the fallback (text present -> text, else marker) only
+    # covers OLD paused rows saved before mode/text were persisted.
+    _rmode = (p.get("mode") or "").lower()
+    if not _rmode:
+        _rmode = "text" if p.get("text") else "marker"
+    _rtext = p.get("text") or ""
+    _rtext2 = p.get("text2") or ""
+    _is_text = (_rmode == "text")
 
     # 1) precise local resume: exact remaining list AND account is local now
-    if recips and p.get("mid") and not is_remote_now:
+    if recips and (p.get("mid") or _is_text) and not is_remote_now:
         payload = {
             "account_id": account_id, "phone": rec["phone"],
             "saved_guid": p.get("saved_guid"), "mid": p.get("mid"),
             "recipients": recips, "base_ok": int(p.get("base_ok") or 0),
             "tag": p.get("tag") or "",
+            # keep the original method: text stays text, never reverts to marker
+            "mode": _rmode, "text": _rtext,
         }
         try:
             await bot.send_message(owner_id,
@@ -6644,15 +6716,17 @@ async def _do_resume(owner_id: int, account_id: int):
             "account_id": account_id, "phone": rec["phone"], "remote": True,
             "worker_id": w["id"], "total": len(recips),
             "recipients": recips, "is_resume": True,
+            # keep the original method on the new worker (text stays text)
+            "mode": _rmode, "text": _rtext,
         }))
         return
 
-    # 2.5) remaining list known but NO mid (came from a REMOTE send) AND the
-    #      account is now LOCAL (master) — e.g. a worker transfer that landed on
-    #      the master. Find the marker LOCALLY, then send EXACTLY the remaining
-    #      list — NOT from scratch. (Without this, it fell through to a fresh
-    #      send and re-sent everyone who was already messaged.)
-    if recips and not p.get("mid") and not is_remote_now:
+    # 2.5) remaining list known but NO mid (came from a REMOTE MARKER send) AND
+    #      the account is now LOCAL (master) — e.g. a worker transfer that landed
+    #      on the master. Find the marker LOCALLY, then send EXACTLY the
+    #      remaining list. (text mode is handled by path 1 above and never
+    #      reaches here, so this stays a marker-only path.)
+    if recips and not p.get("mid") and not is_remote_now and not _is_text:
         marker = db.get_marker()
         try:
             saved_guid, mid = await _find_marker_local(rec["phone"], marker)
@@ -6685,7 +6759,7 @@ async def _do_resume(owner_id: int, account_id: int):
             "account_id": account_id, "phone": rec["phone"],
             "saved_guid": saved_guid, "mid": mid,
             "recipients": recips, "base_ok": int(p.get("base_ok") or 0),
-            "tag": p.get("tag") or "",
+            "tag": p.get("tag") or "", "mode": "marker",
         }))
         return
 
@@ -6695,7 +6769,7 @@ async def _do_resume(owner_id: int, account_id: int):
                                buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
     except Exception:
         pass
-    await _resume_fresh_send(owner_id, account_id)
+    await _resume_fresh_send(owner_id, account_id, mode=_rmode, text=_rtext)
 
 
 async def _resume_remote_list(owner_id, account_id, guids):
@@ -6722,10 +6796,12 @@ async def _resume_remote_list(owner_id, account_id, guids):
             f"📱 {acc['phone']}", f"💥 {repr(e)[:140]}"]))
 
 
-async def _resume_fresh_send(owner_id, account_id):
+async def _resume_fresh_send(owner_id, account_id, mode="marker", text=""):
     acc = db.get_account(account_id)
     if not acc:
         return
+    mode = (mode or "marker").lower()
+    is_text = (mode == "text")
     marker = db.get_marker()
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
@@ -6738,18 +6814,41 @@ async def _resume_fresh_send(owner_id, account_id):
             await bot.send_message(owner_id, "❌ This account's worker is not healthy right now.")
             return
         try:
+            # text mode needs no marked post; ask /prepare in the same mode so
+            # it never fails on a missing marker (worker-transfer bug fix).
             res = await worker.api_call(w, "POST", "/prepare",
-                                        {"phone": acc["phone"], "marker": marker})
+                                        {"phone": acc["phone"], "marker": marker,
+                                         "mode": mode})
         except Exception as e:  # noqa: BLE001
             await bot.send_message(owner_id, f"❌ Preparation error on the worker: {repr(e)[:120]}")
             return
-        if not res.get("marker_found") or not res.get("total"):
+        if not res.get("total") or (not is_text and not res.get("marker_found")):
             await bot.send_message(owner_id, "❌ No marker/recipient on the worker.")
             return
         asyncio.create_task(run_send_remote(owner_id, {
             "account_id": account_id, "phone": acc["phone"], "remote": True,
-            "worker_id": w["id"], "total": res["total"]}))
+            "worker_id": w["id"], "total": res["total"],
+            "mode": mode, "text": text}))
     else:
+        if is_text:
+            # plain-text fresh send: no marker lookup; build recipients locally.
+            try:
+                recips = await _local_ordered_guids(acc)
+            except account_conn.InvalidAuthError:
+                db.set_status(account_id, "inactive")
+                await bot.send_message(owner_id, "🔴 This account's session is invalid.")
+                return
+            except Exception as e:  # noqa: BLE001
+                await bot.send_message(owner_id, f"❌ Error: {repr(e)[:120]}")
+                return
+            if not recips:
+                await bot.send_message(owner_id, "There were no recipients.")
+                return
+            asyncio.create_task(run_send(owner_id, {
+                "account_id": account_id, "phone": acc["phone"],
+                "saved_guid": "", "mid": "", "mode": "text", "text": text,
+                "recipients": recips}))
+            return
         try:
             prep = await _prepare_local(acc, marker)
         except account_conn.InvalidAuthError:
@@ -6768,7 +6867,8 @@ async def _resume_fresh_send(owner_id, account_id):
             return
         asyncio.create_task(run_send(owner_id, {
             "account_id": account_id, "phone": acc["phone"],
-            "saved_guid": saved_guid, "mid": mid, "recipients": recips}))
+            "saved_guid": saved_guid, "mid": mid, "recipients": recips,
+            "mode": "marker"}))
 
 
 # --------------------------------------------------------------------------- #
@@ -7791,6 +7891,7 @@ def _brain_menu(owner_id):
         rows.append([Button.inline(f"{mark} {a['phone']}", f"bsel_{a['id']}".encode())])
     rows.append([Button.inline("📂 Upload Numbers File & Start", b"bfile")])
     rows.append([Button.inline("🔎 Discover Friends by Prefix", b"bdiscover")])
+    rows.append([Button.inline("🌊 Pool Brain (leech + send)", b"pool")])
     rows.append([Button.inline("🔙 Back", b"home")])
     return rows
 
@@ -8018,6 +8119,534 @@ async def brain_stop_cb(event):
     await event.answer("⏹ Stop Brain requested. The current account also stops immediately.", alert=True)
 
 
+# =========================================================================== #
+# POOL BRAIN («مغز استخری») — second Brain mode.
+#   Several accounts (one per worker) leech numbers from ONE shared prefix in
+#   parallel until the GLOBAL target is reached, then EACH account sends (text
+#   or marker) to the contacts IT built. Never stops for one bad account,
+#   records ONLY confirmed-sent numbers, and is restart-safe (durable job).
+# =========================================================================== #
+POOL_BLOCK = 50   # numbers each account leases+probes per round (small = tight overshoot)
+
+
+def _pool_worker_id(acc):
+    """The worker id an account belongs to (master counts as its own worker)."""
+    try:
+        w = worker.worker_for_account(acc)
+        return w["id"] if w else None
+    except Exception:
+        return None
+
+
+def _pool_menu(owner_id):
+    sel = pool_sel.setdefault(owner_id, set())
+    rows = []
+    for a in db.list_accounts():
+        mark = "✅" if a["id"] in sel else "⬜️"
+        tag = "" if a["status"] == "active" else " ⚠️"
+        rows.append([Button.inline(f"{mark} {a['phone']}{tag}", f"psel_{a['id']}".encode())])
+    if sel:
+        rows.append([Button.inline(f"🚀 Start Pool ({len(sel)} accounts)", b"pgo")])
+    rows.append([Button.inline("🔙 Back", b"brain")])
+    return rows
+
+
+@bot.on(events.CallbackQuery(data=b"pool"))
+async def pool_cb(event):
+    if not is_owner(event):
+        return
+    if not db.list_accounts():
+        await safe_edit(event, "Add an account first.",
+                        buttons=[[Button.inline("🔙 Back", b"brain")]])
+        return
+    await safe_edit(event,
+        "🌊 Pool Brain — leech together, then each account sends its own\n"
+        f"{LINE}\n"
+        "Pick accounts (max ONE per worker — session-safety), then a shared prefix\n"
+        "and a TOTAL target. All picked accounts leech in parallel until the pool\n"
+        "reaches the target; then each account sends (marker or text) to the\n"
+        "contacts it built. Only successfully-sent numbers are saved.",
+        buttons=_pool_menu(event.sender_id))
+
+
+@bot.on(events.CallbackQuery(pattern=b"psel_(\\d+)"))
+async def pool_sel_cb(event):
+    if not is_owner(event):
+        return
+    aid = int(event.pattern_match.group(1))
+    acc = db.get_account(aid)
+    if not acc:
+        await event.answer("Account not found.", alert=True)
+        return
+    sel = pool_sel.setdefault(event.sender_id, set())
+    if aid in sel:
+        sel.discard(aid)
+    else:
+        # RULE 1: reject a second account that lives on the SAME worker as an
+        # already-selected one (session conflict guard).
+        wid = _pool_worker_id(acc)
+        for aid2 in sel:
+            acc2 = db.get_account(aid2)
+            if acc2 and _pool_worker_id(acc2) == wid:
+                await event.answer(
+                    "⛔ This worker already has a selected account. Two accounts "
+                    "from one worker isn't allowed (session conflict).", alert=True)
+                return
+        sel.add(aid)
+    await safe_edit(event, "🌊 Pool Brain — select accounts (one per worker):",
+                    buttons=_pool_menu(event.sender_id))
+
+
+@bot.on(events.CallbackQuery(data=b"pgo"))
+async def pool_go_cb(event):
+    if not is_owner(event):
+        return
+    sel = pool_sel.get(event.sender_id, set())
+    if not sel:
+        await event.answer("Pick at least one account first.", alert=True)
+        return
+    state[event.sender_id] = {"step": "await_pool_prefix", "ids": list(sel)}
+    await safe_edit(event,
+        f"☎️ Send the shared prefix for the {len(sel)} pool accounts.\n"
+        "Example: `0913` or `09135` (2–10 digits; the rest is generated).",
+        buttons=[[Button.inline("🔙 Cancel", b"pool")]])
+
+
+async def handle_pool_prefix(event, st):
+    prefix = _clean_prefix(event.raw_text.strip())
+    if not prefix or len(prefix) < 2 or len(prefix) > 10:
+        await event.respond("Invalid prefix. Send something like `0913` (2–10 digits).")
+        return
+    st["prefix"] = prefix
+    st["step"] = "await_pool_target"
+    await event.respond(
+        f"🎯 Prefix `{prefix}` set.\nNow send the TOTAL target — how many Rubika "
+        "numbers the whole pool should collect (e.g. `300`).")
+
+
+async def handle_pool_target(event, st):
+    raw = "".join(ch for ch in (event.raw_text or "") if ch.isdigit())
+    try:
+        target = max(1, int(raw))
+    except ValueError:
+        await event.respond("Send a number, e.g. `300`.")
+        return
+    st["target"] = target
+    st["step"] = "await_pool_mode"
+    await event.respond(
+        f"🎯 Target: {target} Rubika numbers (whole pool).\nChoose the content to send:",
+        buttons=[[Button.inline("📌 Marker (forward)", b"pmode_marker")],
+                 [Button.inline("✍️ Plain Text", b"pmode_text")],
+                 [Button.inline("🔙 Cancel", b"pool")]])
+
+
+@bot.on(events.CallbackQuery(data=b"pmode_marker"))
+async def pool_mode_marker_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_pool_mode":
+        await event.answer("Expired. Start again.", alert=True)
+        return
+    state.pop(event.sender_id, None)
+    await _pool_launch(event, st, mode="marker", content="")
+
+
+@bot.on(events.CallbackQuery(data=b"pmode_text"))
+async def pool_mode_text_cb(event):
+    if not is_owner(event):
+        return
+    st = state.get(event.sender_id) or {}
+    if st.get("step") != "await_pool_mode":
+        await event.answer("Expired. Start again.", alert=True)
+        return
+    st["step"] = "await_pool_text"
+    await safe_edit(event, "✍️ Send the text to send to the leeched contacts:",
+                    buttons=[[Button.inline("🔙 Cancel", b"pool")]])
+
+
+async def handle_pool_text(event, st):
+    text = (event.raw_text or "").strip()
+    if not text:
+        await event.respond("Text can't be empty. Send it again.")
+        return
+    state.pop(event.sender_id, None)
+    await _pool_launch(event, st, mode="text", content=text)
+
+
+def _pool_affine(prefix: str):
+    """(suffix_width, A, offset) for a full-period affine permutation over the
+    suffix space 10^k. A is coprime to 10^k (last digit 7 -> odd & not mult 5),
+    so suffix(i)=(A*i+offset) mod 10^k is a bijection -> disjoint blocks."""
+    k = 11 - len(prefix)
+    space = 10 ** k
+    a = int(space * 0.6180339887)          # golden-ratio spread
+    a -= a % 10
+    a += 7                                   # force last digit 7 -> coprime to 10^k
+    a %= space
+    if a == 0:
+        a = 7 % space or 7
+    offset = random.randrange(space) if space > 1 else 0
+    return k, a, offset
+
+
+async def _pool_launch(event, st, mode, content):
+    owner_id = event.sender_id
+    ids = st.get("ids") or []
+    prefix = st.get("prefix")
+    target = int(st.get("target") or 0)
+    accounts = [a for a in (db.get_account(i) for i in ids) if a]
+    if not accounts or not prefix or target <= 0:
+        await event.respond("Pool info is incomplete. Start again from Brain -> Pool Brain.",
+                            buttons=main_menu(is_real_owner(event)))
+        return
+    suffix_width, affine_a, affine_offset = _pool_affine(prefix)
+    job_id = db.pool_create_job(owner_id, prefix, target, suffix_width, affine_a,
+                                affine_offset, mode, content, accounts)
+    pool_sel.pop(owner_id, None)
+    await event.respond(
+        f"🌊 Pool Brain started (job #{job_id}). Reports go to the log group.",
+        buttons=[[Button.inline("⏹ Stop Pool", f"pstop_{job_id}".encode())],
+                 [Button.inline("🏠 Main Menu", b"home")]])
+    asyncio.create_task(_run_pool(owner_id, job_id))
+
+
+@bot.on(events.CallbackQuery(pattern=b"pstop_(\\d+)"))
+async def pool_stop_cb(event):
+    if not is_owner(event):
+        return
+    job_id = int(event.pattern_match.group(1))
+    # create the ctl entry if _run_pool hasn't yet, so the stop is never lost to
+    # a race; _run_pool's setdefault will keep this same (already-stopped) entry.
+    ctl = pool_ctl.setdefault(
+        job_id, {"stop": False, "owner_id": event.sender_id, "lock": asyncio.Lock()})
+    ctl["stop"] = True
+    try:
+        db.pool_set_status(job_id, "stopped")
+    except Exception:
+        pass
+    # also raise the legacy per-account stop flags so any in-flight send loops
+    # break at their next message.
+    try:
+        for pa in db.pool_list_accounts(job_id):
+            stop_flags[int(pa["account_id"])] = True
+    except Exception:
+        pass
+    await event.answer("⏹ Stop Pool requested. Leech/send will halt shortly.", alert=True)
+
+
+# ----- pool cards (English, ReconBot style) ----- #
+def _pool_card_start(job, accounts):
+    return card("🌊 POOL BRAIN — START", [
+        f"• Job       : #{job['id']}",
+        f"• Prefix    : {job['prefix']}",
+        f"• Target    : {job['target']} Rubika numbers (whole pool)",
+        f"• Accounts  : {len(accounts)} (one per worker)",
+        f"• Content   : {'Plain text' if job['mode'] == 'text' else 'Marker forward'}",
+        f"🕒 {now()}"])
+
+
+def _pool_card_ready(job_id):
+    n = db.pool_hit_count(job_id)
+    rows = [f"• Job       : #{job_id}", f"• Ready     : {n} contacts to send"]
+    for pa in db.pool_list_accounts(job_id):
+        rows.append(f"   – {pa['phone']} : {db.pool_account_hit_count(job_id, pa['account_id'])} found")
+    rows.append(f"🕒 {now()}")
+    return card("🌊 POOL BRAIN — LEECH DONE ✅", rows)
+
+
+def _pool_card_report(job_id, accounts, status):
+    job = db.pool_get_job(job_id) or {}
+    total_found = db.pool_hit_count(job_id)
+    total_sent = 0
+    rows = [
+        f"• Job       : #{job_id}",
+        f"• Status    : {'Completed' if status == 'done' else 'Stopped'}",
+        f"• Target    : {job.get('target', '?')}",
+        f"• Collected : {total_found} Rubika numbers",
+        LINE,
+    ]
+    for pa in db.pool_list_accounts(job_id):
+        aid = pa["account_id"]
+        found = db.pool_account_hit_count(job_id, aid)
+        sent = db.pool_account_sent_count(job_id, aid)
+        total_sent += sent
+        rows.append(f"   – {pa['phone']} : {sent}/{found} sent  [{pa.get('status', '?')}]")
+    rows.append(LINE)
+    rows.append(f"• Total sent : {total_sent}")
+    rows.append(f"🕒 {now()}")
+    return card("🏁 POOL BRAIN — REPORT", rows)
+
+
+# ----- pool leech primitives ----- #
+def _pool_candidate(job, i: int) -> str:
+    space = 10 ** int(job["suffix_width"])
+    suffix = (int(job["affine_a"]) * i + int(job["affine_offset"])) % space
+    return str(job["prefix"]) + str(suffix).zfill(int(job["suffix_width"]))
+
+
+async def _pool_lease_block(job_id, ctl):
+    """Atomically hand out the NEXT index block (single master process -> one
+    asyncio.Lock is enough, Q5). Returns (start, end) or None when the target is
+    reached / the space is exhausted / a stop was requested."""
+    async with ctl["lock"]:
+        if ctl.get("stop"):
+            return None
+        job = db.pool_get_job(job_id)
+        if not job:
+            return None
+        space = 10 ** int(job["suffix_width"])
+        cursor = int(job["cursor"])
+        if cursor >= space:
+            return None
+        if db.pool_hit_count(job_id) >= int(job["target"]):
+            return None
+        end = min(space, cursor + POOL_BLOCK)
+        db.pool_set_cursor(job_id, end)
+        return cursor, end
+
+
+async def _pool_probe_block(acc, display_numbers, delay):
+    """Probe a block on the account's worker (remote) or locally. Returns a list
+    of {phone, on_rubika, guid} (P2 per-number mapping)."""
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+    if w and not worker.is_local(w):
+        res = await worker.api_call(w, "POST", "/contacts/add", {
+            "phone": phone, "numbers": display_numbers, "delay": delay,
+            "default_first": config.CONTACT_DEFAULT_FIRST}, timeout=7200)
+        if not res.get("ok"):
+            raise RuntimeError(res.get("error", "pool probe failed"))
+        return res.get("results") or []
+
+    async def _do(client):
+        out = []
+        af = 0
+        for disp in display_numbers:
+            ph = rb.normalize_phone(disp)
+            if not ph:
+                continue
+            try:
+                r = await asyncio.wait_for(
+                    rb.add_contact(client, disp, config.CONTACT_DEFAULT_FIRST),
+                    timeout=config.SEND_TIMEOUT)
+                af = 0
+                on_r = bool(r.get("on_rubika"))
+                out.append({"phone": ph, "on_rubika": on_r,
+                            "guid": r.get("guid") if on_r else None})
+            except Exception:
+                af += 1
+                out.append({"phone": ph, "on_rubika": False, "guid": None, "error": True})
+                if af >= db.get_max_errors():
+                    await asyncio.sleep(db.get_resume_wait())
+                    af = 0
+            await asyncio.sleep(max(0.0, float(delay)))
+        return out
+    return await account_conn.call(phone, _do, timeout=86400)
+
+
+async def _pool_leech_account(job_id, acc, ctl):
+    """One account's parallel leech loop: lease block -> skip already-sent ->
+    probe -> record hits. A dead/limited account drops out; the others keep
+    going toward the global target."""
+    aid = acc["id"]
+    phone = acc["phone"]
+    tag = acc.get("_tag", "")
+    delay = db.get_discovery_delay()
+    consecutive_err = 0
+    while not ctl.get("stop"):
+        blk = await _pool_lease_block(job_id, ctl)
+        if not blk:
+            break
+        start, end = blk
+        job = db.pool_get_job(job_id)
+        pairs = []
+        for i in range(start, end):
+            disp = _pool_candidate(job, i)
+            norm = rb.normalize_phone(disp)
+            if not norm:
+                continue
+            if db.rubika_was_sent(norm):     # P4: skip numbers already sent before
+                continue
+            pairs.append(disp)
+        if not pairs:
+            continue
+        try:
+            results = await _pool_probe_block(acc, pairs, delay)
+            consecutive_err = 0
+        except account_conn.InvalidAuthError:
+            db.set_status(aid, "inactive")
+            db.pool_set_account_status(job_id, aid, "shot")
+            await log(card("🌊 POOL LEECH — Account Shot (dropped)", [
+                f"{tag} 📱 {phone}",
+                "🔴 Session invalid — this account left the pool; others continue.",
+                f"🕒 {now()}"]))
+            return
+        except Exception as e:  # noqa: BLE001
+            consecutive_err += 1
+            await log_error("Pool leech", f"{tag}{phone}",
+                            f"probe block [{start},{end})", e)
+            if consecutive_err >= db.get_max_errors():
+                await asyncio.sleep(db.get_resume_wait())
+                consecutive_err = 0
+            continue
+        new_hits = 0
+        for r in results:
+            if r.get("on_rubika") and r.get("guid"):
+                if db.pool_add_contact(job_id, aid, r.get("phone"), r["guid"]):
+                    new_hits += 1
+        found_now = db.pool_account_hit_count(job_id, aid)
+        db.pool_set_account_counts(job_id, aid, found=found_now)
+        if new_hits:
+            await log(card("🌊 POOL LEECH — Progress", [
+                f"{tag} 📱 {phone}",
+                f"• This account : {found_now} found",
+                f"• Pool total   : {db.pool_hit_count(job_id)} / {job['target']}",
+                f"🕒 {now()}"]))
+        if db.pool_hit_count(job_id) >= int(job["target"]):
+            break
+    db.pool_set_account_status(job_id, aid, "leech_done")
+
+
+async def _pool_order_local(acc, guids):
+    """Order a LOCAL account's slice by presence (online -> last-seen), no
+    chat-first (Q2). Falls back to given order on any error."""
+    phone = acc["phone"]
+    await account_conn.close(phone)
+    client = rb.open_client(phone)
+    try:
+        await rb.connect_ready(client)
+        rank = await rb.presence_rank(client)
+        return sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _pool_send_phase(owner_id, job_id, accounts, ctl):
+    job = db.pool_get_job(job_id)
+    mode = (job.get("mode") or "text").lower()
+    content = job.get("content") or ""
+    marker = db.get_marker()
+    db.pool_set_status(job_id, "sending")
+    tasks = []
+    for acc in accounts:
+        if ctl.get("stop"):
+            break
+        aid = acc["id"]
+        phone = acc["phone"]
+        tag = acc.get("_tag", "")
+        rows = db.pool_account_guids(job_id, aid, unsent_only=True)
+        guids = [r["guid"] for r in rows]
+        if not guids:
+            continue
+        w = worker.worker_for_account(acc)
+        if w and not worker.is_local(w):
+            # remote: worker orders the slice by presence and reports sent_guids
+            tasks.append(run_send_remote(owner_id, {
+                "account_id": aid, "phone": phone, "remote": True,
+                "worker_id": w["id"], "total": len(guids), "recipients": guids,
+                "is_resume": False, "mode": mode, "text": content,
+                "order_by_presence": True, "pool_job_id": job_id,
+                "suppress_resume_panel": True, "tag": tag}))
+        else:
+            # local (at most one account): order here, find marker if needed
+            try:
+                ordered = await _pool_order_local(acc, guids)
+            except Exception:  # noqa: BLE001
+                ordered = guids
+            saved_guid = mid = ""
+            if mode != "text":
+                try:
+                    saved_guid, mid = await _find_marker_local(phone, marker)
+                except Exception as e:  # noqa: BLE001
+                    await log_error("Pool send", f"{tag}{phone}", "find marker", e)
+                    continue
+                if not mid:
+                    await log(card("🌊 POOL SEND — Marker Not Found (skipped)",
+                                   [f"{tag} 📱 {phone}", f"🕒 {now()}"]))
+                    continue
+            tasks.append(run_send(owner_id, {
+                "account_id": aid, "phone": phone, "saved_guid": saved_guid,
+                "mid": mid, "recipients": ordered, "mode": mode, "text": content,
+                "pool_job_id": job_id, "suppress_resume_panel": True, "tag": tag}))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def _run_pool(owner_id, job_id, resume=False):
+    job = db.pool_get_job(job_id)
+    if not job:
+        return
+    accounts = []
+    for pa in db.pool_list_accounts(job_id):
+        a = db.get_account(pa["account_id"])
+        if a:
+            accounts.append(dict(a))
+    if not accounts:
+        db.pool_set_status(job_id, "done")
+        return
+    for i, a in enumerate(accounts, 1):
+        a["_tag"] = f"#A{i}"
+    ctl = pool_ctl.setdefault(
+        job_id, {"stop": False, "owner_id": owner_id, "lock": asyncio.Lock()})
+
+    # LEECH phase (only while status is still 'leeching'; resume continues from
+    # the durable cursor automatically).
+    if job.get("status") == "leeching":
+        await log(_pool_card_start(job, accounts) if not resume else card(
+            "🌊 POOL BRAIN — RESUMED (leeching)", [f"• Job : #{job_id}", f"🕒 {now()}"]))
+        await asyncio.gather(*[_pool_leech_account(job_id, a, ctl) for a in accounts],
+                             return_exceptions=True)
+        if ctl.get("stop"):
+            db.pool_set_status(job_id, "stopped")
+            await log(_pool_card_report(job_id, accounts, "stopped"))
+            pool_ctl.pop(job_id, None)
+            return
+        db.pool_set_status(job_id, "ready")
+        await log(_pool_card_ready(job_id))
+        try:
+            await bot.send_message(owner_id, card("🌊 Pool ready to send", [
+                f"• {db.pool_hit_count(job_id)} contacts ready", "Sending now ..."]),
+                buttons=[[Button.inline("⏹ Stop Pool", f"pstop_{job_id}".encode())]])
+        except Exception:
+            pass
+
+    # SEND phase
+    if not ctl.get("stop"):
+        await _pool_send_phase(owner_id, job_id, accounts, ctl)
+
+    status = "stopped" if ctl.get("stop") else "done"
+    db.pool_set_status(job_id, status)
+    await log(_pool_card_report(job_id, accounts, status))
+    pool_ctl.pop(job_id, None)
+    try:
+        await bot.send_message(owner_id,
+            "🌊 Pool finished — see the log group for the full report.",
+            buttons=main_menu(owner_id == config.OWNER_ID))
+    except Exception:
+        pass
+
+
+async def _recover_pool_jobs():
+    """Boot recovery: relaunch any pool job that wasn't finished/stopped, so a
+    restart continues from the durable cursor / unsent contacts (no duplicate
+    sends — the global ledger + pool_contacts.sent guarantee it)."""
+    try:
+        jobs = db.pool_list_open_jobs()
+    except Exception:
+        jobs = []
+    for j in jobs:
+        try:
+            await log(card("🌊 POOL BRAIN — Recovering after restart", [
+                f"• Job : #{j['id']}  (status: {j.get('status')})", f"🕒 {now()}"]))
+            asyncio.create_task(_run_pool(int(j["owner_id"]), int(j["id"]), resume=True))
+        except Exception:
+            pass
+
+
 async def _run_brain_send(owner_id, job, mode="marker", body=""):
     marker = db.get_marker()
     delay = db.get_delay()
@@ -8099,6 +8728,23 @@ async def _find_marker_local(phone, marker):
     try:
         await rb.connect_ready(client)
         return await rb.find_marked_message(client, marker)
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def _local_ordered_guids(acc):
+    """Ordered recipient guids for a LOCAL account's own contacts, WITHOUT any
+    marker lookup (used by text-mode fresh resume — worker-transfer bug fix)."""
+    phone = acc["phone"]
+    await account_conn.close(phone)
+    client = rb.open_client(phone)
+    try:
+        await rb.connect_ready(client)
+        ordered, _stats = await rb.get_ordered_recipients(client)
+        return [r["guid"] for r in ordered]
     finally:
         try:
             await client.disconnect()

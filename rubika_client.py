@@ -367,6 +367,27 @@ async def get_ordered_recipients(client: Client):
 
 
 # --------------------------------------------------------------------------- #
+# POOL BRAIN ranking (Q2): rank the account's OWN contacts by
+#   1) currently online first,
+#   2) then most-recent last-seen.
+# Deliberately NO chat-first step (that is the difference from
+# get_ordered_recipients, which is left untouched). Used worker-side to order a
+# pool account's freshly-leeched slice; guids not present here (no presence yet)
+# are pushed to the end by the caller's default rank.
+# --------------------------------------------------------------------------- #
+async def presence_rank(client: Client) -> dict:
+    """Return {guid: rank} where lower rank = higher priority
+    (online first, then last-seen desc). Never raises out useful data."""
+    contacts = await get_contacts_full(client)
+    ordered = sorted(
+        (c for c in contacts if c.get("guid")),
+        key=lambda c: (1 if c.get("online") else 0, c.get("last_online") or 0),
+        reverse=True,
+    )
+    return {c["guid"]: i for i, c in enumerate(ordered)}
+
+
+# --------------------------------------------------------------------------- #
 # Find a marked message in the account's OWN Saved Messages.
 # --------------------------------------------------------------------------- #
 def _msg_id_of(msg):

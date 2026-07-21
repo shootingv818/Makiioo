@@ -2198,3 +2198,291 @@ def tg_clear_comment_texts():
 # The toggle is stored as "campaign_enabled" = "1"/"0" in app_settings.
 # No per-account DB helpers needed — bot.py uses get_setting/set_setting.
 # =========================================================================== #
+
+
+
+# =========================================================================== #
+# POOL BRAIN («مغز استخری») — durable state (additive; lazy tables).
+#   • rubika_sent_numbers : GLOBAL, normalized-phone-keyed "already sent"
+#     ledger (P1/P4). A number lands here ONLY after a CONFIRMED successful
+#     send, so numbers we merely leeched (but never sent) come back next run.
+#   • pool_jobs           : one row per pool run (prefix, affine permutation
+#     params, cursor, target, mode/content, status). Restart-safe.
+#   • pool_job_accounts   : per-account slice metadata (found / sent / status).
+#   • pool_contacts       : the durable GUID <-> normalized-phone map (Q4) so a
+#     sent guid can be turned back into a phone for the ledger even after a
+#     restart. UNIQUE(job_id, guid) also gives intra-job dedup.
+# leeched_numbers and the type-1 discovery are intentionally NOT touched here.
+# =========================================================================== #
+def _ensure_pool_tables():
+    conn = _conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS rubika_sent_numbers (
+            phone   TEXT PRIMARY KEY,
+            sent_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_jobs (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id      INTEGER,
+            prefix        TEXT,
+            target        INTEGER,
+            suffix_width  INTEGER,
+            affine_a      INTEGER,
+            affine_offset INTEGER,
+            cursor        INTEGER DEFAULT 0,
+            mode          TEXT DEFAULT 'text',
+            content       TEXT DEFAULT '',
+            status        TEXT DEFAULT 'leeching',
+            created_at    TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_job_accounts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id     INTEGER,
+            account_id INTEGER,
+            phone      TEXT,
+            found      INTEGER DEFAULT 0,
+            sent       INTEGER DEFAULT 0,
+            status     TEXT DEFAULT 'active',
+            UNIQUE(job_id, account_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS pool_contacts (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id     INTEGER,
+            account_id INTEGER,
+            phone_norm TEXT,
+            guid       TEXT,
+            sent       INTEGER DEFAULT 0,
+            UNIQUE(job_id, guid)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---- GLOBAL sent-ledger (P1/P4) ----
+def rubika_was_sent(phone_norm: str) -> bool:
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute("SELECT 1 FROM rubika_sent_numbers WHERE phone = ?",
+                       (str(phone_norm),)).fetchone()
+    conn.close()
+    return bool(row)
+
+
+def rubika_mark_sent(phone_norm: str):
+    if not phone_norm:
+        return
+    _ensure_pool_tables()
+    conn = _conn()
+    conn.execute(
+        "INSERT INTO rubika_sent_numbers (phone, sent_at) VALUES (?, ?) "
+        "ON CONFLICT(phone) DO UPDATE SET sent_at = excluded.sent_at",
+        (str(phone_norm), _now()))
+    conn.commit()
+    conn.close()
+
+
+def rubika_sent_count() -> int:
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM rubika_sent_numbers").fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+# ---- pool jobs ----
+def pool_create_job(owner_id, prefix, target, suffix_width, affine_a,
+                    affine_offset, mode, content, accounts) -> int:
+    """Create a pool job + one row per (account_id, phone). Returns job_id."""
+    _ensure_pool_tables()
+    conn = _conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO pool_jobs (owner_id, prefix, target, suffix_width, affine_a, "
+        "affine_offset, cursor, mode, content, status, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'leeching', ?)",
+        (int(owner_id), str(prefix), int(target), int(suffix_width), int(affine_a),
+         int(affine_offset), str(mode), str(content or ""), _now()),
+    )
+    job_id = c.lastrowid
+    for a in accounts:
+        c.execute(
+            "INSERT OR IGNORE INTO pool_job_accounts (job_id, account_id, phone, "
+            "found, sent, status) VALUES (?, ?, ?, 0, 0, 'active')",
+            (int(job_id), int(a["id"]), str(a["phone"])),
+        )
+    conn.commit()
+    conn.close()
+    return int(job_id)
+
+
+def pool_get_job(job_id):
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute("SELECT * FROM pool_jobs WHERE id = ?", (int(job_id),)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def pool_set_status(job_id, status):
+    _ensure_pool_tables()
+    conn = _conn()
+    conn.execute("UPDATE pool_jobs SET status = ? WHERE id = ?",
+                 (str(status), int(job_id)))
+    conn.commit()
+    conn.close()
+
+
+def pool_set_cursor(job_id, cursor):
+    _ensure_pool_tables()
+    conn = _conn()
+    conn.execute("UPDATE pool_jobs SET cursor = ? WHERE id = ?",
+                 (int(cursor), int(job_id)))
+    conn.commit()
+    conn.close()
+
+
+def pool_list_open_jobs() -> list:
+    """Jobs that are NOT finished/stopped (for boot recovery)."""
+    _ensure_pool_tables()
+    conn = _conn()
+    rows = conn.execute(
+        "SELECT * FROM pool_jobs WHERE status NOT IN ('done','stopped') "
+        "ORDER BY id").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ---- per-account slice metadata ----
+def pool_list_accounts(job_id) -> list:
+    _ensure_pool_tables()
+    conn = _conn()
+    rows = conn.execute("SELECT * FROM pool_job_accounts WHERE job_id = ? ORDER BY id",
+                        (int(job_id),)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def pool_set_account_status(job_id, account_id, status):
+    _ensure_pool_tables()
+    conn = _conn()
+    conn.execute("UPDATE pool_job_accounts SET status = ? WHERE job_id = ? AND account_id = ?",
+                 (str(status), int(job_id), int(account_id)))
+    conn.commit()
+    conn.close()
+
+
+def pool_set_account_counts(job_id, account_id, found=None, sent=None):
+    _ensure_pool_tables()
+    sets, vals = [], []
+    if found is not None:
+        sets.append("found = ?"); vals.append(int(found))
+    if sent is not None:
+        sets.append("sent = ?"); vals.append(int(sent))
+    if not sets:
+        return
+    vals.extend([int(job_id), int(account_id)])
+    conn = _conn()
+    conn.execute(f"UPDATE pool_job_accounts SET {', '.join(sets)} "
+                 "WHERE job_id = ? AND account_id = ?", vals)
+    conn.commit()
+    conn.close()
+
+
+# ---- pool contacts (durable guid <-> phone map) ----
+def pool_add_contact(job_id, account_id, phone_norm, guid) -> bool:
+    """Bind a leeched Rubika number to its collector account. Returns True if it
+    was NEW in this job (UNIQUE(job_id, guid)), so the caller counts a hit once."""
+    if not guid:
+        return False
+    _ensure_pool_tables()
+    conn = _conn()
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO pool_contacts (job_id, account_id, phone_norm, guid, sent) "
+        "VALUES (?, ?, ?, ?, 0)",
+        (int(job_id), int(account_id), str(phone_norm or ""), str(guid)))
+    conn.commit()
+    changed = cur.rowcount > 0
+    conn.close()
+    return changed
+
+
+def pool_hit_count(job_id) -> int:
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute("SELECT COUNT(*) AS n FROM pool_contacts WHERE job_id = ?",
+                       (int(job_id),)).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def pool_account_hit_count(job_id, account_id) -> int:
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM pool_contacts WHERE job_id = ? AND account_id = ?",
+        (int(job_id), int(account_id))).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
+
+
+def pool_account_guids(job_id, account_id, unsent_only: bool = False) -> list:
+    """Ordered list of (guid, phone_norm, sent) for one account's slice."""
+    _ensure_pool_tables()
+    conn = _conn()
+    q = ("SELECT guid, phone_norm, sent FROM pool_contacts "
+         "WHERE job_id = ? AND account_id = ?")
+    if unsent_only:
+        q += " AND sent = 0"
+    q += " ORDER BY id"
+    rows = conn.execute(q, (int(job_id), int(account_id))).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def pool_guid_phone(job_id, guid):
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute(
+        "SELECT phone_norm FROM pool_contacts WHERE job_id = ? AND guid = ?",
+        (int(job_id), str(guid))).fetchone()
+    conn.close()
+    return row["phone_norm"] if row else None
+
+
+def pool_mark_contact_sent(job_id, guid):
+    """Mark one pool contact sent AND write its phone to the GLOBAL ledger.
+    Idempotent (safe to call again if a guid is polled twice)."""
+    _ensure_pool_tables()
+    phone = pool_guid_phone(job_id, guid)
+    conn = _conn()
+    conn.execute("UPDATE pool_contacts SET sent = 1 WHERE job_id = ? AND guid = ?",
+                 (int(job_id), str(guid)))
+    conn.commit()
+    conn.close()
+    if phone:
+        rubika_mark_sent(phone)
+
+
+def pool_account_sent_count(job_id, account_id) -> int:
+    _ensure_pool_tables()
+    conn = _conn()
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM pool_contacts WHERE job_id = ? AND account_id = ? AND sent = 1",
+        (int(job_id), int(account_id))).fetchone()
+    conn.close()
+    return int(row["n"]) if row else 0
