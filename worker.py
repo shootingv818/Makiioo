@@ -107,21 +107,29 @@ def file_label(worker: dict) -> str:
 # --------------------------------------------------------------------------- #
 # Low-level SSH helpers (asyncssh, lazy import)
 # --------------------------------------------------------------------------- #
-async def _ssh_connect(ip: str, port: int, user: str, password: str):
-    """Open an SSH connection with hard timeouts + keepalive so a slow/flaky
-    server can NEVER hang a caller forever.
+async def _ssh_connect(ip: str, port: int, user: str, password: str,
+                       keepalive: bool = True):
+    """Open an SSH connection with hard timeouts so a slow/flaky server can
+    NEVER hang a caller forever.
 
     - connect_timeout / login_timeout (8s): bound the TCP + auth handshake.
-    - keepalive_interval/count (15s x3): keep a warm connection alive and detect
-      a dead one within ~45s instead of relying on TCP defaults.
-    - the whole connect is additionally wrapped in asyncio.wait_for(10) as a
+    - keepalive=True (default, used ONLY by the persistent tunnel): keepalive
+      15s x3 keeps a warm link alive and detects a dead one within ~45s.
+    - keepalive=False (one-shot admin ops: update / provision / restart /
+      teardown / session backup): NO keepalive is passed, so a long
+      `docker build` on a loaded server can't be dropped mid-flight by a missed
+      keepalive.
+    - the whole connect is wrapped in asyncio.wait_for(10) as a
       version-independent backstop (older asyncssh may lack connect_timeout)."""
     import asyncssh  # lazy
     base = dict(
         host=ip, port=int(port or 22), username=user, password=password,
         known_hosts=None,  # personal tool: trust on first use
-        login_timeout=8, keepalive_interval=15, keepalive_count_max=3,
+        login_timeout=8,
     )
+    if keepalive:
+        base["keepalive_interval"] = 15
+        base["keepalive_count_max"] = 3
 
     async def _do():
         try:
@@ -165,7 +173,7 @@ async def provision_worker(ip: str, ssh_port: int, ssh_user: str, ssh_pass: str,
     conn = None
     try:
         await say("🔌 اتصال SSH به سرور ...")
-        conn = await _ssh_connect(ip, ssh_port, ssh_user, ssh_pass)
+        conn = await _ssh_connect(ip, ssh_port, ssh_user, ssh_pass, keepalive=False)
 
         await say("🐳 بررسی/نصب Docker (با صبر برای قفلِ apt) ...")
         # Fresh Ubuntu servers run unattended-upgrades right after boot, which
@@ -278,15 +286,16 @@ async def register_provisioned(ip, ssh_port, ssh_user, ssh_pass, prov: dict) -> 
 # --------------------------------------------------------------------------- #
 # Remote lifecycle ops (restart / update / teardown) over SSH.
 # --------------------------------------------------------------------------- #
-async def _with_conn(worker: dict):
+async def _with_conn(worker: dict, keepalive: bool = True):
     return await _ssh_connect(
         worker["ip"], worker["ssh_port"], worker["ssh_user"],
         crypto_util.decrypt(worker["ssh_pass_enc"]),
+        keepalive=keepalive,
     )
 
 
 async def restart_worker(worker: dict) -> tuple:
-    conn = await _with_conn(worker)
+    conn = await _with_conn(worker, keepalive=False)
     try:
         return await _run(conn, f"docker restart {CONTAINER}")
     finally:
@@ -298,7 +307,7 @@ async def update_worker(worker: dict) -> tuple:
     image, recreate the container. Robust to a worker stuck on the wrong branch
     (uses fetch + checkout -B FETCH_HEAD) and surfaces a build failure as a
     non-zero exit (so a silent old image isn't reported as success)."""
-    conn = await _with_conn(worker)
+    conn = await _with_conn(worker, keepalive=False)  # long build: no keepalive
     try:
         br = config.GIT_BRANCH
         repo = config.GIT_REPO_URL
@@ -324,7 +333,7 @@ async def teardown_worker(worker: dict):
     """Stop + remove the container and the checkout on the remote server."""
     await close_tunnel(worker["id"])
     try:
-        conn = await _with_conn(worker)
+        conn = await _with_conn(worker, keepalive=False)
         try:
             await _run(conn, f"docker rm -f {CONTAINER} 2>/dev/null; rm -rf {REMOTE_DIR}")
         finally:
@@ -500,17 +509,6 @@ async def _tcp_ping(host: str, port: int, timeout: float = 5.0) -> int:
         return -1
 
 
-async def _local_file_ok() -> bool:
-    """Master-side check: GET HEALTH_URL directly (200/404 ok, 503 blocked)."""
-    import httpx  # lazy
-    try:
-        async with httpx.AsyncClient(timeout=config.HEALTH_TIMEOUT) as c:
-            r = await c.get(config.HEALTH_URL)
-            return r.status_code in (200, 404)
-    except Exception:
-        return False
-
-
 def _mk_summary(worker: dict, status: str, ping: int, api_ok: bool,
                 detail=None) -> dict:
     """Build + persist + cache one worker's health snapshot.
@@ -670,7 +668,7 @@ async def collect_sessions_into_zip(zf):
         if is_local(w):
             continue
         try:
-            conn = await _with_conn(w)
+            conn = await _with_conn(w, keepalive=False)
         except Exception:
             continue
         try:

@@ -2749,7 +2749,8 @@ async def _safe_update_worker(w):
     conn = None
     try:
         await worker.close_tunnel(w["id"])
-        conn = await asyncio.wait_for(worker._with_conn(w), timeout=20)
+        conn = await asyncio.wait_for(worker._with_conn(w, keepalive=False),
+                                      timeout=20)  # long candidate build: no keepalive
         code, out, err = await asyncio.wait_for(
             worker._run(conn, _safe_worker_update_command(w)), timeout=2100)
         text = ((out or "") + "\n" + (err or "")).strip()
@@ -5469,7 +5470,7 @@ async def run_health_engine():
     stalled automation is self-healed. An offline worker leaves its accounts
     UNCHECKED (never marked Shot). Posts ONE English #watcher_health card with a
     button that opens the existing quarantine panel. The separate WORKER health
-    loop (health_loop) is untouched."""
+    loop (worker_snapshot_loop) is untouched."""
     import bot as _botmod                     # the bot module (for observer)
     from portal import observer as _observer  # canonical Watcher logic
     accounts = db.list_accounts()
@@ -5632,35 +5633,6 @@ async def worker_snapshot_loop():
         except Exception as e:  # noqa: BLE001
             print(f"[worker_snapshot_loop] {e}")
         await asyncio.sleep(25)
-
-
-async def health_loop():
-    import time as _t
-    prev_status: dict = {}
-    last_report = 0.0
-    quick = min(300, max(60, config.HEALTH_INTERVAL))
-    while True:
-        try:
-            workers = db.list_workers()
-            if workers:
-                results = await worker.check_all(workers)
-                for r in results:
-                    old = prev_status.get(r["id"])
-                    if old == "ok" and r["status"] != "ok":
-                        kind = "blocked" if r["status"] == "blocked" else "down"
-                        await log(card("🚨 WORKER ALERT", [
-                            f"👨‍🔧 {r['tag']} • {r['ip']}",
-                            f"status: 🟢 healthy  ->  🔴 {kind}",
-                            f"🕒 {now()}",
-                        ]))
-                    prev_status[r["id"]] = r["status"]
-                now_t = _t.monotonic()
-                if now_t - last_report >= config.HEALTH_INTERVAL:
-                    await log(worker_status_all_card(db.list_workers()))
-                    last_report = now_t
-        except Exception as e:  # noqa: BLE001
-            print(f"[health_loop] {e}")
-        await asyncio.sleep(quick)
 
 
 # =========================================================================== #
