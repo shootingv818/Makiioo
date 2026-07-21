@@ -40,10 +40,12 @@ IMAGE = "v2rubby-worker"
 # in-memory: worker_id -> {"conn":.., "listener":.., "local_port":int}
 _tunnels: dict = {}
 _tunnel_locks: dict = {}
-# in-memory health cache: worker_id -> {"status","ping_ms","file_ok","ts"}
+# in-memory health cache: worker_id -> {"status","ping_ms","file_ok","ts","mono"}
 _health_cache: dict = {}
 # in-memory last failure reason per worker (diagnostic), worker_id -> str|None
 _health_detail: dict = {}
+# in-memory per-worker tunnel supervisor tasks: worker_id -> asyncio.Task
+_supervisors: dict = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -106,11 +108,29 @@ def file_label(worker: dict) -> str:
 # Low-level SSH helpers (asyncssh, lazy import)
 # --------------------------------------------------------------------------- #
 async def _ssh_connect(ip: str, port: int, user: str, password: str):
+    """Open an SSH connection with hard timeouts + keepalive so a slow/flaky
+    server can NEVER hang a caller forever.
+
+    - connect_timeout / login_timeout (8s): bound the TCP + auth handshake.
+    - keepalive_interval/count (15s x3): keep a warm connection alive and detect
+      a dead one within ~45s instead of relying on TCP defaults.
+    - the whole connect is additionally wrapped in asyncio.wait_for(10) as a
+      version-independent backstop (older asyncssh may lack connect_timeout)."""
     import asyncssh  # lazy
-    return await asyncssh.connect(
+    base = dict(
         host=ip, port=int(port or 22), username=user, password=password,
         known_hosts=None,  # personal tool: trust on first use
+        login_timeout=8, keepalive_interval=15, keepalive_count_max=3,
     )
+
+    async def _do():
+        try:
+            return await asyncssh.connect(connect_timeout=8, **base)
+        except TypeError:
+            # very old asyncssh without the connect_timeout kwarg
+            return await asyncssh.connect(**base)
+
+    return await asyncio.wait_for(_do(), timeout=10)
 
 
 async def _run(conn, command: str, check: bool = False):
@@ -355,6 +375,91 @@ async def close_tunnel(worker_id: int):
 
 
 # --------------------------------------------------------------------------- #
+# Persistent per-worker tunnel supervisor.
+# Keeps a warm SSH tunnel to each REMOTE worker alive (asyncssh keepalive) and,
+# when it dies, rebuilds it in the BACKGROUND with capped backoff + jitter.
+# This restores the old "warm connection" behaviour: after startup a route is
+# built ONCE and reused; api_call / the snapshot loop then hit an already-open
+# tunnel (fail-fast) instead of paying a cold SSH connect every time.
+# open_tunnel already serialises per-worker via _lock_for(wid), so only ONE
+# connect happens per worker at a time (supervisor + any api_call share it).
+# --------------------------------------------------------------------------- #
+async def _supervisor_loop(worker_id: int):
+    backoff = [5, 15, 30, 60]
+    idx = 0
+    while True:
+        try:
+            w = db.get_worker(worker_id)
+            if not w or is_local(w) or not w.get("enabled"):
+                return  # worker removed/disabled/became master -> stop
+            await open_tunnel(w)          # reuse if warm, else connect (bounded)
+            idx = 0                       # connected -> reset backoff
+            t = _tunnels.get(worker_id)
+            conn = t["conn"] if t else None
+            if conn is None:
+                raise RuntimeError("tunnel missing right after open")
+            await conn.wait_closed()      # block until the SSH link dies
+            await close_tunnel(worker_id)
+            # loop immediately to reconnect (idx still 0 -> short first wait)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await close_tunnel(worker_id)
+            base = backoff[min(idx, len(backoff) - 1)]
+            idx += 1
+            delay = base + random.uniform(0, base * 0.3)  # jitter
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                raise
+
+
+def start_supervisor(worker: dict) -> None:
+    """Ensure a live tunnel-supervisor task exists for one ENABLED remote worker."""
+    if not worker or is_local(worker) or not worker.get("enabled"):
+        return
+    wid = worker["id"]
+    t = _supervisors.get(wid)
+    if t and not t.done():
+        return
+    _supervisors[wid] = asyncio.create_task(_supervisor_loop(wid))
+
+
+async def stop_supervisor(worker_id: int) -> None:
+    """Cancel a worker's supervisor and drop its warm tunnel."""
+    t = _supervisors.pop(worker_id, None)
+    if t and not t.done():
+        t.cancel()
+        try:
+            await t
+        except (asyncio.CancelledError, Exception):
+            pass
+    await close_tunnel(worker_id)
+
+
+async def start_all_supervisors() -> None:
+    """Start supervisors for every enabled remote worker (called at startup)."""
+    for w in db.list_workers():
+        if not is_local(w) and w.get("enabled"):
+            start_supervisor(w)
+
+
+async def prewarm_all() -> None:
+    """Open tunnels to all enabled remote workers in parallel (each bounded by
+    the connect timeout) so the FIRST health cycle after startup doesn't report
+    false TIMEOUTs while cold connections are still being built."""
+    ws = [w for w in db.list_workers() if not is_local(w) and w.get("enabled")]
+    if not ws:
+        return
+    await asyncio.gather(*[open_tunnel(w) for w in ws], return_exceptions=True)
+
+
+def snapshot_all() -> list:
+    """Return the current in-memory health snapshots (no probing)."""
+    return list(_health_cache.values())
+
+
+# --------------------------------------------------------------------------- #
 # API client (master -> worker, through the tunnel).
 # --------------------------------------------------------------------------- #
 async def api_call(worker: dict, method: str, path: str, payload: dict = None,
@@ -406,57 +511,83 @@ async def _local_file_ok() -> bool:
         return False
 
 
-async def check_worker(worker: dict) -> dict:
-    """Measure one worker's health, persist it, update cache, return summary."""
-    wid = worker["id"]
-    if is_local(worker):
-        ping = await _tcp_ping("127.0.0.1", config.WORKER_API_PORT or 22)
-        if ping < 0:
-            ping = 1  # localhost is reachable even if API port closed
-        file_ok = await _local_file_ok()
-    else:
-        ping = await _tcp_ping(worker["ip"], worker["ssh_port"])
-        file_ok = False
-        detail = None
-        if ping < 0:
-            detail = "ssh unreachable"
-        else:
-            try:
-                data = await api_call(worker, "GET", "/health",
-                                      timeout=config.HEALTH_TIMEOUT + 10)
-                file_ok = bool(data.get("file_ok"))
-                if not file_ok:
-                    # API answered but Rubika check failed -> show its status code
-                    detail = f"rubika http={data.get('status_code')}"
-            except Exception as e:  # noqa: BLE001
-                # API itself unreachable through the tunnel
-                detail = f"api error: {type(e).__name__}: {str(e)[:120]}"
-        _health_detail[wid] = detail
+def _mk_summary(worker: dict, status: str, ping: int, api_ok: bool,
+                detail=None) -> dict:
+    """Build + persist + cache one worker's health snapshot.
 
-    status = "ok" if (ping >= 0 and file_ok) else ("blocked" if ping >= 0 else "down")
-    db.update_worker_health(wid, status, ping, file_ok)
+    NOTE: the ``file_ok`` field is kept for backward compatibility with the
+    presentation helpers, but it now means "the worker API answered" (SSH +
+    /ping), NOT "the worker can reach Rubika". Rubika reachability was removed
+    from health on purpose so a transient Rubika 503 can't mark healthy workers
+    as blocked. Worker selection relies on the existing send/login failover for
+    a worker that momentarily can't reach Rubika."""
+    wid = worker["id"]
+    _health_detail[wid] = detail
+    try:
+        db.update_worker_health(wid, status, ping, api_ok)
+    except Exception:
+        pass
     summary = {"id": wid, "tag": worker["tag"], "ip": worker["ip"],
-               "status": status, "ping_ms": ping, "file_ok": file_ok,
-               "detail": _health_detail.get(wid), "ts": config.now_str()}
+               "status": status, "ping_ms": ping, "file_ok": api_ok,
+               "detail": detail, "ts": config.now_str(),
+               "mono": time.monotonic()}
     _health_cache[wid] = summary
     return summary
 
 
-async def check_all(workers: list = None) -> list:
-    """Run health checks for all (enabled) workers IN PARALLEL."""
+async def check_worker(worker: dict, warm_only: bool = False) -> dict:
+    """Measure one worker's health via SSH reachability + the worker API's
+    instant /ping (NOT /health, which probes Rubika and is slow). Persists,
+    caches, and returns a summary.
+
+    warm_only=True (used by the background snapshot loop): never OPEN a new SSH
+    tunnel; if no warm tunnel exists yet (supervisor still (re)connecting) the
+    worker is reported as reconnecting instead of forcing a cold connect.
+    """
+    wid = worker["id"]
+    if is_local(worker):
+        # master runs jobs in-process: no SSH, no worker API, no Rubika probe.
+        return _mk_summary(worker, "ok", 1, True, None)
+
+    ping = await _tcp_ping(worker["ip"], worker["ssh_port"], timeout=3.0)
+    if ping < 0:
+        return _mk_summary(worker, "down", ping, False, "ssh unreachable")
+
+    if warm_only and wid not in _tunnels:
+        # supervisor is (re)establishing the tunnel; don't cold-connect here.
+        return _mk_summary(worker, "blocked", ping, False, "reconnecting")
+
+    try:
+        # /ping is instant and does NO Rubika check.
+        await api_call(worker, "GET", "/ping", timeout=8)
+        return _mk_summary(worker, "ok", ping, True, None)
+    except Exception as e:  # noqa: BLE001
+        return _mk_summary(worker, "blocked", ping, False,
+                           f"api error: {type(e).__name__}: {str(e)[:120]}")
+
+
+async def check_all(workers: list = None, warm_only: bool = False) -> list:
+    """Run health checks for all ENABLED workers IN PARALLEL, with an
+    independent per-worker deadline so one slow/flaky worker can NEVER block
+    the whole cycle (and thus the status card)."""
     if workers is None:
         workers = db.list_workers()
-    if not workers:
+    probe = [w for w in workers if w.get("enabled")]  # skip Disabled entirely
+    if not probe:
         return []
-    results = await asyncio.gather(*[check_worker(w) for w in workers],
+
+    async def _guarded(w):
+        return await asyncio.wait_for(check_worker(w, warm_only=warm_only),
+                                      timeout=15)
+
+    results = await asyncio.gather(*[_guarded(w) for w in probe],
                                    return_exceptions=True)
     out = []
-    for w, r in zip(workers, results):
+    for w, r in zip(probe, results):
         if isinstance(r, Exception):
-            out.append({"id": w["id"], "tag": w["tag"], "ip": w["ip"],
-                        "status": "down", "ping_ms": -1, "file_ok": False,
-                        "detail": f"check crashed: {type(r).__name__}",
-                        "ts": config.now_str()})
+            reason = ("timeout>15s" if isinstance(r, asyncio.TimeoutError)
+                      else f"check crashed: {type(r).__name__}")
+            out.append(_mk_summary(w, "down", -1, False, reason))
         else:
             out.append(r)
     return out
@@ -574,6 +705,8 @@ async def _read_remote_file(sftp, path: str) -> bytes:
 
 
 async def shutdown():
-    """Close all open tunnels (call on master shutdown)."""
+    """Cancel supervisors + close all open tunnels (call on master shutdown)."""
+    for wid in list(_supervisors.keys()):
+        await stop_supervisor(wid)
     for wid in list(_tunnels.keys()):
         await close_tunnel(wid)

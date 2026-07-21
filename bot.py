@@ -2473,8 +2473,12 @@ def _wk_status_block(w) -> list:
     lines = [
         f"{worker.status_emoji(w)} [{_wk_state(w)}] {_wk_type(w)} · {w['tag']}",
         f"   IP    : {w['ip']}",
-        f"   Ping  : {_ping_text(w)} · Route: {_wk_route(w)}",
     ]
+    if not w.get("enabled"):
+        # disabled workers are never probed -> don't show a stale live status
+        lines.append("   Ping  : — · Route: not checked (disabled)")
+        return lines
+    lines.append(f"   Ping  : {_ping_text(w)} · Route: {_wk_route(w)}")
     if not w.get("file_ok"):
         d = worker.health_detail(w["id"])
         if d:
@@ -2482,12 +2486,28 @@ def _wk_status_block(w) -> list:
     return lines
 
 
+def _last_check_label() -> str:
+    """'X seconds ago' from the freshest in-memory snapshot (monotonic)."""
+    import time as _t
+    best = None
+    try:
+        for s in worker.snapshot_all():
+            m = s.get("mono")
+            if m is not None and (best is None or m > best):
+                best = m
+    except Exception:
+        best = None
+    if best is None:
+        return "no check yet"
+    return f"{int(max(0, _t.monotonic() - best))}s ago"
+
+
 def worker_status_all_card(workers) -> str:
     lines = ["🛰 WORKERS — STATUS", LINE]
     for w in workers:
         lines += _wk_status_block(w)
         lines.append(LINE)
-    lines.append(f"🕒 {now()}")
+    lines.append(f"🕒 {now()} · last check: {_last_check_label()}")
     return "\n".join(lines)
 
 
@@ -2860,8 +2880,10 @@ async def w_versions_cb(event):
 async def wk_refresh_cb(event):
     if not is_owner(event):
         return
-    await event.answer("Checking all workers concurrently ...")
-    await log_status_all(refresh=True)
+    # Snapshot-only: never probe here. A background loop auto-checks every ~25s,
+    # so rendering is instant and a slow/flaky worker can't freeze the panel.
+    await event.answer("Latest snapshot (auto-checked every ~25s) …")
+    await log_status_all(refresh=False)
     await workers_cb(event)
 
 
@@ -2946,6 +2968,11 @@ async def provision_and_register(event, wk):
     except Exception:
         pass
     w = db.get_worker(wid)
+    # start the persistent tunnel supervisor for the freshly added worker
+    try:
+        worker.start_supervisor(w)
+    except Exception:
+        pass
     await safe_edit(msg, f"✅ Worker {w['tag']} added and checked.",
                    buttons=[[Button.inline("🛠 Worker Management", b"workers")],
                             [Button.inline("🏠 Main Menu", b"home")]])
@@ -3005,7 +3032,16 @@ async def wk_toggle_cb(event):
     w = db.get_worker(wid)
     if not w:
         return
-    db.set_worker_enabled(wid, not w["enabled"])
+    new_enabled = not w["enabled"]
+    db.set_worker_enabled(wid, new_enabled)
+    # start/stop the persistent tunnel supervisor to match the new state
+    try:
+        if new_enabled and not w["is_master"]:
+            worker.start_supervisor(db.get_worker(wid))
+        else:
+            await worker.stop_supervisor(wid)
+    except Exception:
+        pass
     await event.answer("Status changed.")
     await wk_detail_cb(event)
 
@@ -3122,6 +3158,10 @@ async def wk_del_do_cb(event):
         return
     try:
         await safe_edit(event, "🗑 Cleaning the server and deleting the worker ...")
+        try:
+            await worker.stop_supervisor(wid)   # cancel supervisor + drop tunnel
+        except Exception:
+            pass
         if not w["is_master"]:
             try:
                 await worker.teardown_worker(w)
@@ -5559,6 +5599,41 @@ async def extras_worker_loop():
 # --------------------------------------------------------------------------- #
 # Background health monitor: immediate alerts + periodic STATU WORKER ALL.
 # --------------------------------------------------------------------------- #
+async def worker_snapshot_loop():
+    """Single source of worker health. Every ~25s it probes all ENABLED workers
+    using ONLY warm tunnels (never opens a cold SSH connect — the per-worker
+    supervisor owns (re)connection), stores the result in worker's in-memory
+    snapshot, posts an alert on a healthy->unhealthy transition, and posts the
+    full status card on the slow HEALTH_INTERVAL cadence. The Refresh button
+    renders this snapshot instantly and never probes."""
+    import time as _t
+    prev_status: dict = {}
+    last_report = 0.0
+    while True:
+        try:
+            workers = db.list_workers()
+            if workers:
+                results = await worker.check_all(workers, warm_only=True)
+                for r in results:
+                    old = prev_status.get(r["id"])
+                    if old == "ok" and r["status"] != "ok":
+                        kind = "blocked" if r["status"] == "blocked" else "down"
+                        await log(card("🚨 WORKER ALERT", [
+                            f"👨‍🔧 {r['tag']} • {r['ip']}",
+                            f"status: 🟢 healthy  ->  🔴 {kind}",
+                            f"detail: {r.get('detail') or '—'}",
+                            f"🕒 {now()}",
+                        ]))
+                    prev_status[r["id"]] = r["status"]
+                now_t = _t.monotonic()
+                if now_t - last_report >= config.HEALTH_INTERVAL:
+                    await log(worker_status_all_card(db.list_workers()))
+                    last_report = now_t
+        except Exception as e:  # noqa: BLE001
+            print(f"[worker_snapshot_loop] {e}")
+        await asyncio.sleep(25)
+
+
 async def health_loop():
     import time as _t
     prev_status: dict = {}
@@ -6258,8 +6333,20 @@ async def amain():
         await log(card("⚠️ - #Portal_Error", [
             "#portal #error", "-------------------------------",
             "🔧 Step  : boot", f"📝 Error  : {repr(_pe)[:200]}", f"🕒 {now()}"]))
-    # background worker health monitor (alerts + periodic STATU WORKER ALL)
-    asyncio.create_task(health_loop())
+    # Worker connectivity: pre-warm every enabled remote worker's SSH tunnel in
+    # parallel (bounded), then start a persistent per-worker supervisor that
+    # keeps each tunnel alive and rebuilds it in the background on failure.
+    # This restores the old "warm connection" behaviour so the status card and
+    # api_call hit an already-open tunnel instead of a cold SSH connect.
+    try:
+        await worker.prewarm_all()
+        await worker.start_all_supervisors()
+    except Exception as _we:
+        print(f"[worker warmup] {_we}")
+    # background worker health monitor: warm-tunnel-only snapshot every ~25s,
+    # alerts on healthy->unhealthy, periodic full card. The Refresh button only
+    # renders this snapshot (never probes).
+    asyncio.create_task(worker_snapshot_loop())
     # automation: periodic summary log + relaunch any automation enabled before restart
     asyncio.create_task(automation_summary_loop())
     await recover_automations()
