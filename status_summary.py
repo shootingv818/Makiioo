@@ -229,25 +229,27 @@ def format_card(summary: dict | None = None) -> str:
 
     portal_state = runtime.get("status", "off")
     portal_label = {
-        "running": "فعال", "starting": "در حال شروع", "failed": "خطا", "off": "خاموش",
-    }.get(portal_state, str(portal_state))
-    stale = " | دادهٔ کش‌شده" if summary.get("stale") else ""
+        "running": "RUNNING", "starting": "STARTING", "failed": "FAILED", "off": "OFF",
+    }.get(portal_state, str(portal_state).upper())
+    stale = " (cached)" if summary.get("stale") else ""
     rate = today.get("rate", 0)
     if isinstance(rate, float) and rate.is_integer():
         rate = int(rate)
 
+    div = "-------------------------------"
     return "\n".join([
-        "🤖 وضعیت ربات",
-        "━━━━━━━━━━━━",
-        f"🟢 ربات آنلاین{stale}",
-        f"👤 اکانت‌ها: {accounts.get('total', 0)} | فعال: {accounts.get('active', 0)} "
-        f"| مشغول: {accounts.get('busy', 0)}",
-        f"✈️ تلگرام: {tg_accounts.get('active', 0)}/{tg_accounts.get('total', 0)} فعال",
-        f"🌐 پورتال: {portal_label} | امروز: {today.get('success', 0)}/"
-        f"{today.get('started', 0)} ({rate}٪)",
-        f"📦 کل ورودی پورتال: {total.get('success', 0)} | منتظر کد: {today.get('pending', 0)}",
-        f"🖥 Workerها: {workers.get('healthy', 0)}/{workers.get('enabled', 0)} سالم "
-        f"| Job فعال: {jobs.get('active', 0)}",
+        "| 🤖 - #control_panel",
+        div,
+        f"• Status            : ONLINE{stale}",
+        f"• Rubika Accounts   : {accounts.get('total', 0)} "
+        f"(active {accounts.get('active', 0)}, busy {accounts.get('busy', 0)})",
+        f"• Telegram Accounts : {tg_accounts.get('active', 0)}/{tg_accounts.get('total', 0)} active",
+        f"• Workers           : {workers.get('healthy', 0)}/{workers.get('enabled', 0)} healthy",
+        f"• Active Jobs       : {jobs.get('active', 0)}",
+        f"• Portal            : {portal_label} | today "
+        f"{today.get('success', 0)}/{today.get('started', 0)} ({rate}%)",
+        f"• Portal Total      : {total.get('success', 0)} | pending code {today.get('pending', 0)}",
+        div,
     ])
 
 
