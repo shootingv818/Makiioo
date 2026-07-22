@@ -132,6 +132,40 @@
 
 ---
 
+---
+
+---
+
+## آپدیت این نشست (۳) — «مغز استخری» (Pool Brain) + فیکس انتقال ورکر (متن→مارکر)
+> شاخه: `feat/build-from-meow` (مستقیم روی همان شاخه‌ی deploy، طبق جریانِ سرورِ کاربر).
+> کامیت‌ها: `6497251` (فیچر + فیکس) سپس `38a45d3` (کارت‌های واضح‌تر لاگ).
+> فایل‌های کد: `bot.py`, `db.py`, `worker_api.py`, `rubika_client.py`. بدون migration مخرب (فقط جدول/ستون/کلید JSON جدید).
+
+### ۱) حالت دوم مغز = «🌊 Pool Brain» — `bot.py` + `db.py` + `worker_api.py` + `rubika_client.py`
+- **ایده:** چند اکانت (یکی به‌ازای هر ورکر) با **یک پیش‌شماره‌ی مشترک** و یک **هدف کلِ جهانی**، به‌صورت **موازی** شماره لیچ می‌کنند تا مجموع استخر به هدف برسد؛ بعد **هر اکانت به مخاطب‌هایی که خودش ساخته** ارسال می‌کند (مارکر یا متن). مغز نوع‌۱ (فایل‌محور) و discovery دست‌نخورده ماندند.
+- **UI:** دکمه‌ی «🌊 Pool Brain» در منوی Brain → `b"pool"` → `_pool_menu` با **محافظِ یک‌ورکر=یک‌اکانت** (`psel_`؛ انتخاب دومی از همان ورکر رد می‌شود) → `pgo` → پیش‌شماره (`await_pool_prefix`) → هدف (`await_pool_target`) → مارکر/متن (`pmode_marker`/`pmode_text`, متن: `await_pool_text`) → `_pool_launch`.
+- **تولید کاندید (قطعی، برای بلاک‌بندی):** permutation افاین `suffix(i)=(A·i+offset) mod 10^k`, با `A` هم‌اول با `10^k` (آخرین رقم ۷). `_pool_affine`. تولید رندومِ نوع‌۱ (`_gen_number`/`_next_candidate`) **دست‌نخورده**.
+- **لیچ موازی:** `_pool_leech_account` هر اکانت؛ لیزِ اتمیکِ بلاک با `_pool_lease_block` (asyncio.Lock تک‌پروسه + cursorِ durable در `pool_jobs.cursor`؛ Q5). `POOL_BLOCK=50`. توقفِ لیز وقتی مجموع ≥ هدف (overshoot کوچک قابل‌قبول). شماره‌های `rubika_was_sent` از ابتدا رد می‌شوند (P4؛ در `leeched_numbers` **نوشته نمی‌شود**). پروب با `_pool_probe_block` (ریموت `/contacts/add` → `results[]`؛ لوکال `rb.add_contact`). هر hit با `pool_add_contact` (UNIQUE(job_id,guid)) به اکانتِ سازنده گره می‌خورد.
+- **ارسال:** `_pool_send_phase` — هر اکانت سهم `unsent` خودش را می‌فرستد. ریموت: `run_send_remote(order_by_presence=True, pool_job_id=...)`؛ لوکال: پیش‌مرتب با `_pool_order_local` سپس `run_send(pool_job_id=...)`. **همه با `suppress_resume_panel=True`** (Q3: استخر خودش ادامه را مدیریت می‌کند، بدون پنلِ Transfer/Continue).
+- **ثبتِ «فقط ارسال‌موفق» (P1):** ورکر در `/send/status` لیستِ `sent_guids` (موفقیت قطعی) می‌دهد؛ مستر در هر poll آن‌ها را diff و با `pool_mark_contact_sent` هم `pool_contacts.sent=1` و هم دفترچه‌ی **جهانیِ** `rubika_sent_numbers` را می‌نویسد. لوکال هم بعد از هر ارسال موفق مستقیم ثبت می‌کند. کلید = شماره‌ی نرمالِ `rb.normalize_phone` (P6، تک‌منبع).
+- **هیچ‌وقت متوقف نشو:** اکانتِ شوت/بدون‌دسترسی drop می‌شود و بقیه ادامه؛ بدون transfer در حین استخر (P3: سهمِ ارسال‌نشده چون ثبت نشده دفعه‌ی بعد برمی‌گردد).
+- **Restart-safe:** `pool_jobs`/`pool_job_accounts`/`pool_contacts`/cursor در DB؛ boot-recovery با `_recover_pool_jobs()` در `amain` (jobهای باز را از cursor/سهمِ unsent ادامه می‌دهد؛ dedup توسط ledger + `pool_contacts.sent`).
+- **کارت‌های لاگ (انگلیسی):** POOL BRAIN START (لیست اکانت→ورکر)، per-account LEECH Started/Progress/Finished (Finished همیشه حتی ۰)، `🚫 ACCOUNT SHOT / NO ACCESS` (خطای دقیق؛ ریموت با `/account/verify`، لوکال با `verify_session_dead`)، `⚠️ WORKER NEEDS UPDATE` (ورکرِ قدیمیِ بدون `results`)، Paused (خطای گذرا + retry)، LEECH DONE، per-account SEND Started/Skipped، REPORT پایانی.
+- **db.py (افزایشی):** جداول `rubika_sent_numbers`, `pool_jobs`, `pool_job_accounts`, `pool_contacts` + توابع `rubika_was_sent/rubika_mark_sent`, `pool_create_job/get_job/set_status/set_cursor/list_open_jobs/list_accounts/set_account_status/set_account_counts/add_contact/hit_count/account_hit_count/account_guids/guid_phone/mark_contact_sent/account_sent_count`.
+- **worker_api.py (افزایشی، backward-compatible):** `/contacts/add` علاوه بر قبلی‌ها `results=[{phone,on_rubika,guid}]` (باگ زنده‌ی «همه on_rubika=false» هم رفع شد)؛ `SendIn.order_by_presence` + مرتب‌سازیِ سمت‌ورکر با `rb.presence_rank`؛ `job.sent_guids` و افزودن در `_run_send` روی هر موفقیت قطعی.
+- **rubika_client.py:** `presence_rank(client)` = ترتیب آنلاین→آخرین‌بازدید **بدون چت‌دار** (Q2). `get_ordered_recipients` (چت‌دار-اول) **دست‌نخورده**.
+
+### ۲) فیکس باگِ انتقال ورکر (متنِ ارسال → اشتباهی مارکر) — `bot.py`
+- **باگ:** `_offer_resume_after_send` فیلدهای `mode/text` را در payloadِ `paused_sends` ذخیره نمی‌کرد؛ resume/transfer پیش‌فرض `marker` می‌گرفت و مسیر ۲.۵ به‌زور `_find_marker_local` می‌زد.
+- **فیکس:** `mode/text/text2` در payload ذخیره می‌شود (JSON، بدون migration)، `mode` صریح نوشته می‌شود با fallbackِ رکورد قدیمی (text باشد→text وگرنه marker). همه‌ی مسیرهای `_do_resume` (۱ لوکال، ۲ ریموت، ۲.۵ فقط-مارکر با گارد `not _is_text`، ۳ fresh) و `_resume_fresh_send` (شاخه‌ی text با `_local_ordered_guids`/`prepare mode=text`) و `run_send_remote` (فلگ `suppress_resume_panel`) اصلاح شدند. در حالت text **هیچ‌جا** دنبال مارکر نمی‌گردد (لوکال/`/send/start`/`/send/to_list`).
+
+### تست/صحت‌سنجی این نشست
+- `python3 -m py_compile bot.py db.py worker_api.py rubika_client.py` پاک.
+- cross-check: همه‌ی `db.pool_*`/`db.rubika_*` ارجاع‌شده در `bot.py` در `db.py` تعریف شده (diff خالی)؛ همه‌ی هلپرهای pool یک‌بار تعریف؛ callbackها + stepهای dispatcher + boot-recovery وصل.
+- ⚠️ **deploy:** worker_api عوض شده → برای کارکردِ استخر روی اکانت‌های ریموت باید **Workers → Update All** زده شود؛ وگرنه کارتِ «WORKER NEEDS UPDATE» می‌آید (نه ۰ خاموش). به سرعت/تنظیمات (Send delay/Probe speed) دست زده نشد.
+
+---
+
 ## نکات تداخل سشن (مهم برای آپدیت بعدی)
 - یک اتصال زنده برای هر session؛ قبل از اتصال جدید، قبلی بسته شود (`account_conn.close`).
 - حذف اکانت فقط با InvalidAuth قطعی و **تأیید صریح مالک** (پنل قرنطینه). timeout/شبکه/FloodWait/Worker unavailable = خطای موقت، هرگز حذف/قرنطینه‌ی قطعی.
@@ -152,5 +186,6 @@
 
 ## وضعیت آپدیت‌ها
 - شاخه‌ی قبلی: `feat/build-from-meow`. کامیت‌ها: base → worker fix → channel-brain → english-logs → watcher-merge.
-- شاخه‌ی این نشست: `fix/channel-brain-worker-display` (از `dcbc0aa`). سه بخش: فیکس مغز کانال + نمایش ورکر + حذف کد مرده. فقط `bot.py`/`worker_api.py` (+ این نقشه).
+- شاخه‌ی `fix/channel-brain-worker-display` (از `dcbc0aa`): فیکس مغز کانال + نمایش ورکر + حذف کد مرده.
+- **این نشست:** روی `feat/build-from-meow` مستقیم. کامیت‌ها: `1de4f42` (فاز۳ ورکر keepalive) → `6497251` (مغز استخری + فیکس انتقال ورکر) → `38a45d3` (کارت‌های واضح‌تر لاگ استخر + تشخیص شوت/ورکر قدیمی). `py_compile` هر ۴ فایل پاک.
 - صحت‌سنجی این نشست: compileall پاک، ruff `F821/F811/F823` پاک، `_safe_worker_update_command` byte-identical، ۶۶ تست (۳۸+۸+۲۰) PASS، grep دیف allowlist، semantic review سبز (تنها نکته: trade-off عمدیِ retry تکراری‌سازی کانال، بالا توضیح داده شد).
