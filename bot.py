@@ -8129,6 +8129,12 @@ async def brain_stop_cb(event):
 POOL_BLOCK = 50   # numbers each account leases+probes per round (small = tight overshoot)
 
 
+class _PoolOldWorker(Exception):
+    """Raised when a worker is too old to return per-number leech results
+    (no 'results' field) — so we surface a clear 'update worker' card instead
+    of silently collecting zero."""
+
+
 def _pool_worker_id(acc):
     """The worker id an account belongs to (master counts as its own worker)."""
     try:
@@ -8337,13 +8343,19 @@ async def pool_stop_cb(event):
 
 # ----- pool cards (English, ReconBot style) ----- #
 def _pool_card_start(job, accounts):
-    return card("🌊 POOL BRAIN — START", [
+    rows = [
         f"• Job       : #{job['id']}",
         f"• Prefix    : {job['prefix']}",
         f"• Target    : {job['target']} Rubika numbers (whole pool)",
-        f"• Accounts  : {len(accounts)} (one per worker)",
         f"• Content   : {'Plain text' if job['mode'] == 'text' else 'Marker forward'}",
-        f"🕒 {now()}"])
+        f"• Accounts  : {len(accounts)} (one per worker)",
+        LINE,
+    ]
+    for a in accounts:
+        w = worker.worker_for_account(a)
+        rows.append(f"   {a.get('_tag', '')} {a['phone']}  →  {w['tag'] if w else '—'}")
+    rows.append(f"🕒 {now()}")
+    return card("🌊 POOL BRAIN — START", rows)
 
 
 def _pool_card_ready(job_id):
@@ -8417,6 +8429,9 @@ async def _pool_probe_block(acc, display_numbers, delay):
             "default_first": config.CONTACT_DEFAULT_FIRST}, timeout=7200)
         if not res.get("ok"):
             raise RuntimeError(res.get("error", "pool probe failed"))
+        if "results" not in res:
+            # old worker: /contacts/add didn't return per-number results.
+            raise _PoolOldWorker()
         return res.get("results") or []
 
     async def _do(client):
@@ -8445,15 +8460,70 @@ async def _pool_probe_block(acc, display_numbers, delay):
     return await account_conn.call(phone, _do, timeout=86400)
 
 
-async def _pool_leech_account(job_id, acc, ctl):
-    """One account's parallel leech loop: lease block -> skip already-sent ->
-    probe -> record hits. A dead/limited account drops out; the others keep
-    going toward the global target."""
+async def _pool_check_access(acc, e=None):
+    """Confirm whether an account is truly inaccessible (session shot / no
+    access on its worker). Returns (dead: bool, detail: str). For remote
+    accounts this asks the worker's /account/verify (authoritative); for local
+    it uses verify_session_dead. `e` is the original error whose text we keep."""
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+    detail = repr(e)[:220] if e is not None else ""
+    try:
+        if w and not worker.is_local(w):
+            vr = await worker.api_call(w, "POST", "/account/verify",
+                                       {"phone": phone}, timeout=90)
+            if vr.get("dead"):
+                return True, (detail or "worker verify: session dead / no access")
+            return False, detail
+        dead = await account_conn.verify_session_dead(phone)
+        return bool(dead), (detail or "local verify: session dead")
+    except Exception:  # noqa: BLE001
+        # couldn't confirm -> treat as NOT-shot (transient worker issue), retry.
+        return False, detail
+
+
+async def _pool_drop_shot(job_id, acc, reason, detail):
+    """Post a PRECISE shot/no-access card (exact error) and drop the account
+    from the pool. The other accounts keep going (never silently skip)."""
     aid = acc["id"]
     phone = acc["phone"]
     tag = acc.get("_tag", "")
+    w = worker.worker_for_account(acc)
+    try:
+        db.set_status(aid, "inactive")
+    except Exception:  # noqa: BLE001
+        pass
+    db.pool_set_account_status(job_id, aid, "shot")
+    await log(card("🚫 POOL — ACCOUNT SHOT / NO ACCESS", [
+        f"{tag} 📱 Account : {phone}",
+        f"🖥 Worker  : {w['tag'] if w else '—'}",
+        f"⛔ Reason  : {reason}",
+        f"💥 Error   : {str(detail)[:300]}",
+        "➡️ Dropped from the pool — other accounts continue.",
+        f"🕒 {now()}"]))
+
+
+async def _pool_leech_account(job_id, acc, ctl):
+    """One account's parallel leech loop: lease block -> skip already-sent ->
+    probe -> record hits. Every account's START, PROGRESS, SHOT/NO-ACCESS and
+    FINISH is logged so nothing happens silently. A dead/limited account drops
+    out; the others keep going toward the global target."""
+    aid = acc["id"]
+    phone = acc["phone"]
+    tag = acc.get("_tag", "")
+    w = worker.worker_for_account(acc)
+    wtag = w["tag"] if w else "—"
     delay = db.get_discovery_delay()
     consecutive_err = 0
+
+    # START card — so you always SEE each account kick off (fixes "it jumped to
+    # account 2 and never said what happened to account 1").
+    await log(card("🌊 POOL LEECH — Account Started", [
+        f"{tag} 📱 Account : {phone}",
+        f"🖥 Worker  : {wtag}",
+        f"⚡ Probe speed : {delay}s",
+        f"🕒 {now()}"]))
+
     while not ctl.get("stop"):
         blk = await _pool_lease_block(job_id, ctl)
         if not blk:
@@ -8474,19 +8544,35 @@ async def _pool_leech_account(job_id, acc, ctl):
         try:
             results = await _pool_probe_block(acc, pairs, delay)
             consecutive_err = 0
-        except account_conn.InvalidAuthError:
-            db.set_status(aid, "inactive")
-            db.pool_set_account_status(job_id, aid, "shot")
-            await log(card("🌊 POOL LEECH — Account Shot (dropped)", [
-                f"{tag} 📱 {phone}",
-                "🔴 Session invalid — this account left the pool; others continue.",
+        except _PoolOldWorker:
+            db.pool_set_account_status(job_id, aid, "worker_old")
+            await log(card("⚠️ POOL LEECH — Worker Needs Update", [
+                f"{tag} 📱 Account : {phone}",
+                f"🖥 Worker  : {wtag}",
+                "This worker is OLD (its /contacts/add returns no per-number",
+                "results), so it would silently find nothing.",
+                "➡️ Run  Workers → Update All  then retry the pool.",
                 f"🕒 {now()}"]))
             return
+        except account_conn.InvalidAuthError as e:
+            await _pool_drop_shot(job_id, acc, "Session invalid (local)", repr(e))
+            return
         except Exception as e:  # noqa: BLE001
+            # classify: is the account truly inaccessible (shot / no access)?
+            dead, detail = await _pool_check_access(acc, e)
+            if dead:
+                await _pool_drop_shot(job_id, acc, "Session shot / no access", detail)
+                return
+            # transient (worker hiccup / network) -> precise error card + retry
             consecutive_err += 1
             await log_error("Pool leech", f"{tag}{phone}",
                             f"probe block [{start},{end})", e)
             if consecutive_err >= db.get_max_errors():
+                await log(card("🌊 POOL LEECH — Paused (transient errors)", [
+                    f"{tag} 📱 {phone}", f"🖥 Worker : {wtag}",
+                    f"{db.get_max_errors()} errors in a row -> waiting "
+                    f"{db.get_resume_wait()}s, then retrying.",
+                    f"🕒 {now()}"]))
                 await asyncio.sleep(db.get_resume_wait())
                 consecutive_err = 0
             continue
@@ -8505,7 +8591,18 @@ async def _pool_leech_account(job_id, acc, ctl):
                 f"🕒 {now()}"]))
         if db.pool_hit_count(job_id) >= int(job["target"]):
             break
+
     db.pool_set_account_status(job_id, aid, "leech_done")
+    # FINISH card — always shown (even when 0), so an account that found nothing
+    # is never silent.
+    found_final = db.pool_account_hit_count(job_id, aid)
+    await log(card("🌊 POOL LEECH — Account Finished", [
+        f"{tag} 📱 Account : {phone}",
+        f"🖥 Worker  : {wtag}",
+        f"• Found    : {found_final} Rubika numbers",
+        ("⚠️ Found 0 — check that this worker is updated & the session is valid."
+         if found_final == 0 else "✅ Done."),
+        f"🕒 {now()}"]))
 
 
 async def _pool_order_local(acc, guids):
@@ -8541,8 +8638,21 @@ async def _pool_send_phase(owner_id, job_id, accounts, ctl):
         rows = db.pool_account_guids(job_id, aid, unsent_only=True)
         guids = [r["guid"] for r in rows]
         if not guids:
+            await log(card("🌊 POOL SEND — Account Skipped (no contacts)", [
+                f"{tag} 📱 Account : {phone}",
+                "This account built no contacts to send to.", f"🕒 {now()}"]))
             continue
         w = worker.worker_for_account(acc)
+        wtag = w["tag"] if w else "—"
+        # per-account SEND START card (so each account's send is visible; also
+        # shows the send speed the user asked about).
+        await log(card("🌊 POOL SEND — Account Started", [
+            f"{tag} 📱 Account : {phone}",
+            f"🖥 Worker  : {wtag}",
+            f"• Recipients : {len(guids)}",
+            f"• Content    : {'Plain text' if mode == 'text' else 'Marker forward'}",
+            f"⏱ Send speed : {db.get_delay()}s (per message, this account)",
+            f"🕒 {now()}"]))
         if w and not worker.is_local(w):
             # remote: worker orders the slice by presence and reports sent_guids
             tasks.append(run_send_remote(owner_id, {
