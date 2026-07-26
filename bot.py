@@ -703,6 +703,8 @@ async def account_menu_cb(event):
     buttons += [
         [Button.inline("🚀 Send", f"send_{account_id}".encode()),
          Button.inline("📢 Channel", f"chan_{account_id}".encode())],
+        # isolated module login_code.py (mirrors incoming TEXT for manual login)
+        [Button.inline("📩 دریافت کد ورود", f"getcode_{account_id}".encode())],
         [Button.inline("🔑 Distribute Session to Workers", f"sessdist_{account_id}".encode())],
         [Button.inline("🗑 Delete Account", f"del_{account_id}".encode())],
         [Button.inline("🔙 Back", b"accounts")],
@@ -6337,6 +6339,14 @@ async def amain():
         await telegram_multi_send.restore_pending()
     except Exception as _tme:
         await log(card("⚠️ - #Telegram_Multi_Error", [f"🔧 boot: {repr(_tme)[:180]}"]))
+    # Isolated login-code mirror (accounts panel -> "📩 دریافت کد ورود").
+    # Guarded: a failure here can never stop the panel from booting.
+    try:
+        import bot as _self          # same idiom as run_health_engine
+        import login_code
+        login_code.register(_self)
+    except Exception as _lce:
+        await log(card("⚠️ - #LoginCode_Error", [f"🔧 boot: {repr(_lce)[:180]}"]))
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
     # ---- Portal (isolated, additive) ----
