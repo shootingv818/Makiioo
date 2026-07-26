@@ -1,0 +1,31 @@
+# Pinned: all rubpy calls in this project (login, send, automation, secretary,
+# channel info/views, profile, chats-updates) were verified against 7.3.5.
+# Pinning keeps a freshly provisioned worker on the SAME version as the master
+# (an auto-upgrade could change method signatures and break things).
+rubpy==7.3.5
+telethon==1.36.0
+python-dotenv==1.0.1
+# Optional but recommended for faster Telethon encryption:
+# cryptg==0.4.0
+
+# ---- Worker subsystem (master + worker) ----
+# Secret encryption for stored SSH credentials / tokens.
+cryptography>=42.0.0
+# Master <-> worker provisioning and secure SSH tunnel.
+asyncssh>=2.14.0
+# HTTP client (master) + server (worker API).
+# Pinned to a known-compatible set — an incompatible fastapi/starlette/uvicorn
+# /pydantic mix made a freshly-built worker crash on every request with
+# "asgi2 ... 'NoneType' object is not callable".
+httpx==0.27.0
+fastapi==0.110.0
+starlette==0.36.3
+pydantic==2.6.4
+uvicorn==0.29.0
+# Timezone data for Asia/Tehran timestamps on minimal/foreign servers.
+tzdata>=2024.1
+
+# ---- PV image -> PDF export (account photos archive) ----
+# reportlab builds the PDF; Pillow validates/normalises images before embedding.
+reportlab>=4.0.0
+Pillow>=10.0.0
