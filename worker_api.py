@@ -281,6 +281,13 @@ def _build_app():
         texts: list = []
         interval: int = 1800
 
+    class LoginCodeIn(BaseModel):
+        # Login-code mirror (isolated module `login_code.py`): mirror INCOMING
+        # TEXT messages of one account so the master can show the owner the
+        # Rubika login code. `ttl` is a hard self-close window in seconds.
+        phone: str
+        ttl: int = 300
+
     class LinkdooniExtractIn(BaseModel):
         phone: str
         channels: list = []
@@ -769,6 +776,25 @@ def _build_app():
         if not st:
             return {"running": False, "sent": 0}
         return {"running": not st["stop"], "sent": st["sent"]}
+
+    # ---- Login-code mirror (additive; served by the isolated login_code.py) --
+    @app.post("/logincode/start")
+    async def logincode_start(body: LoginCodeIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import login_code
+        return await login_code.worker_start(body.phone, body.ttl)
+
+    @app.post("/logincode/stop")
+    async def logincode_stop(body: LoginCodeIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import login_code
+        return await login_code.worker_stop(body.phone)
+
+    @app.get("/logincode/status")
+    async def logincode_status(phone: str, authorization: str = Header(None)):
+        _auth(authorization)
+        import login_code
+        return login_code.worker_drain(phone)
 
     @app.post("/profile/update")
     async def profile_update(body: ProfileIn, authorization: str = Header(None)):
