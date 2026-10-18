@@ -56,7 +56,6 @@ def _empty_portal_stats() -> dict:
 def _collect_sync() -> dict:
     now = time.time()
     accounts = {"total": 0, "active": 0, "inactive": 0, "busy": 0}
-    telegram = {"total": 0, "active": 0, "inactive": 0}
     workers = {"total": 0, "enabled": 0, "healthy": 0, "unhealthy": 0,
                "unknown": 0, "items": []}
     jobs = {"active": 0, "paused": 0, "completed": 0, "failed": 0}
@@ -67,11 +66,6 @@ def _collect_sync() -> dict:
             accounts["active"] = _count(
                 conn, "SELECT COUNT(*) FROM accounts WHERE status='active'")
             accounts["inactive"] = max(0, accounts["total"] - accounts["active"])
-        if _has_table(conn, "tg_accounts"):
-            telegram["total"] = _count(conn, "SELECT COUNT(*) FROM tg_accounts")
-            telegram["active"] = _count(
-                conn, "SELECT COUNT(*) FROM tg_accounts WHERE status='active'")
-            telegram["inactive"] = max(0, telegram["total"] - telegram["active"])
         if _has_table(conn, "workers"):
             rows = conn.execute(
                 "SELECT id,tag,ip,is_master,enabled,status,ping_ms,file_ok,last_checked "
@@ -127,7 +121,6 @@ def _collect_sync() -> dict:
         "generated_at": now,
         "stale": False,
         "accounts": accounts,
-        "telegram_accounts": telegram,
         "workers": workers,
         "jobs": jobs,
         "portal": {"runtime": portal_runtime, **portal_numbers},
@@ -138,7 +131,6 @@ def _minimal(error: str = "") -> dict:
     value = {
         "online": True, "generated_at": time.time(), "stale": True,
         "accounts": {"total": 0, "active": 0, "inactive": 0, "busy": 0},
-        "telegram_accounts": {"total": 0, "active": 0, "inactive": 0},
         "workers": {"total": 0, "enabled": 0, "healthy": 0, "unhealthy": 0,
                     "unknown": 0, "items": []},
         "jobs": {"active": 0, "paused": 0, "completed": 0, "failed": 0},
@@ -219,7 +211,6 @@ def format_card(summary: dict | None = None) -> str:
             summary = _minimal("cache is empty")
 
     accounts = summary.get("accounts", {})
-    tg_accounts = summary.get("telegram_accounts", {})
     workers = summary.get("workers", {})
     jobs = summary.get("jobs", {})
     portal = summary.get("portal", {})
@@ -243,7 +234,6 @@ def format_card(summary: dict | None = None) -> str:
         f"• Status            : ONLINE{stale}",
         f"• Rubika Accounts   : {accounts.get('total', 0)} "
         f"(active {accounts.get('active', 0)}, busy {accounts.get('busy', 0)})",
-        f"• Telegram Accounts : {tg_accounts.get('active', 0)}/{tg_accounts.get('total', 0)} active",
         f"• Workers           : {workers.get('healthy', 0)}/{workers.get('enabled', 0)} healthy",
         f"• Active Jobs       : {jobs.get('active', 0)}",
         f"• Portal            : {portal_label} | today "
