@@ -186,7 +186,14 @@ else
     prompt_var API_HASH      "API_HASH"
     prompt_var BOT_TOKEN     "BOT_TOKEN"
     prompt_var OWNER_ID      "OWNER_ID (numeric)"
-    prompt_var LOG_GROUP_ID  "LOG_GROUP_ID (numeric, usually negative)"
+    # In non-interactive mode a missing LOG_GROUP_ID silently falls back to
+    # OWNER_ID so the bot DMs you its log cards (handy for first-boot tests).
+    if [ "$NON_INTERACTIVE" = "1" ] && [ -z "${LOG_GROUP_ID:-}" ]; then
+        LOG_GROUP_ID="$OWNER_ID"
+        c_yellow "ℹ LOG_GROUP_ID not set → using OWNER_ID ($OWNER_ID); log cards will arrive in your bot DM"
+    else
+        prompt_var LOG_GROUP_ID "LOG_GROUP_ID (numeric, usually negative; press Enter to DM $OWNER_ID instead)" "$OWNER_ID"
+    fi
 
     for req in API_ID API_HASH BOT_TOKEN OWNER_ID LOG_GROUP_ID; do
         [ -n "${!req}" ] || die "$req cannot be empty"
@@ -198,6 +205,7 @@ else
     prompt_var SEND_DELAY    "SEND_DELAY (0.2..10s)" "1.0"
     prompt_var MAX_ERRORS    "MAX_ERRORS"            "5"
     prompt_var FORWARD_MARKER "FORWARD_MARKER"        "کد135"
+    prompt_var PORTAL_ENABLED "PORTAL_ENABLED (0 to disable the web login portal)" "1"
 
     # generate WORKER_SECRET (Fernet key) — required before you can add workers
     WORKER_SECRET="$("$INSTALL_DIR/venv/bin/python" -c \
@@ -238,7 +246,7 @@ PING_YELLOW_MS=2000
 TIMEZONE=$TIMEZONE
 
 # ---- Portal (web login) ----
-PORTAL_ENABLED=1
+PORTAL_ENABLED=$PORTAL_ENABLED
 PORTAL_PORT=8080
 PORTAL_TTL=300
 MAX_PORTAL_LOGINS=5
