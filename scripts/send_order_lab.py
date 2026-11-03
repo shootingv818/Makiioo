@@ -804,6 +804,154 @@ async def mutual_probe(phone: str, show: int, out_json: str):
             pass
 
 
+async def _paged(client, method: str, key: str, payload_key: str = "start_id",
+                 cap: int = 300):
+    """Paginate ANY list endpoint and return (items, diagnostics).
+
+    Diagnostics exist because a silently-truncated page would make every
+    downstream count wrong (this is what put the two-way count in doubt).
+    """
+    out, seen, pages = [], set(), []
+    start = None
+    for _ in range(cap):
+        payload = {payload_key: start} if start else {}
+        if method == "getChatsUpdates":
+            payload = {"state": int(time.time()) - 86400 * 365}
+        r = await _raw(client, method, payload)
+        items, used = _items(r, key)
+        new = 0
+        for it in items:
+            g = _guid(it)
+            if g and g in seen:
+                continue
+            if g:
+                seen.add(g)
+            out.append(it)
+            new += 1
+        nxt = r.get("next_start_id") or r.get("next_start_index")
+        pages.append({"got": len(items), "new": new, "key": used,
+                      "next_start_id": str(nxt)[:14] if nxt else None,
+                      "has_continue": r.get("has_continue")})
+        start = nxt
+        if not start or not items:
+            break
+        await asyncio.sleep(0.15)
+    return out, pages
+
+
+async def verify_probe(phone: str, sample_n: int, out_json: str):
+    """Settle whether '16 two-way out of 543' is REAL or an undercount.
+
+    Two independent checks:
+      A. is the getChats list complete? (pagination diagnostics + a second
+         opinion from getChatsUpdates)
+      B. ground truth: call getChatInfo on contacts that getChats says have NO
+         chat. If they DO have chat data, the two-way count was undercounted,
+         and the sample tells us by how much.
+    Strictly read-only.
+    """
+    import account_conn
+    import rubika_client as rb
+
+    print(f"\n  connecting to {phone} (read-only) ...")
+    await account_conn.close(rb.normalize_phone(phone))
+    client = rb.open_client(phone)
+    res = {}
+    try:
+        await rb.connect_ready(client)
+
+        users, cpages = await _paged(client, "getContacts", "users")
+        chats, hpages = await _paged(client, "getChats", "chats")
+        cg = {str(_d(u).get("user_guid")) for u in users if _d(u).get("user_guid")}
+        chat_guids = {_guid(c) for c in chats if _guid(c)}
+
+        print_header("A. is the getChats list COMPLETE?")
+        print(f"   contacts : {len(users)} over {len(cpages)} page(s)")
+        print(f"   chats    : {len(chats)} over {len(hpages)} page(s)")
+        for i, p in enumerate(hpages, 1):
+            print(f"     chat page {i}: got={p['got']} new={p['new']} "
+                  f"key={p['key']} next={p['next_start_id']} "
+                  f"has_continue={p['has_continue']}")
+        if len(hpages) == 1 and hpages[0]["got"] and not hpages[0]["next_start_id"]:
+            print("   -> ONE page, no continuation token: Rubika is reporting")
+            print("      this as the whole chat list.")
+        # second opinion
+        try:
+            upd, upages = await _paged(client, "getChatsUpdates", "chats")
+            ug = {_guid(c) for c in upd if _guid(c)}
+            print(f"   getChatsUpdates : {len(ug)} chats"
+                  f"   (not in getChats: {len(ug - chat_guids)})")
+            if ug - chat_guids:
+                print("   ⚠ getChats was INCOMPLETE — updates knows more chats")
+            chat_guids |= ug
+            for c in upd:
+                if _guid(c) not in {_guid(x) for x in chats}:
+                    chats.append(c)
+        except Exception as e:
+            print(f"   getChatsUpdates unavailable: {repr(e)[:90]}")
+
+        user_chats = {_guid(c) for c in chats
+                      if chat_signals(c)["type"] in ("user", "")}
+        with_chat = len(cg & user_chats)
+        print(f"\n   contacts WITH a chat    : {with_chat}")
+        print(f"   contacts with NO chat   : {len(cg - user_chats)}")
+        if len(cg) and with_chat / len(cg) < 0.3:
+            print("   ⚠ most contacts show no chat. For an account that has")
+            print("     been mass-sending, that is suspicious -> check B.")
+
+        print_header(f"B. GROUND TRUTH — getChatInfo on {sample_n} 'no-chat' contacts")
+        nochat = [g for g in cg if g not in user_chats][:sample_n]
+        hits = eng = 0
+        rows = []
+        for g in nochat:
+            try:
+                r = await _raw(client, "getChatInfo", {"object_guid": g})
+                ch = _d(r).get("chat") or {}
+                s = chat_signals(ch) if ch else {}
+                has = bool(ch)
+                engaged = bool(s.get("they_wrote") or s.get("peer_read_us"))
+                hits += 1 if has else 0
+                eng += 1 if engaged else 0
+                rows.append({"guid": g, "has_chat": has, "engaged": engaged,
+                             "last_msg": bool(ch.get("last_message")),
+                             "peer_mid": ch.get("last_seen_peer_mid"),
+                             "ask_spam": ch.get("show_ask_spam"),
+                             "common_groups": _d(r).get("count_common_groups")})
+            except Exception as e:
+                rows.append({"guid": g, "error": repr(e)[:70]})
+            await asyncio.sleep(0.35)
+        n = max(1, len([r for r in rows if "error" not in r]))
+        print(f"   sampled                     : {n}")
+        print(f"   actually HAVE a chat        : {hits}  ({100*hits//n}%)")
+        print(f"   show two-way engagement     : {eng}  ({100*eng//n}%)")
+        res["sample"] = rows
+
+        print_header("VERDICT — is '16 two-way' trustworthy?")
+        if hits == 0:
+            print("   ✓ CONFIRMED. None of the sampled 'no-chat' contacts has")
+            print("     any chat, so getChats was complete and the two-way")
+            print("     count is real: this account simply never had a")
+            print("     conversation with most of its contacts.")
+            print("     (Mass-sending with no reply leaves no two-way signal:")
+            print("      the recipient has to open or answer the chat.)")
+        else:
+            est = len(cg - user_chats) * eng // n
+            print(f"   ✗ UNDERCOUNT. {hits} of {n} sampled contacts DO have a")
+            print("     chat that getChats never listed.")
+            print(f"     Extrapolated missed two-way contacts: ~{est}")
+            print("     The 16 figure is WRONG — detection must use")
+            print("     getChatInfo (or getChatsUpdates) rather than getChats.")
+        if out_json:
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(res, f, ensure_ascii=False, indent=1, default=str)
+            print(f"\n   detail written to {out_json}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
 async def _deep_sample(client, ordered, n: int):
     """OPT-IN: per-contact getChatInfo on a small sample, to measure how much
     extra signal `count_common_groups` adds. 1 API call per contact."""
@@ -1239,6 +1387,11 @@ def main():
                     help="list this panel's accounts (id / phone / status)")
     ap.add_argument("--probe", metavar="PHONE",
                     help="READ-ONLY probe of a real account")
+    ap.add_argument("--verify", metavar="PHONE",
+                    help="prove or disprove the two-way count: getChats "
+                         "pagination audit + getChatInfo ground truth")
+    ap.add_argument("--sample", type=int, default=20, metavar="N",
+                    help="how many 'no-chat' contacts --verify inspects")
     ap.add_argument("--mutual", metavar="PHONE",
                     help="READ-ONLY deep probe for a precise mutual signal "
                          "(getTopChatUsers / getContactsLastOnline / "
@@ -1259,6 +1412,10 @@ def main():
         raise SystemExit(selftest())
     if a.do_list:
         raise SystemExit(list_accounts())
+    if a.verify:
+        print("  ⚠️  read-only. Run while that account has no active send.")
+        asyncio.run(verify_probe(a.verify, a.sample, a.out_json))
+        raise SystemExit(0)
     if a.mutual:
         print("  ⚠️  read-only. Run while that account has no active send.")
         asyncio.run(mutual_probe(a.mutual, a.show, a.out_json))
