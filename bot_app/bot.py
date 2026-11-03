@@ -1120,16 +1120,21 @@ async def send_file_prepare_cb(event):
     await safe_edit(event,
         "⏳ Uploading the file to Saved Messages (auto-fallback to another worker "
         "if an IP is blocked), then sending …")
+    stop_flags[account_id] = False
     import bot as _self
     ok, detail = await caption_file.send_for_account(_self, acc)
     if ok:
+        # Same panel as a normal send: a live Stop button. The reused
+        # run_send / run_send_remote post the STARTED / PROGRESS / STOPPED /
+        # FINISHED cards to the log group and, on stop, offer the
+        # worker-transfer / continue panel — all unchanged.
         await safe_edit(event,
             card("📎 FILE SEND STARTED", [
                 f"• Account : {acc['phone']}",
                 "• The file is in Saved Messages and the send has started.",
-                "• Progress cards are posted in the log group.",
+                "• Progress / stop / transfer cards go to the log group.",
                 f"🕒 {now()}"]),
-            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+            buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
     else:
         await safe_edit(event,
             card("📎 FILE SEND FAILED ❌", [

@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import tempfile
 
 import account_conn
@@ -143,10 +144,14 @@ def clear_file() -> None:
 # --------------------------------------------------------------------------- #
 async def _upload_document(client, object_guid, data: bytes, caption: str,
                            filename: str):
-    ext = os.path.splitext(filename or "")[1] or ".bin"
-    fd, path = tempfile.mkstemp(prefix="capfile_", suffix=ext)
+    # Preserve the EXACT original file name: rubpy derives the document's name
+    # from the path basename, so we write the bytes to <tmpdir>/<original name>
+    # — nothing is renamed and nothing is appended to the name or the caption.
+    name = os.path.basename(filename or "") or "file"
+    tmpdir = tempfile.mkdtemp(prefix="capup_")
+    path = os.path.join(tmpdir, name)
     try:
-        with os.fdopen(fd, "wb") as fh:
+        with open(path, "wb") as fh:
             fh.write(data)
         cap = caption or None
         last = None
@@ -178,10 +183,7 @@ async def _upload_document(client, object_guid, data: bytes, caption: str,
                     continue
         raise RuntimeError(f"this rubpy build has no file-send method ({last})")
     finally:
-        try:
-            os.unlink(path)
-        except Exception:  # noqa: BLE001
-            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 async def _run_upload(phone: str, data: bytes, caption: str, filename: str) -> dict:
