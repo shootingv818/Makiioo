@@ -583,6 +583,39 @@ async def probe(phone: str, strategy: str, deep: int, out_json: str,
             pass
 
 
+def _items(resp, *prefer):
+    """Pull the list payload out of ANY Rubika response.
+
+    Learned the hard way: guessing key names produced false zeros twice
+    (getTopChatUsers actually returns `abs_users`, not `top_chat_users`).
+    So after the known keys we fall back to self-discovery — the first value
+    that is a list of dicts — and we always report WHICH key was used.
+    Returns (items, key_name).
+    """
+    d = _d(resp)
+    for k in (*prefer, "abs_users", "users", "top_chat_users", "objects",
+              "blocked_users", "contacts", "chats"):
+        v = d.get(k)
+        if isinstance(v, list) and v:
+            return v, k
+    for k, v in d.items():                      # self-discovering fallback
+        if isinstance(v, list) and v and isinstance(v[0], dict):
+            return v, f"{k} (auto-detected)"
+    return [], "none"
+
+
+def _guid(obj):
+    """Rubika uses object_guid in some responses and user_guid in others."""
+    d = _d(obj)
+    return str(d.get("object_guid") or d.get("user_guid") or "")
+
+
+def _name_of_user(u):
+    d = _d(u)
+    return (str(d.get("first_name") or "") + " "
+            + str(d.get("last_name") or "")).strip() or _guid(u)
+
+
 async def _raw(client, method: str, payload: dict | None = None):
     """Call ANY Rubika API method, including ones rubpy does not wrap.
     rubpy exposes a generic `builder(name=..., input=..., dict=True)`."""
@@ -632,21 +665,32 @@ async def mutual_probe(phone: str, show: int, out_json: str):
         try:
             tr = await _raw(client, "getTopChatUsers")
             found["top_chat_users"] = tr
-            raw_top = (tr.get("top_chat_users") or tr.get("users")
-                       or tr.get("objects") or [])
-            top = [str(_d(t).get("user_guid") or _d(t).get("object_guid") or "")
-                   for t in raw_top]
-            top = [g for g in top if g]
+            raw_top, key = _items(tr, "top_chat_users")
+            top = [g for g in (_guid(t) for t in raw_top) if g]
+            print(f"   payload key   : {key}")
             print(f"   returned      : {len(top)} users")
             if raw_top:
                 print(f"   object keys   : {sorted(_d(raw_top[0]))}")
+            contact_guids = {str(_d(u).get("user_guid")) for u in users}
             two_way = {g for g, s in sigs.items()
                        if s["they_wrote"] or s["peer_read_us"]}
             inter = [g for g in top if g in two_way]
-            newly = [g for g in top if g not in sigs]
+            no_chat = [g for g in top if g not in sigs]
+            not_contact = [g for g in top if g not in contact_guids]
             print(f"   already in our two-way set : {len(inter)}/{len(top)}")
-            print(f"   NOT in our chat list at all: {len(newly)}"
-                  "   <- extra signal if > 0")
+            print(f"   in top list but NO chat    : {len(no_chat)}"
+                  "   <- EXTRA two-way signal")
+            print(f"   not even in your contacts  : {len(not_contact)}")
+            # show the ones that are contacts but our chat heuristic missed
+            extra = [g for g in no_chat if g in contact_guids]
+            if extra:
+                names = {str(_d(u).get("user_guid")): _name_of_user(u)
+                         for u in users}
+                print(f"   -> {len(extra)} contact(s) Rubika ranks as top chats"
+                      " that our chat-based test missed:")
+                for g in extra[:12]:
+                    print(f"        {names.get(g, g)[:30]}")
+            found["top_extra_contacts"] = len(extra)
         except Exception as e:
             print(f"   unavailable: {repr(e)[:120]}")
 
@@ -695,10 +739,18 @@ async def mutual_probe(phone: str, show: int, out_json: str):
         print_header("4. getBlockedUsers  (definitive, vs chat is_blocked)")
         try:
             br = await _raw(client, "getBlockedUsers", {"start_id": None})
-            blocked = br.get("users") or br.get("blocked_users") or []
+            found["blocked_raw"] = br
+            blocked, bkey = _items(br, "blocked_users")
             found["blocked"] = len(blocked)
+            print(f"   payload key   : {bkey}")
             print(f"   blocked users : {len(blocked)}")
             print(f"   chat-derived  : {sum(1 for s in sigs.values() if s['blocked'])}")
+            want = (found.get("privacy") or {}).get(
+                "privacy_setting", {}).get("count_blocked_user")
+            if want is not None:
+                print(f"   privacy says  : {want}"
+                      + ("   ✓ match" if int(want) == len(blocked)
+                         else "   ⚠ mismatch — parse still wrong"))
         except Exception as e:
             print(f"   unavailable: {repr(e)[:120]}")
 
@@ -1013,7 +1065,29 @@ def selftest() -> int:
     ck("include_excluded returns everyone",
        len(build_order(users, chats, "hybrid", include_excluded=True)[0]) == 14)
 
-    print_header("7. robustness")
+    print_header("7. response-shape extraction (the false-zero bug)")
+    # getTopChatUsers really answers with `abs_users` + object_guid. Guessing
+    # key names gave a false "0 users" twice, so this must be self-discovering.
+    real_top = {"abs_users": [
+        {"object_guid": "u_a", "type": "User", "first_name": "مریم",
+         "last_name": "اسدی"},
+        {"object_guid": "u_b", "type": "User", "first_name": "امیر"}]}
+    items, key = _items(real_top, "top_chat_users")
+    ck("finds the real 'abs_users' key", key == "abs_users" and len(items) == 2)
+    ck("reads object_guid", [_guid(x) for x in items] == ["u_a", "u_b"])
+    ck("builds a display name", _name_of_user(items[0]) == "مریم اسدی")
+    ck("preferred key wins when present",
+       _items({"top_chat_users": [{"user_guid": "z"}],
+               "abs_users": [{"object_guid": "y"}]}, "top_chat_users")[1]
+       == "top_chat_users")
+    disc, dkey = _items({"some_unknown_field": [{"object_guid": "u_x"}]})
+    ck("self-discovers an UNKNOWN key (no more false zeros)",
+       len(disc) == 1 and "auto-detected" in dkey)
+    ck("empty response -> ('none')", _items({}) == ([], "none"))
+    ck("ignores non-dict lists", _items({"ids": [1, 2, 3]})[1] == "none")
+    ck("guid falls back to user_guid", _guid({"user_guid": "u_q"}) == "u_q")
+
+    print_header("8. robustness")
     ck("empty input is safe", build_order([], [])[0] == [])
     ck("users with no guid are skipped",
        build_order([{"first_name": "x"}], [])[0] == [])
