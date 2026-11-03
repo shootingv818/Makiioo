@@ -121,15 +121,21 @@ TEST_MESSAGE = "این پیام تست هست"
 ONLINE_WINDOW_SEC = 75
 
 # Ranking of the privacy buckets Rubika returns for Approximate last-seen.
+# VERIFIED against a live account (543 contacts): Rubika returns
+#   Recently / WeekAgo / MonthAgo / LongAgo
+# The Telegram-style spellings are kept only as harmless aliases.
 _APPROX_ORDER = {
     "online": 0,
     "recently": 1,
-    "lastweek": 2,
-    "last week": 2,
-    "lastmonth": 3,
-    "last month": 3,
-    "longtimeago": 4,
-    "long time ago": 4,
+    "weekago": 2, "lastweek": 2, "last week": 2,
+    "monthago": 3, "lastmonth": 3, "last month": 3,
+    "longago": 4, "longtimeago": 4, "long time ago": 4,
+}
+
+_APPROX_TIER = {
+    "recently": "APPROX_RECENTLY",
+    "weekago": "APPROX_WEEK", "lastweek": "APPROX_WEEK", "last week": "APPROX_WEEK",
+    "monthago": "APPROX_MONTH", "lastmonth": "APPROX_MONTH", "last month": "APPROX_MONTH",
 }
 
 
@@ -283,10 +289,7 @@ def classify(user, sig: dict | None) -> dict:
     elif pres["exact"] and pres["ts"]:
         tier = "EXACT_PRESENCE"
     else:
-        b = pres["bucket"]
-        tier = {"recently": "APPROX_RECENTLY",
-                "lastweek": "APPROX_WEEK", "last week": "APPROX_WEEK",
-                "lastmonth": "APPROX_MONTH", "last month": "APPROX_MONTH"}.get(b, "COLD")
+        tier = _APPROX_TIER.get(pres["bucket"], "COLD")
 
     return {
         "guid": u.get("user_guid") or u.get("object_guid") or "",
@@ -481,7 +484,16 @@ def _field_audit(users, chats):
         1 for u in users
         if str((_d(u).get("online_time") or {}).get("type") or "").lower() == "approximate"
         and int(_d(u).get("last_online") or 0) % 1800 == 0)
+    # `warning_info` showed up on a live account and is undocumented; it may be
+    # Rubika's own scam/spam marker, which would beat show_ask_spam as a filter.
+    warn = [_d(u).get("warning_info") for u in users if _d(u).get("warning_info")]
+    unknown_buckets = sorted(
+        {str((_d(u).get("online_time") or {}).get("approximate_period") or "").lower()
+         for u in users} - set(_APPROX_TIER) - {"", "online"})
     return {
+        "warning_info_count": len(warn),
+        "warning_info_samples": warn[:3],
+        "unmapped_buckets": unknown_buckets,
         "contacts_seen": len(users),
         "chats_seen": len(chats),
         "contact_has_status_field": uk.get("status", 0),
@@ -517,6 +529,12 @@ async def probe(phone: str, strategy: str, deep: int, out_json: str,
         print(f"  approximate buckets     : {audit['approximate_buckets']}")
         print(f"  masked ts on 30-min grid: {audit['masked_ts_rounded_to_30min']}"
               "   <- fake precision")
+        if audit["unmapped_buckets"]:
+            print(f"  ⚠ UNMAPPED buckets      : {audit['unmapped_buckets']}"
+                  "   <- tell me, they fall to COLD")
+        if audit["warning_info_count"]:
+            print(f"  warning_info present on : {audit['warning_info_count']}"
+                  f"   sample={audit['warning_info_samples']}")
         print(f"  contact keys            : {', '.join(audit['contact_keys'])}")
 
         ordered, report = build_order(users, chats, strategy)
@@ -661,6 +679,17 @@ def _fx():
          "phone": "9812", "last_online": 1723235400, "is_deleted": False,
          "online_time": {"type": "Approximate",
                          "approximate_period": "LongTimeAgo"}},
+        # REAL bucket spellings observed on a live account (543 contacts):
+        # Recently / WeekAgo / MonthAgo / LongAgo
+        {"user_guid": "u_weekago", "first_name": "RealWeekAgo", "phone": "9813",
+         "last_online": 1723235400, "is_deleted": False,
+         "online_time": {"type": "Approximate", "approximate_period": "WeekAgo"}},
+        {"user_guid": "u_monthago", "first_name": "RealMonthAgo", "phone": "9814",
+         "last_online": 1723235400, "is_deleted": False,
+         "online_time": {"type": "Approximate", "approximate_period": "MonthAgo"}},
+        {"user_guid": "u_longago", "first_name": "RealLongAgo", "phone": "9815",
+         "last_online": 1723235400, "is_deleted": False,
+         "online_time": {"type": "Approximate", "approximate_period": "LongAgo"}},
         # spam-risk: Rubika warns the peer we are a stranger
         {"user_guid": "u_spam", "first_name": "StrangerSpam", "phone": "9897",
          "last_online": now - 30, "is_deleted": False,
@@ -781,6 +810,16 @@ def selftest() -> int:
        g.index("u_mask_recent") < g.index("u_mask_old"))
     ck("hybrid: 'LongTimeAgo' lands in COLD",
        tier.get("u_mask_old") == "COLD")
+    # regression: the REAL Rubika spellings must map to their own tiers, not COLD
+    ck("real 'WeekAgo' -> APPROX_WEEK (not COLD)",
+       tier.get("u_weekago") == "APPROX_WEEK")
+    ck("real 'MonthAgo' -> APPROX_MONTH (not COLD)",
+       tier.get("u_monthago") == "APPROX_MONTH")
+    ck("real 'LongAgo' -> COLD", tier.get("u_longago") == "COLD")
+    ck("WeekAgo ranks above MonthAgo",
+       g.index("u_weekago") < g.index("u_monthago"))
+    ck("MonthAgo ranks above LongAgo",
+       g.index("u_monthago") < g.index("u_longago"))
 
     gm = [r["guid"] for r in build_order(users, chats, "mutual")[0]]
     ck("mutual: two-way ahead of the online stranger",
@@ -793,17 +832,17 @@ def selftest() -> int:
        gp.index("u_exact") < gp.index("u_replied"))
 
     print_header("6. report counters")
-    ck("counts contacts", rep["contacts"] == 11)
-    ck("sendable = 8", rep["sendable"] == 8)
+    ck("counts contacts", rep["contacts"] == 14)
+    ck("sendable = 11", rep["sendable"] == 11)
     ck("mutual counted", rep["mutual"] == 2)
-    ck("one_way counted", rep["one_way"] == 6)
+    ck("one_way counted", rep["one_way"] == 9)
     # only the sendable online contact counts: the online-but-excluded ones
     # (spam-risk / deleted / blocked) must NOT inflate this number.
     ck("online_now counts sendable only", rep["online_now"] == 1)
     ck("exact presence counted", rep["exact_presence"] == 5)
-    ck("masked presence counted", rep["masked_presence"] == 3)
+    ck("masked presence counted", rep["masked_presence"] == 6)
     ck("include_excluded returns everyone",
-       len(build_order(users, chats, "hybrid", include_excluded=True)[0]) == 11)
+       len(build_order(users, chats, "hybrid", include_excluded=True)[0]) == 14)
 
     print_header("7. robustness")
     ck("empty input is safe", build_order([], [])[0] == [])
@@ -812,8 +851,8 @@ def selftest() -> int:
     ck("garbage online_time is safe",
        presence_of({"online_time": "nope", "last_online": "x"})["ts"] == 0)
     # with no chat data at all, only the deleted account is excluded (blocked /
-    # ask_spam are chat-derived and therefore unknown) -> 11 - 1 = 10
-    ck("None chat list is safe", len(build_order(users, None)[0]) == 10)
+    # ask_spam are chat-derived and therefore unknown) -> 14 - 1 = 13
+    ck("None chat list is safe", len(build_order(users, None)[0]) == 13)
     ck("unknown strategy falls back to hybrid",
        [r["guid"] for r in build_order(users, chats, "zzz")[0]] == g)
 
