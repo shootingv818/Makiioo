@@ -800,11 +800,49 @@ def print_diff(legacy, proposed, recs):
               f" -> proposed #1")
 
 
+def list_accounts() -> int:
+    """Print the panel's accounts so you can copy a real phone number.
+    READ-ONLY: a single SELECT, no connection to Rubika."""
+    try:
+        import db
+        import worker
+    except Exception as e:
+        print(f"  could not load the panel modules: {repr(e)[:160]}")
+        print("  run this from the repo root (e.g. cd /opt/rubika-panel)")
+        return 1
+    try:
+        rows = db.list_accounts()
+    except Exception as e:
+        print(f"  could not read the database: {repr(e)[:160]}")
+        return 1
+    if not rows:
+        print("\n  no accounts in this panel yet.\n")
+        return 0
+    print_header(f"ACCOUNTS ({len(rows)})")
+    print(f"  {'id':>4}  {'phone':<16} {'status':<12} worker")
+    for a in rows:
+        try:
+            w = worker.worker_for_account(a) or {}
+            wtag = w.get("tag") or "-"
+            if w and worker.is_local(w):
+                wtag += " (local)"
+        except Exception:
+            wtag = "?"
+        print(f"  {a['id']:>4}  {str(a.get('phone') or '-'):<16} "
+              f"{str(a.get('status') or '-'):<12} {wtag}")
+    first = str(rows[0].get("phone") or "")
+    print(f"\n  then run:   --probe {first}")
+    print(f"  with test:  --probe {first} --send-test 989370024307\n")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Research lab for Rubika recipient ordering (standalone).")
     ap.add_argument("--selftest", action="store_true",
                     help="run the offline logic tests (no network/login)")
+    ap.add_argument("--list", action="store_true", dest="do_list",
+                    help="list this panel's accounts (id / phone / status)")
     ap.add_argument("--probe", metavar="PHONE",
                     help="READ-ONLY probe of a real account")
     ap.add_argument("--strategy", default="hybrid", choices=sorted(STRATEGIES),
@@ -821,9 +859,12 @@ def main():
 
     if a.selftest:
         raise SystemExit(selftest())
+    if a.do_list:
+        raise SystemExit(list_accounts())
     if not a.probe:
         ap.print_help()
         print("\n  tip: start with   --selftest   (offline, proves the logic)")
+        print("       then           --list       (shows your account numbers)")
         raise SystemExit(0)
     if a.send_test:
         print("\n  ⚠️  --send-test will send ONE real message.")
