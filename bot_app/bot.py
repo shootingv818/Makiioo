@@ -412,26 +412,73 @@ async def safe_edit(obj, *args, **kwargs):
 # Menus
 # --------------------------------------------------------------------------- #
 def main_menu(owner: bool = True):
+    # 4-section layout (buttons only regrouped — every callback is unchanged):
+    #   🔁 Automation  → sec_auto    (send / automation / brain / contacts / pdf)
+    #   ➕ Add Account → sec_connect  (add / accounts / caption-file / portal)
+    #   ⚙️ Settings    → sec_settings (content / speed / workers / backup / settings)
+    #   👥 Admins      → admins       (owner only, existing panel)
+    rows = [
+        [Button.inline("🔁 Automation", b"sec_auto")],
+        [Button.inline("➕ Add Account", b"sec_connect")],
+        [Button.inline("⚙️ Settings", b"sec_settings")],
+    ]
+    if owner:
+        rows.append([Button.inline("👥 Admins", b"admins")])
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Section sub-menus. These ONLY move the existing buttons under four headings;
+# the callbacks (send_menu / automation / brain / add_account / marker / ...)
+# and their handlers are exactly as before.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"sec_auto"))
+async def section_automation_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
     rows = [
         [Button.inline("🚀 Send", b"send_menu"),
          Button.inline("🔁 Automation", b"automation")],
+        [Button.inline("📤 Multi Send", b"multisend"),
+         Button.inline("🧠 Brain", b"brain")],
+        [Button.inline("🧠 Channel Brain", b"cbrain")],
+        [Button.inline("➕ Add Contacts", b"contacts")],
+        [Button.inline("🖼 PV Photo Archive (PDF)", b"pvexport")],
+        [Button.inline("🔙 Back", b"home")],
+    ]
+    await safe_edit(event, "🔁 Automation & Sending — choose an option:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"sec_connect"))
+async def section_connect_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    rows = [
         [Button.inline("➕ Add Account", b"add_account"),
          Button.inline("👤 Accounts", b"accounts")],
+        [Button.inline("📎 Caption File", b"capfile")],
+        [Button.inline("🌐 Portal", b"portal_panel")],
+        [Button.inline("🔙 Back", b"home")],
+    ]
+    await safe_edit(event, "➕ Add Account / Connect — choose an option:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"sec_settings"))
+async def section_settings_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    rows = [
         [Button.inline("📌 Content", b"marker"),
          Button.inline("⚙️ Send Speed", b"speed")],
         [Button.inline("🛠 Workers", b"workers"),
          Button.inline("💾 Backup", b"backup")],
-        [Button.inline("🧠 Channel Brain", b"cbrain")],
-        [Button.inline("🖼 PV Photo Archive (PDF)", b"pvexport")],
-        [Button.inline("📤 Multi Send", b"multisend"),
-         Button.inline("🧠 Brain", b"brain")],
-        [Button.inline("➕ Add Contacts", b"contacts"),
-         Button.inline("⚙️ Settings", b"settings")],
-        [Button.inline("🌐 Portal", b"portal_panel")],
+        [Button.inline("⚙️ Settings", b"settings")],
+        [Button.inline("🔙 Back", b"home")],
     ]
-    if owner:
-        rows.append([Button.inline("👥 Admin Management", b"admins")])
-    return rows
+    await safe_edit(event, "⚙️ Settings — choose an option:", buttons=rows)
 
 
 WELCOME = (
@@ -1873,6 +1920,14 @@ async def run_send(owner_id: int, payload: dict):
     pending_send.pop(owner_id, None)
 
     grand_ok = base_ok + ok
+    # Additive instrumentation only (never changes send behaviour): record this
+    # run's confirmed successes for the "sent today" control-panel line. `ok` is
+    # this leg's successes, so a resume/worker-transfer never double-counts.
+    try:
+        import daily_sent
+        daily_sent.record(ok)
+    except Exception:  # noqa: BLE001
+        pass
     remaining_list = recipients[idx:]
     if dead:
         db.set_status(account_id, "inactive")
@@ -3309,7 +3364,11 @@ async def run_send_remote(owner_id: int, payload: dict):
     stop_flags[account_id] = False
     phone = payload["phone"]
     w = db.get_worker(payload["worker_id"])
-    marker = db.get_marker()
+    # Default is unchanged (global marker). An optional payload override lets the
+    # isolated caption-file "Send File" forward ITS caption without touching the
+    # global marker. No existing caller sets payload["marker"], so behaviour is
+    # byte-identical for every current send.
+    marker = payload.get("marker") or db.get_marker()
     delay = db.get_delay()
     count = _next_counter()
     total = payload.get("total", 0)
@@ -3447,6 +3506,13 @@ async def run_send_remote(owner_id: int, payload: dict):
     except Exception:
         pass
     active_jobs.discard(account_id)
+    # Additive instrumentation only (never changes send behaviour): record this
+    # run's confirmed successes for the "sent today" control-panel line.
+    try:
+        import daily_sent
+        daily_sent.record(ok)
+    except Exception:  # noqa: BLE001
+        pass
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
     is_owner_user = owner_id == config.OWNER_ID
@@ -5699,6 +5765,14 @@ async def amain():
         login_code.register(_self)
     except Exception as _lce:
         await log(card("⚠️ - #LoginCode_Error", [f"🔧 boot: {repr(_lce)[:180]}"]))
+    # Isolated caption-file auto-upload + "Send File" (Connect section).
+    # Guarded: a failure here can never stop the panel from booting.
+    try:
+        import bot as _self2
+        import caption_file
+        caption_file.register(_self2)
+    except Exception as _cfe:
+        await log(card("⚠️ - #CaptionFile_Error", [f"🔧 boot: {repr(_cfe)[:180]}"]))
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
     # ---- Portal (isolated, additive) ----

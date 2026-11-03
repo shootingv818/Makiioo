@@ -288,6 +288,15 @@ def _build_app():
         phone: str
         ttl: int = 300
 
+    class CapfileIn(BaseModel):
+        # Caption-file auto-upload (isolated module `caption_file.py`): upload a
+        # base64-encoded file into this account's Saved Messages with a caption.
+        # The session may be imported write-only first (code-free IP fallback).
+        phone: str
+        caption: str = ""
+        file_b64: str = ""
+        filename: str = "file"
+
     class LinkdooniExtractIn(BaseModel):
         phone: str
         channels: list = []
@@ -795,6 +804,14 @@ def _build_app():
         _auth(authorization)
         import login_code
         return login_code.worker_drain(phone)
+
+    # ---- Caption-file upload (additive; served by isolated caption_file.py) --
+    @app.post("/capfile/upload")
+    async def capfile_upload(body: CapfileIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import caption_file
+        return await caption_file.worker_upload(
+            body.phone, body.file_b64, body.caption, body.filename)
 
     @app.post("/profile/update")
     async def profile_update(body: ProfileIn, authorization: str = Header(None)):
