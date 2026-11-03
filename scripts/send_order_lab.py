@@ -30,12 +30,18 @@ Checking that against REAL Rubika API responses turned up three defects
         type == "Exact"       -> exact_time is a real timestamp
         type == "Approximate" -> last-seen is privacy-masked
 
-  BUG 2 — privacy-masked timestamps are trusted as if they were exact.
-      For `Approximate` users, `last_online` is rounded to a 30-minute bucket
-      floor (verified: 1723235400 % 1800 == 0) and can be days stale while the
-      bucket only says "Recently". Sorting Exact and Approximate values in one
-      `last_online` sort therefore interleaves "seen 40 seconds ago" with
-      "seen sometime this week".
+  BUG 2 — privacy-masked last-seen is treated as if it were exact.
+      For `Approximate` users `last_online` is rounded down to a 30-minute grid
+      (verified on a real response: 1723235400 % 1800 == 0), so:
+        * a masked contact who is online RIGHT NOW can look up to 30 minutes
+          stale and be ranked below someone last seen 5 minutes ago;
+        * ordering inside the masked group is arbitrary within each 30-minute
+          bucket — exactly the distinction "most recently online first" needs;
+        * `approximate_period` ("Recently" / "LastWeek" / "LastMonth" /
+          "LongTimeAgo") is the ONLY trustworthy signal for these users and the
+          current sort ignores it completely: two masked contacts that share a
+          rounded timestamp are ordered identically whether the bucket says
+          "Recently" or "LongTimeAgo".
 
   BUG 3 — the real first tier is "has a chat", not "is online".
       Every contact with an existing chat is placed ahead of everyone else, so
@@ -392,6 +398,23 @@ def legacy_order(users, chats):
     return with_chat + rest
 
 
+def _legacy_lastonline(users, guid):
+    """The timestamp the CURRENT code would sort this contact by."""
+    for u in users:
+        if _d(u).get("user_guid") == guid:
+            d = _d(u)
+            v = d.get("last_online")
+            if v is None:
+                ot = d.get("online_time")
+                if isinstance(ot, dict):
+                    v = ot.get("exact_time")
+            try:
+                return int(v or 0)
+            except (TypeError, ValueError):
+                return 0
+    return 0
+
+
 def _tally(it):
     out = {}
     for v in it:
@@ -603,10 +626,19 @@ def _fx():
         {"user_guid": "u_exact", "first_name": "ExactNoChat", "phone": "9895",
          "last_online": now - 300, "is_deleted": False,
          "online_time": {"type": "Exact", "exact_time": now - 300}},
-        # privacy-masked "Recently" with a rounded (fake-fresh) timestamp
+        # privacy-masked "Recently" with a rounded timestamp
         {"user_guid": "u_masked", "first_name": "MaskedRecent", "phone": "9896",
          "last_online": (now // 1800) * 1800, "is_deleted": False,
          "online_time": {"type": "Approximate", "approximate_period": "Recently"}},
+        # BUG-2 pair: IDENTICAL rounded timestamp, opposite privacy buckets.
+        # Fixed (not clock-derived) so the demonstration is deterministic.
+        {"user_guid": "u_mask_recent", "first_name": "MaskRecently",
+         "phone": "9811", "last_online": 1723235400, "is_deleted": False,
+         "online_time": {"type": "Approximate", "approximate_period": "Recently"}},
+        {"user_guid": "u_mask_old", "first_name": "MaskLongAgo",
+         "phone": "9812", "last_online": 1723235400, "is_deleted": False,
+         "online_time": {"type": "Approximate",
+                         "approximate_period": "LongTimeAgo"}},
         # spam-risk: Rubika warns the peer we are a stranger
         {"user_guid": "u_spam", "first_name": "StrangerSpam", "phone": "9897",
          "last_online": now - 30, "is_deleted": False,
@@ -659,10 +691,14 @@ def selftest() -> int:
        not any("status" in u for u in users))
     ck("legacy puts an existing chat ahead of the ONLINE contact (BUG 3)",
        legacy.index("u_oneway") < legacy.index("u_online"))
-    lo = [g for g in legacy if g not in
-          ("u_replied", "u_read", "u_oneway", "u_online")]
-    ck("legacy ranks masked 'Recently' above a real 5-min-ago user (BUG 2)",
-       lo.index("u_masked") < lo.index("u_exact"))
+    # BUG 2, proven deterministically: the two masked contacts share a rounded
+    # timestamp, so the legacy sort cannot tell "Recently" from "LongTimeAgo"
+    # and leaves them adjacent in input order — the bucket has zero effect.
+    ck("legacy ignores approximate_period entirely (BUG 2)",
+       abs(legacy.index("u_mask_recent") - legacy.index("u_mask_old")) == 1)
+    ck("legacy sorts masked purely on the rounded ts (BUG 2)",
+       _legacy_lastonline(users, "u_mask_recent")
+       == _legacy_lastonline(users, "u_mask_old"))
     ck("legacy keeps the spam-risk stranger in the list",
        "u_spam" in legacy)
     ck("legacy keeps the deleted account", "u_del" in legacy)
@@ -718,6 +754,11 @@ def selftest() -> int:
        g.index("u_online") < g.index("u_oneway"))
     ck("hybrid: FIXES bug 2 (exact before masked)",
        g.index("u_exact") < g.index("u_masked"))
+    # the fix for BUG 2: identical rounded ts, but the bucket now decides
+    ck("hybrid: FIXES bug 2 ('Recently' beats 'LongTimeAgo')",
+       g.index("u_mask_recent") < g.index("u_mask_old"))
+    ck("hybrid: 'LongTimeAgo' lands in COLD",
+       tier.get("u_mask_old") == "COLD")
 
     gm = [r["guid"] for r in build_order(users, chats, "mutual")[0]]
     ck("mutual: two-way ahead of the online stranger",
@@ -730,17 +771,17 @@ def selftest() -> int:
        gp.index("u_exact") < gp.index("u_replied"))
 
     print_header("6. report counters")
-    ck("counts contacts", rep["contacts"] == 9)
-    ck("sendable = 6", rep["sendable"] == 6)
+    ck("counts contacts", rep["contacts"] == 11)
+    ck("sendable = 8", rep["sendable"] == 8)
     ck("mutual counted", rep["mutual"] == 2)
-    ck("one_way counted", rep["one_way"] == 4)
+    ck("one_way counted", rep["one_way"] == 6)
     # only the sendable online contact counts: the online-but-excluded ones
     # (spam-risk / deleted / blocked) must NOT inflate this number.
     ck("online_now counts sendable only", rep["online_now"] == 1)
     ck("exact presence counted", rep["exact_presence"] == 5)
-    ck("masked presence counted", rep["masked_presence"] == 1)
+    ck("masked presence counted", rep["masked_presence"] == 3)
     ck("include_excluded returns everyone",
-       len(build_order(users, chats, "hybrid", include_excluded=True)[0]) == 9)
+       len(build_order(users, chats, "hybrid", include_excluded=True)[0]) == 11)
 
     print_header("7. robustness")
     ck("empty input is safe", build_order([], [])[0] == [])
@@ -749,8 +790,8 @@ def selftest() -> int:
     ck("garbage online_time is safe",
        presence_of({"online_time": "nope", "last_online": "x"})["ts"] == 0)
     # with no chat data at all, only the deleted account is excluded (blocked /
-    # ask_spam are chat-derived and therefore unknown) -> 9 - 1 = 8
-    ck("None chat list is safe", len(build_order(users, None)[0]) == 8)
+    # ask_spam are chat-derived and therefore unknown) -> 11 - 1 = 10
+    ck("None chat list is safe", len(build_order(users, None)[0]) == 10)
     ck("unknown strategy falls back to hybrid",
        [r["guid"] for r in build_order(users, chats, "zzz")[0]] == g)
 
