@@ -1,60 +1,46 @@
 """
-📎 Caption-file auto-upload + file send — ISOLATED, ADDITIVE module.
-====================================================================
+📎 Caption-file send method — ISOLATED, ADDITIVE module.
+========================================================
 
 What the owner asked for (nothing more):
-  * In the Connect section, set ONE file together with its caption (sent in a
-    single Telegram message to the bot).
-  * Every account that logs in gets that file uploaded into its own Rubika
-    "Saved Messages" automatically, so it is READY to be forwarded. The caption
-    is stored on the uploaded message and doubles as the forward marker.
-  * Sometimes Rubika blocks an upload from a given IP. Exactly like the existing
-    "move the send to another worker" flow, the upload is retried on another
-    worker (its session is pushed write-only first) until one IP succeeds.
-  * Success / failure is reported to the log group. If every worker fails, the
-    final card shows the concrete error.
-  * A "Send File" button forwards the pre-uploaded file from every ready account
-    to its contacts by REUSING the existing send engine (bot.run_send /
-    bot.run_send_remote) — no new send logic.
+  * In 📌 Content, set ONE file together with its caption (sent in a single
+    Telegram message). The bot only STORES it — no upload happens here.
+  * "File + Caption" is a SEND METHOD (next to Forward-marker / Plain-text /
+    Channel). It is used ONLY when the owner chooses it on an account or when
+    creating a channel.
+  * When chosen, the file is uploaded into THAT account's Rubika "Saved
+    Messages" with the caption (the caption doubles as the forward marker), then
+    the EXISTING send engine (run_send / run_send_remote) forwards it to the
+    contacts — or, for a channel, it is forwarded into the new channel.
+  * If an IP is blocked, the upload is retried on another worker — exactly the
+    existing "move to another worker" pattern (pick_worker_for_transfer +
+    write-only /session/import). That transfer logic itself is NOT modified.
+  * Every attempt is logged to the log group; a total failure reports the
+    concrete error and nothing is sent.
 
 Design constraints honoured (project_notes/CORE_RULES.md):
-  * `account_conn.py`, `rubika_client.py`, `worker.py`, `db.py`, `main.py` are
-    NOT rewritten — this module only CALLS them.
-  * No new DB table / schema change: config + per-account upload state live in
-    the existing generic `app_settings` key/value store; the file bytes live on
-    disk next to the SQLite database.
-  * `bot.py` gets only small hooks: the 4-section menu already routes a
-    "📎 Caption File" button here, plus one guarded `register(...)` in `amain`.
-  * `worker_api.py` gets ONE additive endpoint `/capfile/upload` (Bearer), so an
-    old worker simply 404s and the master reports it on the fail card.
+  * core/ (account_conn, db, crypto_util), rubika_client, worker, main, config,
+    portal, features, login_code are NOT modified — this module only CALLS them.
+  * No new DB table / schema change: the file+caption live in the generic
+    app_settings key/value store + one on-disk file next to the database.
+  * bot.py gets only thin hooks (a Content button, a send-method option, a
+    channel-method option, and one guarded register(...) in amain).
+  * worker_api.py gets ONE additive endpoint /capfile/upload.
 
 Session-safety (project_notes/SESSION_AND_CONFLICTS.md):
-  * Every upload opens exactly ONE connection, through `account_conn` (close ->
-    call), never two at once on a session.
-  * An account that is BUSY (active send/channel job, or an always-on
-    automation that owns the warm connection) is SKIPPED and retried later.
-  * Pushing a session to another worker uses the write-only `/session/import`
-    (no connect -> can't trigger AUTH_FROM_ANOTHER); the real connection happens
-    on that worker when it runs the upload.
-  * Read/connect only: a dead session is reported, never auto-deleted or
-    quarantined here.
-
-Isolation / fault tolerance:
-  * The background watcher loop can only end by cancellation; every iteration is
-    wrapped so one bad account never stops the loop.
-  * Every upload attempt is contained; the per-account state records
-    uploaded/error with the signature of the current file so changing the file
-    re-queues everyone and a transient error is retried after a cooldown.
+  * The upload opens exactly ONE connection through account_conn (close->call).
+  * It refuses while the account is busy (active send/channel job, or an
+    always-on automation that owns the warm connection).
+  * A non-home worker gets the session via write-only /session/import (no
+    connect -> no AUTH_FROM_ANOTHER); it connects only to run the upload.
+  * Read/connect only: a dead session is reported, never auto-deleted.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import json
 import os
 import tempfile
-import time
 
 import account_conn
 import db
@@ -65,50 +51,33 @@ import rubika_client as rb
 # but `account_conn` + `db` + `rubika_client`.
 
 # --------------------------------------------------------------------------- #
-# Tunables (kept local on purpose: no new .env keys, no config.py change).
+# Tunables (local on purpose: no new .env keys, no config.py change).
 # --------------------------------------------------------------------------- #
-WATCH_INTERVAL = 20.0            # seconds between account scans
 UPLOAD_TIMEOUT = 600             # per-attempt upload deadline (seconds)
-RETRY_COOLDOWN = 300             # re-try an errored account after this long
 MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 MAX_WORKER_TRIES = 6             # IP-fallback: how many workers to try per upload
 
 # app_settings keys (generic key/value store — no schema change)
-K_ENABLED = "capfile_enabled"
 K_CAPTION = "capfile_caption"
 K_NAME = "capfile_name"
-K_SIG = "capfile_sig"
-K_STATE = "capfile_state"        # JSON: {account_id: {sig,status,at,ts,error}}
+K_HAS = "capfile_has"            # "1" once a file is stored
 
 _DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(db.__file__)),
                          "data", "caption_file")
 
 _registered = False
-_watch_task = None
 _await_set: set = set()          # owner ids currently setting a new file
 
 
 # --------------------------------------------------------------------------- #
-# Config (master-side; backed by app_settings + one on-disk file)
+# Config (file + caption, stored once; no upload here)
 # --------------------------------------------------------------------------- #
-def is_enabled() -> bool:
-    return str(db.get_setting(K_ENABLED, "0")) == "1"
-
-
-def set_enabled(value: bool) -> None:
-    db.set_setting(K_ENABLED, "1" if value else "0")
-
-
 def get_caption() -> str:
     return db.get_setting(K_CAPTION, "") or ""
 
 
 def get_name() -> str:
     return db.get_setting(K_NAME, "") or ""
-
-
-def get_sig() -> str:
-    return db.get_setting(K_SIG, "") or ""
 
 
 def _stored_path(name: str | None = None) -> str:
@@ -133,16 +102,11 @@ def read_file_bytes():
 
 
 def has_file() -> bool:
-    return bool(get_sig()) and read_file_bytes() is not None
+    return str(db.get_setting(K_HAS, "0")) == "1" and read_file_bytes() is not None
 
 
-def _make_sig(data: bytes, caption: str) -> str:
-    return (hashlib.sha256(data).hexdigest()[:16] + ":"
-            + hashlib.sha256((caption or "").encode()).hexdigest()[:8])
-
-
-def set_file(data: bytes, caption: str = "", name: str = "file") -> str:
-    """Persist a new file + caption and RE-QUEUE every account for upload."""
+def set_file(data: bytes, caption: str = "", name: str = "file") -> None:
+    """Persist a new file + caption. Nothing is uploaded here."""
     os.makedirs(_DATA_DIR, exist_ok=True)
     try:
         for f in os.listdir(_DATA_DIR):               # drop old current.*
@@ -156,71 +120,19 @@ def set_file(data: bytes, caption: str = "", name: str = "file") -> str:
     name = name or "file"
     with open(_stored_path(name), "wb") as fh:
         fh.write(data)
-    sig = _make_sig(data, caption)
     db.set_setting(K_NAME, name)
     db.set_setting(K_CAPTION, caption or "")
-    db.set_setting(K_SIG, sig)
-    db.set_setting(K_ENABLED, "1")
-    reset_all_state()                                 # re-upload to everyone
-    return sig
+    db.set_setting(K_HAS, "1")
 
 
 def clear_file() -> None:
-    set_enabled(False)
     try:
         for f in os.listdir(_DATA_DIR):
             if f.startswith("current"):
                 os.unlink(os.path.join(_DATA_DIR, f))
     except Exception:  # noqa: BLE001
         pass
-    db.set_setting(K_SIG, "")
-    reset_all_state()
-
-
-# --------------------------------------------------------------------------- #
-# Per-account upload state (JSON in app_settings; watcher is the only writer)
-# --------------------------------------------------------------------------- #
-def _load_state() -> dict:
-    try:
-        raw = db.get_setting(K_STATE, "") or ""
-        return json.loads(raw) if raw else {}
-    except Exception:  # noqa: BLE001
-        return {}
-
-
-def _save_state(d: dict) -> None:
-    try:
-        db.set_setting(K_STATE, json.dumps(d))
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def acc_state(account_id) -> dict:
-    return _load_state().get(str(int(account_id)), {})
-
-
-def set_acc(account_id, **fields) -> None:
-    d = _load_state()
-    key = str(int(account_id))
-    cur = d.get(key, {})
-    cur.update(fields)
-    d[key] = cur
-    _save_state(d)
-
-
-def reset_all_state() -> None:
-    _save_state({})
-
-
-def counts() -> tuple:
-    """(uploaded, errors) for the CURRENT file signature."""
-    d = _load_state()
-    sig = get_sig()
-    up = sum(1 for v in d.values()
-             if v.get("status") == "uploaded" and v.get("sig") == sig)
-    err = sum(1 for v in d.values()
-              if v.get("status") == "error" and v.get("sig") == sig)
-    return up, err
+    db.set_setting(K_HAS, "0")
 
 
 # --------------------------------------------------------------------------- #
@@ -346,7 +258,7 @@ def _ok_card(bot, acc, w, nbytes):
         f"📱 Account : {acc.get('phone')}",
         f"🖥 Worker  : {(w.get('tag') or 'local') if w else 'local'}",
         f"📦 Size    : {nbytes} bytes",
-        "📥 Stored in the account's Saved Messages (ready to send).",
+        "📥 Stored in the account's Saved Messages (ready to forward).",
         f"🕒 {bot.now()}",
     ])
 
@@ -356,7 +268,7 @@ def _fail_card(bot, acc, tried, err):
         f"📱 Account : {acc.get('phone')}",
         f"🖥 Workers tried : {len(tried)}",
         f"💥 Last error : {str(err)[:160]}",
-        "➡️ Will retry automatically after a cooldown.",
+        "Nothing was sent.",
         f"🕒 {bot.now()}",
     ])
 
@@ -365,17 +277,19 @@ def _dead_card(bot, acc):
     return bot.card("📎 CAPTION FILE — Session Invalid 🔴", [
         f"📱 Account : {acc.get('phone')}",
         "This account's session is not usable; another IP won't help.",
-        "Re-login the account, then press “Re-upload All”.",
+        "Re-login the account, then try again.",
         f"🕒 {bot.now()}",
     ])
 
 
 async def upload_for_account(bot, account: dict) -> tuple:
-    """Pre-upload the caption-file into one account's Saved Messages, moving to
+    """Upload the caption-file into one account's Saved Messages, moving to
     another worker on failure (reuses pick_worker_for_transfer). Logs the
     outcome. Returns (ok: bool, detail: str)."""
     aid = int(account["id"])
     phone = account["phone"]
+    if _is_busy(bot, aid):
+        return False, "account is busy (a send/automation is running)"
     data = read_file_bytes()
     if not data:
         return False, "no file set"
@@ -445,42 +359,6 @@ async def upload_for_account(bot, account: dict) -> tuple:
     return False, last_err
 
 
-async def _watch_loop(bot) -> None:
-    """Background scanner: upload the current file to any active account that
-    doesn't have it yet. Never dies on a single bad account."""
-    while True:
-        try:
-            await asyncio.sleep(WATCH_INTERVAL)
-            if not is_enabled():
-                continue
-            sig = get_sig()
-            if not sig or read_file_bytes() is None:
-                continue
-            for acc in db.list_accounts():
-                if (acc.get("status") or "") != "active":
-                    continue
-                aid = int(acc["id"])
-                st = acc_state(aid)
-                if st.get("sig") == sig and st.get("status") == "uploaded":
-                    continue
-                if (st.get("sig") == sig and st.get("status") == "error"
-                        and (time.time() - float(st.get("ts") or 0)) < RETRY_COOLDOWN):
-                    continue
-                if _is_busy(bot, aid):
-                    continue
-                ok, detail = await upload_for_account(bot, acc)
-                set_acc(aid, sig=sig,
-                        status="uploaded" if ok else "error",
-                        at=bot.now(), ts=time.time(),
-                        error="" if ok else str(detail)[:200])
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            await _safe_log(bot, bot.card("⚠️ CAPTION FILE — Watcher Error",
-                                          [repr(e)[:160], f"🕒 {bot.now()}"]))
-            await asyncio.sleep(WATCH_INTERVAL)
-
-
 async def _launch_local_send(bot, acc: dict, caption: str) -> bool:
     """Prepare + launch a LOCAL send that forwards the pre-uploaded file, by
     reusing bot.run_send unchanged (the caption is the Saved-Messages marker)."""
@@ -490,21 +368,21 @@ async def _launch_local_send(bot, acc: dict, caption: str) -> bool:
         await account_conn.close(rb.normalize_phone(phone))
         client = rb.open_client(phone)
     except Exception as e:  # noqa: BLE001
-        await _safe_log(bot, bot.card("⚠️ SEND FILE — Prepare Error",
+        await _safe_log(bot, bot.card("⚠️ FILE SEND — Prepare Error",
                         [f"📱 {phone}", repr(e)[:150], f"🕒 {bot.now()}"]))
         return False
     try:
         await rb.connect_ready(client)
         saved_guid, mid = await rb.find_marked_message(client, caption)
         if not mid:
-            await _safe_log(bot, bot.card("⚠️ SEND FILE — Not Ready", [
+            await _safe_log(bot, bot.card("⚠️ FILE SEND — Not Found", [
                 f"📱 {phone}",
-                "The caption-file is not in this account's Saved Messages yet.",
+                "The uploaded file was not found in Saved Messages.",
                 f"🕒 {bot.now()}"]))
             return False
         ordered, _stats = await rb.get_ordered_recipients(client)
     except Exception as e:  # noqa: BLE001
-        await _safe_log(bot, bot.card("⚠️ SEND FILE — Prepare Error",
+        await _safe_log(bot, bot.card("⚠️ FILE SEND — Prepare Error",
                         [f"📱 {phone}", repr(e)[:150], f"🕒 {bot.now()}"]))
         return False
     finally:
@@ -523,165 +401,67 @@ async def _launch_local_send(bot, acc: dict, caption: str) -> bool:
     return True
 
 
-async def send_file_all(bot) -> tuple:
-    """Forward the pre-uploaded file from EVERY ready account to its contacts,
-    reusing the existing send engine. Returns (launched_count, detail)."""
+async def send_for_account(bot, acc: dict) -> tuple:
+    """The 'File + Caption' send method for ONE account: upload the file to its
+    Saved Messages (worker/IP fallback) then forward it to the contacts using
+    the EXISTING send engine. Returns (ok, detail)."""
     if not has_file():
-        return 0, "no file set"
+        return False, "no file set"
+    aid = int(acc["id"])
+    ok, detail = await upload_for_account(bot, acc)
+    if not ok:
+        return False, detail                           # fail card already logged
     caption = get_caption()
-    sig = get_sig()
     wk = _worker_mod()
-    launched = 0
-    for acc in db.list_accounts():
-        if (acc.get("status") or "") != "active":
-            continue
-        aid = int(acc["id"])
-        st = acc_state(aid)
-        if not (st.get("status") == "uploaded" and st.get("sig") == sig):
-            continue
-        if _is_busy(bot, aid):
-            continue
-        try:
-            w = wk.worker_for_account(acc)
-        except Exception:  # noqa: BLE001
-            w = None
-        try:
-            if w and not wk.is_local(w):
-                # remote: reuse run_send_remote; the (additive) payload["marker"]
-                # makes the worker forward THIS file's caption, not the global one.
-                payload = {"account_id": aid, "phone": acc["phone"],
-                           "worker_id": w["id"], "total": 0,
-                           "marker": caption, "mode": "marker"}
-                asyncio.create_task(bot.run_send_remote(bot.config.OWNER_ID, payload))
-                launched += 1
-            else:
-                if await _launch_local_send(bot, acc, caption):
-                    launched += 1
-        except Exception as e:  # noqa: BLE001
-            await _safe_log(bot, bot.card("⚠️ SEND FILE — Launch Error",
-                            [f"📱 {acc.get('phone')}", repr(e)[:150],
-                             f"🕒 {bot.now()}"]))
-    return launched, ""
-
-
-# --------------------------------------------------------------------------- #
-# Panel rendering
-# --------------------------------------------------------------------------- #
-def _panel_text(bot) -> str:
-    cap = get_caption()
-    cap_show = (cap[:70] + "…") if len(cap) > 70 else (cap or "(none)")
-    up, err = counts()
-    total_active = 0
     try:
-        total_active = sum(1 for a in db.list_accounts()
-                           if (a.get("status") or "") == "active")
+        w = wk.worker_for_account(acc)
     except Exception:  # noqa: BLE001
-        pass
-    pending = max(0, total_active - up - err)
-    return bot.card("📎 CAPTION FILE", [
-        f"• State     : {'ON 🟢' if is_enabled() else 'OFF ⚪️'}",
-        f"• File      : {get_name() or '(not set)'}",
-        f"• Caption   : {cap_show}",
-        bot.LINE,
-        f"• Uploaded  : {up}    Pending : {pending}    Errors : {err}",
-        "Any logged-in account gets the file in its Saved Messages",
-        "automatically (auto-fallback to another worker if an IP is blocked).",
-    ])
-
-
-def _panel_buttons(bot):
-    B = bot.Button
-    toggle = "Turn OFF" if is_enabled() else "Turn ON"
-    return [
-        [B.inline("📁 Set File + Caption", b"capfile_set")],
-        [B.inline(f"🔁 {toggle}", b"capfile_toggle"),
-         B.inline("♻️ Re-upload All", b"capfile_reupload")],
-        [B.inline("📎 Send File Now", b"capfile_send")],
-        [B.inline("🔙 Back", b"sec_connect")],
-    ]
+        w = None
+    if w and not wk.is_local(w):
+        # remote: reuse run_send_remote; the additive payload["marker"] makes the
+        # worker forward THIS file's caption, not the global marker.
+        payload = {"account_id": aid, "phone": acc["phone"],
+                   "worker_id": w["id"], "total": 0,
+                   "marker": caption, "mode": "marker"}
+        asyncio.create_task(bot.run_send_remote(bot.config.OWNER_ID, payload))
+        return True, (w.get("tag") or "")
+    launched = await _launch_local_send(bot, acc, caption)
+    if not launched:
+        return False, "uploaded, but could not start the local send"
+    return True, "local"
 
 
 # --------------------------------------------------------------------------- #
-# Registration (called once from bot.amain, guarded there).
+# Registration (called once from bot.amain, guarded there). Only the SET flow:
+# a Content button opens it, and a file message is captured + stored.
 # --------------------------------------------------------------------------- #
 def register(bot) -> None:
-    """Attach the panel callbacks + the file-capture handler and start the
-    background upload watcher. Idempotent."""
-    global _registered, _watch_task
+    """Attach the 'set file+caption' callback + the file-capture handler.
+    Idempotent. No background work, no auto-upload."""
+    global _registered
     if _registered:
         return
     _registered = True
     events, client = bot.events, bot.bot
-
-    try:
-        _watch_task = asyncio.create_task(_watch_loop(bot), name="capfile:watch")
-    except Exception:  # noqa: BLE001
-        _watch_task = None
-
-    @client.on(events.CallbackQuery(data=b"capfile"))
-    async def open_panel(event):
-        if not bot.is_owner(event):
-            return
-        _await_set.discard(event.sender_id)
-        await bot.safe_edit(event, _panel_text(bot), buttons=_panel_buttons(bot))
 
     @client.on(events.CallbackQuery(data=b"capfile_set"))
     async def set_file_cb(event):
         if not bot.is_owner(event):
             return
         _await_set.add(event.sender_id)
-        await bot.safe_edit(event, bot.card("📎 CAPTION FILE — Set", [
-            "Send the FILE together with its caption in ONE message.",
-            "The caption becomes the forward marker; the file is uploaded to",
-            "every logged-in account's Saved Messages automatically.",
+        cur = get_caption()
+        await bot.safe_edit(event, bot.card("📎 FILE + CAPTION", [
+            f"• Current : {get_name() or '(not set)'}",
+            f"• Caption : {(cur[:70] + '…') if len(cur) > 70 else (cur or '(none)')}",
             bot.LINE,
-            "Waiting for your file …",
-        ]), buttons=[[bot.Button.inline("🔙 Cancel", b"capfile")]])
-
-    @client.on(events.CallbackQuery(data=b"capfile_toggle"))
-    async def toggle_cb(event):
-        if not bot.is_owner(event):
-            return
-        set_enabled(not is_enabled())
-        await bot.safe_edit(event, _panel_text(bot), buttons=_panel_buttons(bot))
-
-    @client.on(events.CallbackQuery(data=b"capfile_reupload"))
-    async def reupload_cb(event):
-        if not bot.is_owner(event):
-            return
-        if not has_file():
-            await event.answer("No file is set yet.", alert=True)
-            return
-        reset_all_state()
-        await event.answer("Queued re-upload to all accounts.")
-        await bot.safe_edit(event, _panel_text(bot), buttons=_panel_buttons(bot))
-
-    @client.on(events.CallbackQuery(data=b"capfile_send"))
-    async def send_cb(event):
-        if not bot.is_owner(event):
-            return
-        if not has_file():
-            await event.answer("No file is set yet.", alert=True)
-            return
-        up, _err = counts()
-        if up <= 0:
-            await event.answer("No account has the file ready yet — wait for auto-upload.",
-                               alert=True)
-            return
-        await bot.safe_edit(event, bot.card("📎 SEND FILE", [
-            f"Launching send from {up} ready account(s) …",
-            f"🕒 {bot.now()}"]),
-            buttons=[[bot.Button.inline("🔙 Back", b"capfile")]])
-        launched, _d = await send_file_all(bot)
-        await bot.safe_edit(event, bot.card("📎 SEND FILE — Launched", [
-            f"• Sends started : {launched}",
-            "Each account posts its own progress cards in the log group.",
-            f"🕒 {bot.now()}"]),
-            buttons=[[bot.Button.inline("🔙 Back", b"capfile")]])
+            "Send the FILE together with its caption in ONE message.",
+            "It is only stored now; it uploads when you pick",
+            "“File + Caption” on an account's Send, or when creating a channel.",
+        ]), buttons=[[bot.Button.inline("🔙 Back", b"marker")]])
 
     @client.on(events.NewMessage())
     async def capture_file(event):
-        # Only acts for an owner who just pressed "Set File"; otherwise it is a
+        # Only acts for an owner who just pressed "File + Caption"; otherwise a
         # no-op so it coexists with the panel's message_router.
         if event.sender_id not in _await_set:
             return
@@ -700,15 +480,16 @@ def register(bot) -> None:
             name = os.path.basename(path) or "file"
             caption = (getattr(event.message, "text", "") or "").strip()
             set_file(data, caption, name)
-            await event.respond(bot.card("📎 CAPTION FILE — Saved ✅", [
-                f"• File     : {name} ({len(data)} bytes)",
-                f"• Caption  : {caption[:80] or '(none)'}",
-                "• Auto-upload to all logged-in accounts : queued",
-                f"🕒 {bot.now()}"]), buttons=_panel_buttons(bot))
+            await event.respond(bot.card("📎 FILE + CAPTION — Saved ✅", [
+                f"• File    : {name} ({len(data)} bytes)",
+                f"• Caption : {caption[:80] or '(none)'}",
+                "Pick it from an account's 🚀 Send → “File + Caption”.",
+                f"🕒 {bot.now()}"]),
+                buttons=[[bot.Button.inline("📌 Back to Content", b"marker")]])
         except Exception as e:  # noqa: BLE001
-            await event.respond(bot.card("⚠️ CAPTION FILE — Save Error",
+            await event.respond(bot.card("⚠️ FILE + CAPTION — Save Error",
                                 [repr(e)[:160], f"🕒 {bot.now()}"]),
-                                buttons=[[bot.Button.inline("🔙 Back", b"capfile")]])
+                                buttons=[[bot.Button.inline("🔙 Back", b"marker")]])
         finally:
             if tmpdir:
                 try:

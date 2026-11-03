@@ -97,6 +97,8 @@ pending: dict = {}
 pending_send: dict = {}
 # prepared channels waiting for the "add members" step: owner_id -> payload
 pending_channel: dict = {}
+# channel name entered, waiting for the send-method choice: owner_id -> {account_id,name}
+pending_channel_name: dict = {}
 # stop flags per account id
 stop_flags: dict = {}
 # accounts currently running a send/channel job (in-memory busy lock)
@@ -412,25 +414,22 @@ async def safe_edit(obj, *args, **kwargs):
 # Menus
 # --------------------------------------------------------------------------- #
 def main_menu(owner: bool = True):
-    # 4-section layout (buttons only regrouped — every callback is unchanged):
-    #   🔁 Automation  → sec_auto    (send / automation / brain / contacts / pdf)
-    #   ➕ Add Account → sec_connect  (add / accounts / caption-file / portal)
-    #   ⚙️ Settings    → sec_settings (content / speed / workers / backup / settings)
-    #   👥 Admins      → admins       (owner only, existing panel)
+    # Main panel: 2 buttons on top + 1 wide button below (owner or not).
+    #   🔁 Automation | 👤 Accounts     (top row)
+    #   ⚙️ Settings                      (wide, bottom — holds Portal + Admins)
+    # Buttons are only regrouped by function; every callback/handler is as before.
     rows = [
-        [Button.inline("🔁 Automation", b"sec_auto")],
-        [Button.inline("➕ Add Account", b"sec_connect")],
+        [Button.inline("🔁 Automation", b"sec_auto"),
+         Button.inline("👤 Accounts", b"sec_accounts")],
         [Button.inline("⚙️ Settings", b"sec_settings")],
     ]
-    if owner:
-        rows.append([Button.inline("👥 Admins", b"admins")])
     return rows
 
 
 # --------------------------------------------------------------------------- #
-# Section sub-menus. These ONLY move the existing buttons under four headings;
-# the callbacks (send_menu / automation / brain / add_account / marker / ...)
-# and their handlers are exactly as before.
+# Section sub-menus. These ONLY move the existing buttons under three headings
+# (paired two-per-row); the callbacks (send_menu / automation / add_account /
+# marker / portal_panel / admins / ...) and their handlers are exactly as before.
 # --------------------------------------------------------------------------- #
 @bot.on(events.CallbackQuery(data=b"sec_auto"))
 async def section_automation_cb(event):
@@ -439,30 +438,29 @@ async def section_automation_cb(event):
     state.pop(event.sender_id, None)
     rows = [
         [Button.inline("🚀 Send", b"send_menu"),
-         Button.inline("🔁 Automation", b"automation")],
-        [Button.inline("📤 Multi Send", b"multisend"),
+         Button.inline("📤 Multi Send", b"multisend")],
+        [Button.inline("🔁 Automation", b"automation"),
          Button.inline("🧠 Brain", b"brain")],
-        [Button.inline("🧠 Channel Brain", b"cbrain")],
-        [Button.inline("➕ Add Contacts", b"contacts")],
-        [Button.inline("🖼 PV Photo Archive (PDF)", b"pvexport")],
+        [Button.inline("🧠 Channel Brain", b"cbrain"),
+         Button.inline("🖼 PV Photo (PDF)", b"pvexport")],
         [Button.inline("🔙 Back", b"home")],
     ]
     await safe_edit(event, "🔁 Automation & Sending — choose an option:", buttons=rows)
 
 
-@bot.on(events.CallbackQuery(data=b"sec_connect"))
-async def section_connect_cb(event):
+@bot.on(events.CallbackQuery(data=b"sec_accounts"))
+async def section_accounts_cb(event):
     if not is_owner(event):
         return
     state.pop(event.sender_id, None)
     rows = [
         [Button.inline("➕ Add Account", b"add_account"),
          Button.inline("👤 Accounts", b"accounts")],
-        [Button.inline("📎 Caption File", b"capfile")],
-        [Button.inline("🌐 Portal", b"portal_panel")],
+        [Button.inline("📌 Content", b"marker"),
+         Button.inline("➕ Add Contacts", b"contacts")],
         [Button.inline("🔙 Back", b"home")],
     ]
-    await safe_edit(event, "➕ Add Account / Connect — choose an option:", buttons=rows)
+    await safe_edit(event, "👤 Accounts — choose an option:", buttons=rows)
 
 
 @bot.on(events.CallbackQuery(data=b"sec_settings"))
@@ -471,13 +469,16 @@ async def section_settings_cb(event):
         return
     state.pop(event.sender_id, None)
     rows = [
-        [Button.inline("📌 Content", b"marker"),
-         Button.inline("⚙️ Send Speed", b"speed")],
+        [Button.inline("⚙️ Send Speed", b"speed"),
+         Button.inline("⚙️ Settings", b"settings")],
         [Button.inline("🛠 Workers", b"workers"),
          Button.inline("💾 Backup", b"backup")],
-        [Button.inline("⚙️ Settings", b"settings")],
-        [Button.inline("🔙 Back", b"home")],
     ]
+    portal_row = [Button.inline("🌐 Portal", b"portal_panel")]
+    if is_real_owner(event):
+        portal_row.append(Button.inline("👥 Admins", b"admins"))
+    rows.append(portal_row)
+    rows.append([Button.inline("🔙 Back", b"home")])
     await safe_edit(event, "⚙️ Settings — choose an option:", buttons=rows)
 
 
@@ -743,7 +744,9 @@ async def account_menu_cb(event):
         buttons.append([Button.inline("🔁 Re-login (session recovery)",
                                       f"relogin_{account_id}".encode())])
     buttons += [
-        [Button.inline("🚀 Send", f"send_{account_id}".encode()),
+        # "🚀 Send" now opens the send-method chooser (forward / text / file+caption
+        # / channel) instead of jumping straight to forward-marker.
+        [Button.inline("🚀 Send", f"sm_{account_id}".encode()),
          Button.inline("📢 Channel", f"chan_{account_id}".encode())],
         # isolated module login_code.py (mirrors incoming TEXT for manual login)
         [Button.inline("📩 دریافت کد ورود", f"getcode_{account_id}".encode())],
@@ -1082,10 +1085,60 @@ async def send_mode_cb(event):
         buttons=[
             [Button.inline("📎 Forward Marker to Contacts", f"send_{account_id}".encode())],
             [Button.inline("✍️ Plain Text to Contacts", f"sendtext_{account_id}".encode())],
+            [Button.inline("📎 File + Caption to Contacts", f"sendfile_{account_id}".encode())],
             [Button.inline("📢 Channel-style Send", f"chan_{account_id}".encode())],
-            [Button.inline("🔙 Back", b"send_menu")],
+            [Button.inline("🔙 Back", f"acc_{account_id}".encode())],
         ],
     )
+
+
+@bot.on(events.CallbackQuery(pattern=b"sendfile_(\\d+)"))
+async def send_file_prepare_cb(event):
+    """Send method = the caption-file: upload the owner's stored file+caption to
+    THIS account's Saved Messages (with worker/IP fallback), then forward it to
+    the contacts using the EXISTING send engine. The file is uploaded ONLY now,
+    when this method is chosen — not when the account was added."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("Account not found.", alert=True)
+        return
+    if continuous_busy(account_id):
+        await safe_edit(event,
+            "🔁 An automation feature is on for this account. Turn it off from Automation first.",
+            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    import caption_file
+    if not caption_file.has_file():
+        await safe_edit(event,
+            "📎 No file is set yet. Set it from 📌 Content → “File + Caption” first.",
+            buttons=[[Button.inline("📌 Content", b"marker")],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    await safe_edit(event,
+        "⏳ Uploading the file to Saved Messages (auto-fallback to another worker "
+        "if an IP is blocked), then sending …")
+    import bot as _self
+    ok, detail = await caption_file.send_for_account(_self, acc)
+    if ok:
+        await safe_edit(event,
+            card("📎 FILE SEND STARTED", [
+                f"• Account : {acc['phone']}",
+                "• The file is in Saved Messages and the send has started.",
+                "• Progress cards are posted in the log group.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+    else:
+        await safe_edit(event,
+            card("📎 FILE SEND FAILED ❌", [
+                f"• Account : {acc['phone']}",
+                f"• Reason  : {str(detail)[:160]}",
+                "Nothing was sent. Fix the issue and try again.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🔁 Retry", f"sendfile_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
 
 
 # --------------------------------------------------------------------------- #
@@ -2021,12 +2074,85 @@ async def handle_channel_name(event):
     if not acc:
         await event.respond("Account not found.", buttons=main_menu(is_real_owner(event)))
         return
-    marker = db.get_marker()
+    # Choose WHAT content to forward into the new channel: the current marker,
+    # or the caption-file (same upload-to-Saved-Messages method as the sends).
+    pending_channel_name[event.sender_id] = {"account_id": account_id, "name": name}
+    try:
+        import caption_file
+        capset = caption_file.has_file()
+    except Exception:  # noqa: BLE001
+        capset = False
+    rows = [[Button.inline(f"📌 Marker ('{db.get_marker()}')", f"chmk_{account_id}".encode())]]
+    if capset:
+        rows.append([Button.inline("📎 File + Caption", f"chcf_{account_id}".encode())])
+    else:
+        rows.append([Button.inline("📎 File + Caption (set it in Content first)",
+                                   b"marker")])
+    rows.append([Button.inline("🔙 Cancel", f"acc_{account_id}".encode())])
+    await event.respond(
+        card("📢 CHANNEL SEND METHOD", [
+            f"• Channel : {name}",
+            "Choose what to forward into the channel:",
+        ]), buttons=rows)
+
+
+async def _channel_proceed(event, use_caption_file: bool):
+    p = pending_channel_name.get(event.sender_id)
+    if not p:
+        await event.answer("Channel info expired. Start again from Channel.", alert=True)
+        return
+    account_id = p["account_id"]
+    name = p["name"]
+    acc = db.get_account(account_id)
+    if not acc:
+        await safe_edit(event, "Account not found.",
+                        buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    if use_caption_file:
+        import caption_file
+        if not caption_file.has_file():
+            await safe_edit(event,
+                "📎 No file is set. Set it from 📌 Content → “File + Caption” first.",
+                buttons=[[Button.inline("📌 Content", b"marker")],
+                         [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+            return
+        marker = caption_file.get_caption()
+        await safe_edit(event,
+            "⏳ Uploading the file to Saved Messages (auto-fallback to another "
+            "worker if an IP is blocked) before creating the channel …")
+        import bot as _self
+        ok, detail = await caption_file.upload_for_account(_self, acc)
+        if not ok:
+            await safe_edit(event,
+                card("📎 CHANNEL FILE UPLOAD FAILED ❌", [
+                    f"• Account : {acc['phone']}",
+                    f"• Reason  : {str(detail)[:160]}",
+                    "The channel was NOT created.",
+                    f"🕒 {now()}"]),
+                buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+            return
+    else:
+        marker = db.get_marker()
+    pending_channel_name.pop(event.sender_id, None)
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
         await channel_create_remote(event, acc, w, name, marker)
     else:
         await channel_create_local(event, acc, name, marker)
+
+
+@bot.on(events.CallbackQuery(pattern=b"chmk_(\\d+)"))
+async def channel_marker_cb(event):
+    if not is_owner(event):
+        return
+    await _channel_proceed(event, use_caption_file=False)
+
+
+@bot.on(events.CallbackQuery(pattern=b"chcf_(\\d+)"))
+async def channel_capfile_cb(event):
+    if not is_owner(event):
+        return
+    await _channel_proceed(event, use_caption_file=True)
 
 
 def _channel_ready_buttons(account_id):
@@ -2337,6 +2463,11 @@ async def marker_cb(event):
     state[event.sender_id] = {"step": "await_marker"}
     cur2 = db.get_rb_text2()
     plain = get_plain_text()
+    try:
+        import caption_file
+        capset = caption_file.has_file()
+    except Exception:  # noqa: BLE001
+        capset = False
     await safe_edit(event, 
         f"📌 Current marker: '{db.get_marker()}'\n{LINE}\n"
         "Send the new marker (the text you put at the end of your marked message's caption):",
@@ -2347,6 +2478,9 @@ async def marker_cb(event):
             ("📝 Plain Text (no forward) : SET" if plain
              else "📝 Plain Text (no forward) : EMPTY"),
             b"plaintext")],
+                 [Button.inline(
+            ("📎 File + Caption : SET" if capset else "📎 File + Caption : EMPTY"),
+            b"capfile_set")],
                  [Button.inline("🔙 Back", b"home")]],
     )
 
