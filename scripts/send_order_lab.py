@@ -410,6 +410,47 @@ def legacy_order(users, chats):
     return with_chat + rest
 
 
+def verdict_twoway(requested: int, succeeded: int, with_chat: int,
+                   engaged: int, nochat_total: int):
+    """Decide whether the two-way count can be trusted. PURE + testable.
+
+    Exists because the first version of this check printed a confident
+    "✓ CONFIRMED" after every single probe call had failed: it divided by
+    max(1, successes), so zero successes became a denominator of 1 and the
+    absence of evidence was reported as evidence. A verdict now REQUIRES a
+    real sample and says so when it does not have one.
+
+    Returns (status, lines) with status in
+    {"insufficient", "confirmed", "undercount"}.
+    """
+    need = max(5, requested // 2)
+    if succeeded < need:
+        return "insufficient", [
+            "⛔ NO VERDICT — not enough data.",
+            f"   {succeeded} of {requested} probes succeeded"
+            f" (need at least {need}).",
+            "   Nothing is proven either way; fix the failures above and",
+            "   re-run. Absence of data is NOT evidence of correctness.",
+        ]
+    if with_chat == 0:
+        return "confirmed", [
+            f"✓ CONFIRMED on {succeeded} probes. None of the sampled",
+            "  'no-chat' contacts has a chat, so getChats was complete and",
+            "  the two-way count is real: this account never had a",
+            "  conversation with most of its contacts.",
+            "  (Mass-sending with no reply leaves no two-way signal — the",
+            "   recipient must open or answer the chat for it to show.)",
+        ]
+    est = nochat_total * engaged // max(1, succeeded)
+    return "undercount", [
+        f"✗ UNDERCOUNT. {with_chat} of {succeeded} sampled contacts DO have",
+        "  a chat that getChats never listed.",
+        f"  Extrapolated missed two-way contacts: ~{est}",
+        "  The count is wrong — detection must use getUserInfo per contact",
+        "  rather than the getChats list.",
+    ]
+
+
 def _legacy_lastonline(users, guid):
     """The timestamp the CURRENT code would sort this contact by."""
     for u in users:
@@ -899,13 +940,16 @@ async def verify_probe(phone: str, sample_n: int, out_json: str):
             print("   ⚠ most contacts show no chat. For an account that has")
             print("     been mass-sending, that is suspicious -> check B.")
 
-        print_header(f"B. GROUND TRUTH — getChatInfo on {sample_n} 'no-chat' contacts")
+        print_header(f"B. GROUND TRUTH — getUserInfo on {sample_n} 'no-chat' contacts")
+        # There is NO `getChatInfo` API method. For a user guid the real call is
+        # getUserInfo with the `user_guid` key (pyrubi synthesises the name from
+        # the guid type). Getting this wrong made all 25 probes fail silently.
         nochat = [g for g in cg if g not in user_chats][:sample_n]
         hits = eng = 0
         rows = []
         for g in nochat:
             try:
-                r = await _raw(client, "getChatInfo", {"object_guid": g})
+                r = await _raw(client, "getUserInfo", {"user_guid": g})
                 ch = _d(r).get("chat") or {}
                 s = chat_signals(ch) if ch else {}
                 has = bool(ch)
@@ -918,29 +962,30 @@ async def verify_probe(phone: str, sample_n: int, out_json: str):
                              "ask_spam": ch.get("show_ask_spam"),
                              "common_groups": _d(r).get("count_common_groups")})
             except Exception as e:
-                rows.append({"guid": g, "error": repr(e)[:70]})
+                rows.append({"guid": g, "error": f"{type(e).__name__}: {str(e)[:60]}"})
             await asyncio.sleep(0.35)
-        n = max(1, len([r for r in rows if "error" not in r]))
-        print(f"   sampled                     : {n}")
-        print(f"   actually HAVE a chat        : {hits}  ({100*hits//n}%)")
-        print(f"   show two-way engagement     : {eng}  ({100*eng//n}%)")
+
+        ok_rows = [r for r in rows if "error" not in r]
+        errs = [r for r in rows if "error" in r]
+        print(f"   requested : {len(nochat)}")
+        print(f"   succeeded : {len(ok_rows)}")
+        print(f"   FAILED    : {len(errs)}")
+        if errs:
+            tal = _tally(r["error"] for r in errs)
+            for msg, c in sorted(tal.items(), key=lambda x: -x[1])[:3]:
+                print(f"       {c}x  {msg}")
+        if ok_rows:
+            n = len(ok_rows)
+            print(f"   actually HAVE a chat    : {hits}  ({100 * hits // n}%)")
+            print(f"   show two-way engagement : {eng}  ({100 * eng // n}%)")
         res["sample"] = rows
 
-        print_header("VERDICT — is '16 two-way' trustworthy?")
-        if hits == 0:
-            print("   ✓ CONFIRMED. None of the sampled 'no-chat' contacts has")
-            print("     any chat, so getChats was complete and the two-way")
-            print("     count is real: this account simply never had a")
-            print("     conversation with most of its contacts.")
-            print("     (Mass-sending with no reply leaves no two-way signal:")
-            print("      the recipient has to open or answer the chat.)")
-        else:
-            est = len(cg - user_chats) * eng // n
-            print(f"   ✗ UNDERCOUNT. {hits} of {n} sampled contacts DO have a")
-            print("     chat that getChats never listed.")
-            print(f"     Extrapolated missed two-way contacts: ~{est}")
-            print("     The 16 figure is WRONG — detection must use")
-            print("     getChatInfo (or getChatsUpdates) rather than getChats.")
+        print_header("VERDICT — is the two-way count trustworthy?")
+        status, lines = verdict_twoway(len(nochat), len(ok_rows), hits, eng,
+                                       len(cg - user_chats))
+        res["verdict"] = status
+        for ln in lines:
+            print("   " + ln)
         if out_json:
             with open(out_json, "w", encoding="utf-8") as f:
                 json.dump(res, f, ensure_ascii=False, indent=1, default=str)
@@ -1235,7 +1280,24 @@ def selftest() -> int:
     ck("ignores non-dict lists", _items({"ids": [1, 2, 3]})[1] == "none")
     ck("guid falls back to user_guid", _guid({"user_guid": "u_q"}) == "u_q")
 
-    print_header("8. robustness")
+    print_header("8. verdict gating (the false-CONFIRMED bug)")
+    # the exact regression: 25 requested, 0 succeeded -> must NOT confirm
+    st, _ = verdict_twoway(requested=25, succeeded=0, with_chat=0,
+                           engaged=0, nochat_total=504)
+    ck("0 of 25 probes -> insufficient, NOT confirmed", st == "insufficient")
+    st, _ = verdict_twoway(25, 1, 0, 0, 504)
+    ck("1 of 25 probes -> still insufficient", st == "insufficient")
+    st, _ = verdict_twoway(25, 12, 0, 0, 504)
+    ck("12 of 25 with no chats -> confirmed", st == "confirmed")
+    st, lines = verdict_twoway(25, 20, 8, 6, 504)
+    ck("found chats -> undercount", st == "undercount")
+    ck("undercount extrapolates", any("~151" in x for x in lines))
+    st, _ = verdict_twoway(4, 4, 0, 0, 10)
+    ck("tiny request still needs 5 successes", st == "insufficient")
+    st, _ = verdict_twoway(100, 50, 0, 0, 504)
+    ck("50 of 100 meets the bar", st == "confirmed")
+
+    print_header("9. robustness")
     ck("empty input is safe", build_order([], [])[0] == [])
     ck("users with no guid are skipped",
        build_order([{"first_name": "x"}], [])[0] == [])
