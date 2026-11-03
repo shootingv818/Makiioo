@@ -583,6 +583,175 @@ async def probe(phone: str, strategy: str, deep: int, out_json: str,
             pass
 
 
+async def _raw(client, method: str, payload: dict | None = None):
+    """Call ANY Rubika API method, including ones rubpy does not wrap.
+    rubpy exposes a generic `builder(name=..., input=..., dict=True)`."""
+    return await client.builder(name=method, input=payload or {}, dict=True)
+
+
+async def mutual_probe(phone: str, show: int, out_json: str):
+    """Settle the question: is there a precise, Telegram-style mutual signal?
+
+    Probes four endpoints that the panel does not use today (two of them are
+    not even wrapped by rubpy) and then runs a CORRELATION TEST to decide
+    whether 'Exact last-seen' can be trusted as a 'they saved me' signal.
+    Strictly read-only.
+    """
+    import account_conn
+    import rubika_client as rb
+
+    print(f"\n  connecting to {phone} (read-only) ...")
+    await account_conn.close(rb.normalize_phone(phone))
+    client = rb.open_client(phone)
+    found = {}
+    try:
+        await rb.connect_ready(client)
+        users = await _fetch_raw(client, "contacts")
+        chats = await _fetch_raw(client, "chats")
+        sigs = {}
+        for ch in chats:
+            s = chat_signals(ch)
+            if s["guid"]:
+                sigs[s["guid"]] = s
+
+        # ---- 1. our own privacy settings: learn the enum vocabulary -------
+        print_header("1. getPrivacySetting  (what Exact/Approximate mean)")
+        try:
+            ps = await _raw(client, "getPrivacySetting")
+            found["privacy"] = ps
+            for item in (ps.get("privacy_settings") or ps.get("settings") or []):
+                print(f"   {item}")
+            if not (ps.get("privacy_settings") or ps.get("settings")):
+                print(f"   {json.dumps(ps, ensure_ascii=False)[:600]}")
+        except Exception as e:
+            print(f"   unavailable: {repr(e)[:120]}")
+
+        # ---- 2. Rubika's OWN affinity ranking ----------------------------
+        print_header("2. getTopChatUsers  (Rubika's own 'who you talk to most')")
+        top = []
+        try:
+            tr = await _raw(client, "getTopChatUsers")
+            found["top_chat_users"] = tr
+            raw_top = (tr.get("top_chat_users") or tr.get("users")
+                       or tr.get("objects") or [])
+            top = [str(_d(t).get("user_guid") or _d(t).get("object_guid") or "")
+                   for t in raw_top]
+            top = [g for g in top if g]
+            print(f"   returned      : {len(top)} users")
+            if raw_top:
+                print(f"   object keys   : {sorted(_d(raw_top[0]))}")
+            two_way = {g for g, s in sigs.items()
+                       if s["they_wrote"] or s["peer_read_us"]}
+            inter = [g for g in top if g in two_way]
+            newly = [g for g in top if g not in sigs]
+            print(f"   already in our two-way set : {len(inter)}/{len(top)}")
+            print(f"   NOT in our chat list at all: {len(newly)}"
+                  "   <- extra signal if > 0")
+        except Exception as e:
+            print(f"   unavailable: {repr(e)[:120]}")
+
+        # ---- 3. authoritative bulk presence ------------------------------
+        print_header("3. getContactsLastOnline  (fresher presence than getContacts?)")
+        guids = [str(_d(u).get("user_guid")) for u in users if _d(u).get("user_guid")]
+        live = {}
+        try:
+            for i in range(0, min(len(guids), 600), 100):
+                r = await _raw(client, "getContactsLastOnline",
+                               {"user_guids": guids[i:i + 100]})
+                blob = (r.get("contacts_last_online") or r.get("users") or r)
+                if isinstance(blob, dict):
+                    for g, v in blob.items():
+                        if isinstance(v, (int, float, str)):
+                            live[g] = v
+                elif isinstance(blob, list):
+                    for it in blob:
+                        d = _d(it)
+                        g = d.get("user_guid") or d.get("object_guid")
+                        if g:
+                            live[g] = (d.get("last_online")
+                                       or d.get("time") or d.get("online_time"))
+                await asyncio.sleep(0.2)
+            found["last_online_sample"] = dict(list(live.items())[:5])
+            print(f"   entries returned : {len(live)}")
+            if live:
+                print(f"   sample           : {found['last_online_sample']}")
+            now = time.time()
+            fresh = 0
+            for g, v in live.items():
+                try:
+                    if now - int(v) <= ONLINE_WINDOW_SEC:
+                        fresh += 1
+                except (TypeError, ValueError):
+                    pass
+            base = sum(1 for u in users if presence_of(u)["online"])
+            print(f"   online per getContacts        : {base}")
+            print(f"   online per getContactsLastOnline: {fresh}")
+            if fresh > base:
+                print("   -> this endpoint sees MORE online users; worth adopting")
+        except Exception as e:
+            print(f"   unavailable: {repr(e)[:120]}")
+
+        # ---- 4. definitive block list ------------------------------------
+        print_header("4. getBlockedUsers  (definitive, vs chat is_blocked)")
+        try:
+            br = await _raw(client, "getBlockedUsers", {"start_id": None})
+            blocked = br.get("users") or br.get("blocked_users") or []
+            found["blocked"] = len(blocked)
+            print(f"   blocked users : {len(blocked)}")
+            print(f"   chat-derived  : {sum(1 for s in sigs.values() if s['blocked'])}")
+        except Exception as e:
+            print(f"   unavailable: {repr(e)[:120]}")
+
+        # ---- 5. THE CORRELATION TEST -------------------------------------
+        print_header("5. CORRELATION — does 'Exact last-seen' mean 'they saved me'?")
+        eng_tot = eng_ex = non_tot = non_ex = 0
+        for u in users:
+            d = _d(u)
+            if d.get("is_deleted"):
+                continue
+            g = d.get("user_guid")
+            s = sigs.get(g)
+            engaged = bool(s and (s["they_wrote"] or s["peer_read_us"]))
+            ex = presence_of(u)["exact"]
+            if engaged:
+                eng_tot += 1
+                eng_ex += 1 if ex else 0
+            else:
+                non_tot += 1
+                non_ex += 1 if ex else 0
+        pe = 100.0 * eng_ex / max(1, eng_tot)
+        pn = 100.0 * non_ex / max(1, non_tot)
+        print(f"   engaged (they read/wrote) : {eng_ex}/{eng_tot} exact"
+              f" = {pe:.0f}%")
+        print(f"   never engaged             : {non_ex}/{non_tot} exact"
+              f" = {pn:.0f}%")
+        lift = pe - pn
+        print(f"   lift                      : {lift:+.0f} percentage points")
+        if lift >= 25:
+            print("   => STRONG: Exact last-seen is a usable 'they saved me' proxy.")
+        elif lift >= 10:
+            print("   => WEAK but real; usable only as a tie-breaker.")
+        else:
+            print("   => NO usable signal. Exact last-seen does NOT indicate")
+            print("      mutuality on this account — people who demonstrably")
+            print("      read your messages still hide their last-seen.")
+            print("      Conclusion: chat-derived signals remain the only")
+            print("      reliable way to detect two-way contacts.")
+        found["correlation"] = {"engaged_total": eng_tot, "engaged_exact": eng_ex,
+                                "other_total": non_tot, "other_exact": non_ex,
+                                "lift_pp": round(lift, 1)}
+
+        if out_json:
+            with open(out_json, "w", encoding="utf-8") as f:
+                json.dump(found, f, ensure_ascii=False, indent=1, default=str)
+            print(f"\n  raw responses written to {out_json}")
+    finally:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
 async def _deep_sample(client, ordered, n: int):
     """OPT-IN: per-contact getChatInfo on a small sample, to measure how much
     extra signal `count_common_groups` adds. 1 API call per contact."""
@@ -996,6 +1165,10 @@ def main():
                     help="list this panel's accounts (id / phone / status)")
     ap.add_argument("--probe", metavar="PHONE",
                     help="READ-ONLY probe of a real account")
+    ap.add_argument("--mutual", metavar="PHONE",
+                    help="READ-ONLY deep probe for a precise mutual signal "
+                         "(getTopChatUsers / getContactsLastOnline / "
+                         "getPrivacySetting / getBlockedUsers + correlation test)")
     ap.add_argument("--strategy", default="hybrid", choices=sorted(STRATEGIES),
                     help="ordering strategy (default: hybrid)")
     ap.add_argument("--deep", type=int, default=0, metavar="N",
@@ -1012,6 +1185,10 @@ def main():
         raise SystemExit(selftest())
     if a.do_list:
         raise SystemExit(list_accounts())
+    if a.mutual:
+        print("  ⚠️  read-only. Run while that account has no active send.")
+        asyncio.run(mutual_probe(a.mutual, a.show, a.out_json))
+        raise SystemExit(0)
     if not a.probe:
         ap.print_help()
         print("\n  tip: start with   --selftest   (offline, proves the logic)")
