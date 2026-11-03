@@ -98,10 +98,19 @@ import time
 # from the repo root without touching any module.
 # --------------------------------------------------------------------------- #
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _sub in ("core", "rubika", "workers", "bot_app", "status"):
-    _p = os.path.join(_ROOT, _sub)
+# The repo ROOT must come too: config.py lives there. main.py gets it for free
+# (it IS in the root), but this script sits in scripts/, so sys.path[0] is
+# scripts/ and `import config` would fail.
+for _sub in ("", "core", "rubika", "workers", "bot_app", "status"):
+    _p = os.path.join(_ROOT, _sub) if _sub else _ROOT
     if os.path.isdir(_p) and _p not in sys.path:
         sys.path.insert(0, _p)
+# config.py reads .env with python-dotenv relative to the CWD, so make the repo
+# root the CWD no matter where the script was invoked from.
+try:
+    os.chdir(_ROOT)
+except OSError:
+    pass
 
 # The fixed text used by --send-test. Deliberately explicit so a recipient
 # cannot mistake it for a real/marketing message.
@@ -511,10 +520,23 @@ async def probe(phone: str, strategy: str, deep: int, out_json: str,
         print(f"  contact keys            : {', '.join(audit['contact_keys'])}")
 
         ordered, report = build_order(users, chats, strategy)
-        print_report(report)
-
         legacy = legacy_order(users, chats)
+        print_verdict(audit, report, legacy, ordered)
+        print_report(report)
         print_diff(legacy, [r["guid"] for r in ordered], ordered)
+
+        # The real online test: who is online RIGHT NOW per the fixed logic.
+        # Open Rubika on your phone and compare this list.
+        on = [r for r in ordered if r["online"]]
+        print_header(f"ONLINE RIGHT NOW — fixed logic ({len(on)})")
+        if not on:
+            print("  nobody online this second. Re-run in a minute;")
+            print("  ONLINE_NOW needs an EXACT last-seen inside "
+                  f"{ONLINE_WINDOW_SEC}s.")
+        for i, r in enumerate(on[:40], 1):
+            secs = int(time.time() - r["ts"]) if r["ts"] else -1
+            print(f"  {i:>3}. {r['name'][:26]:<26} seen {secs:>3}s ago"
+                  f"   legacy position #{legacy.index(r['guid']) + 1}")
 
         print_header(f"PROPOSED FIRST {show}  (strategy={strategy})")
         for i, r in enumerate(ordered[:show], 1):
@@ -802,6 +824,55 @@ def selftest() -> int:
 # =========================================================================== #
 # output helpers
 # =========================================================================== #
+def print_verdict(audit, rep, legacy, ordered):
+    """The two answers, on real data, in one screen."""
+    n = audit["contacts_seen"]
+    has_status = audit["contact_has_status_field"]
+    masked = rep["masked_presence"]
+    tiers = rep["tiers"]
+    replied = tiers.get("REPLIED", 0)
+    read_us = tiers.get("READ_US", 0)
+    spam = rep["excluded_reasons"].get("show_ask_spam (stranger / spam risk)", 0)
+
+    byg = {r["guid"]: r for r in ordered}
+    first_on = next((i + 1 for i, g in enumerate(legacy)
+                     if byg.get(g, {}).get("online")), None)
+
+    print_header("VERDICT — on YOUR real data")
+    print("  Q1: is the bot's online-first logic correct?")
+    if has_status == 0:
+        print(f"      ✗ BROKEN. 0 of {n} contacts carry a 'status' field,")
+        print("        which is what the bot's _is_online() tests. So the")
+        print("        'online first' tier NEVER fires on this account.")
+    else:
+        print(f"      ? {has_status} of {n} contacts DO carry 'status'"
+              " — unexpected, inspect contact_keys above.")
+    print(f"      → with the fixed logic, {rep['online_now']} contact(s) are"
+          " online right now.")
+    if first_on:
+        print(f"      → the first online contact sits at position #{first_on}"
+              " in the bot's")
+        print("        current order, vs #1 in the proposed order.")
+    pct = round(100.0 * masked / max(1, rep["sendable"]), 1)
+    print(f"      → {masked} ({pct}%) hide their last-seen, so the bot's"
+          " last_online")
+    print("        sort is unreliable for them (30-min rounded buckets).")
+
+    print("\n  Q2: do two-way (mutual) contacts exist, and can we split them?")
+    if replied + read_us:
+        print(f"      ✓ YES — {replied + read_us} two-way contacts found:")
+        print(f"          {replied} wrote to you, {read_us} read your messages")
+        print(f"      → {rep['one_way']} are one-way (never engaged).")
+        print("      → Rubika has NO mutual flag, but these come free from the")
+        print("        getChats call the panel already makes.")
+    else:
+        print("      ✗ none detected on this account (no chat history yet).")
+    if spam:
+        print(f"      ⚠ {spam} contact(s) carry show_ask_spam=True — Rubika is")
+        print("        warning them you're a stranger. The bot messages these")
+        print("        today; the proposed list excludes them.")
+
+
 def print_header(t):
     print("\n" + "-" * 68)
     print(f"  {t}")
