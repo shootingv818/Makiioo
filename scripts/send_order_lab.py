@@ -230,33 +230,46 @@ def chat_signals(chat) -> dict:
     }
 
 
-# Tier ids, best -> worst. The *priority* of these is what a strategy changes.
+# Presence tiers, best -> worst. This is the PRIMARY axis, exactly as asked:
+#   online now  ->  last-seen visible AND seen today  ->  hidden "Recently"
+#   ->  visible but older  ->  hidden week/month  ->  cold
+# "two-way" is NOT a tier any more, it is a separate flag, so a strategy can
+# lift two-way contacts without disturbing the presence grouping.
 TIERS = (
-    "ONLINE_NOW",      # at the phone right now (exact presence inside window)
-    "REPLIED",         # two-way: they wrote to us
-    "READ_US",         # two-way: they read our messages
-    "CHAT_ONE_WAY",    # chat exists but they never read it
-    "EXACT_PRESENCE",  # no chat, but not hiding last-seen from us
-    "APPROX_RECENTLY",
-    "APPROX_WEEK",
-    "APPROX_MONTH",
-    "COLD",            # long ago / unknown
+    "ONLINE_NOW",       # at the phone right now
+    "TODAY_OPEN",       # last-seen OPEN (exact) and seen today
+    "RECENTLY_HIDDEN",  # last-seen CLOSED, bucket says "Recently"
+    "EXACT_OLDER",      # last-seen OPEN but before today
+    "WEEK_HIDDEN",      # closed, "WeekAgo"
+    "MONTH_HIDDEN",     # closed, "MonthAgo"
+    "COLD",             # "LongAgo" / unknown
 )
+_TIER_INDEX = {t: i for i, t in enumerate(TIERS)}
 
-STRATEGIES = {
-    # default: whoever is at the phone right now, then two-way, then presence
-    "hybrid": ("ONLINE_NOW", "REPLIED", "READ_US", "CHAT_ONE_WAY",
-               "EXACT_PRESENCE", "APPROX_RECENTLY", "APPROX_WEEK",
-               "APPROX_MONTH", "COLD"),
-    # safest for spam: every two-way contact before any stranger
-    "mutual": ("REPLIED", "READ_US", "ONLINE_NOW", "CHAT_ONE_WAY",
-               "EXACT_PRESENCE", "APPROX_RECENTLY", "APPROX_WEEK",
-               "APPROX_MONTH", "COLD"),
-    # literal reading of "online first, then most recent"
-    "presence": ("ONLINE_NOW", "EXACT_PRESENCE", "REPLIED", "READ_US",
-                 "CHAT_ONE_WAY", "APPROX_RECENTLY", "APPROX_WEEK",
-                 "APPROX_MONTH", "COLD"),
+TIER_LABEL = {
+    "ONLINE_NOW": "ONLINE NOW",
+    "TODAY_OPEN": "SEEN TODAY (last-seen open)",
+    "RECENTLY_HIDDEN": "RECENTLY (last-seen hidden)",
+    "EXACT_OLDER": "OLDER (last-seen open)",
+    "WEEK_HIDDEN": "WEEK AGO (hidden)",
+    "MONTH_HIDDEN": "MONTH AGO (hidden)",
+    "COLD": "LONG AGO / unknown",
 }
+
+# A strategy only decides the COARSE grouping; inside a group the presence
+# tier and then recency always apply.
+STRATEGIES = ("priority", "hybrid", "mutual")
+
+
+def _group_rank(rec, strategy: str) -> int:
+    """Coarse bucket for a strategy. Lower = sent earlier."""
+    if strategy == "mutual":            # every two-way contact first
+        return 0 if rec["mutual"] else 1
+    if strategy == "hybrid":            # online now, then two-way, then rest
+        if rec["tier"] == "ONLINE_NOW":
+            return 0
+        return 1 if rec["mutual"] else 2
+    return 0                            # "priority": pure presence order
 
 
 def classify(user, sig: dict | None) -> dict:
@@ -268,37 +281,29 @@ def classify(user, sig: dict | None) -> dict:
     excluded = ""
     if u.get("is_deleted") is True:
         excluded = "deleted account"
+    elif _is_suspended(u):
+        # Found on live data: warning_info carries a BlockUser warning reading
+        # "این کاربر تعلیق می باشد" (this user is suspended). These are NOT
+        # flagged is_deleted, so they survive every other filter and every
+        # send to them is wasted.
+        excluded = "suspended (warning_info)"
     elif sig.get("blocked"):
         excluded = "blocked us"
     elif sig.get("can_send") is False:
         excluded = "no SendMessages access"
     elif sig.get("ask_spam"):
-        # Rubika itself is warning this peer that we are a stranger: messaging
-        # them is what earns spam reports.
         excluded = "show_ask_spam (stranger / spam risk)"
 
+    tier = presence_tier(pres)
     has_chat = bool(sig)
-    if pres["online"]:
-        tier = "ONLINE_NOW"
-    elif has_chat and sig.get("they_wrote"):
-        tier = "REPLIED"
-    elif has_chat and sig.get("peer_read_us"):
-        tier = "READ_US"
-    elif has_chat:
-        tier = "CHAT_ONE_WAY"
-    elif pres["exact"] and pres["ts"]:
-        tier = "EXACT_PRESENCE"
-    else:
-        tier = _APPROX_TIER.get(pres["bucket"], "COLD")
-
     return {
         "guid": u.get("user_guid") or u.get("object_guid") or "",
-        "name": (str(u.get("first_name") or "") + " "
-                 + str(u.get("last_name") or "")).strip(),
+        "name": _name_of_user(u),
         "phone": u.get("phone") or "",
         "tier": tier,
         "excluded": excluded,
         "mutual": bool(has_chat and (sig.get("they_wrote") or sig.get("peer_read_us"))),
+        "has_chat": has_chat,
         "exact": pres["exact"],
         "ts": pres["ts"],
         "bucket": pres["bucket"],
@@ -308,14 +313,49 @@ def classify(user, sig: dict | None) -> dict:
     }
 
 
-def build_order(users, chats, strategy: str = "hybrid",
+def _is_suspended(user) -> bool:
+    """True when Rubika itself marks the account suspended via warning_info."""
+    w = _d(user).get("warning_info")
+    if not w:
+        return False
+    if isinstance(w, dict):
+        wid = str(w.get("warning_id") or "")
+        txt = str(w.get("text") or "")
+        return ("BlockUser" in wid) or ("تعلیق" in txt)
+    return bool(w)
+
+
+def _day_start(ts: float | None = None) -> int:
+    """Local midnight, so 'seen today' means today on the operator's clock."""
+    lt = time.localtime(ts if ts is not None else time.time())
+    return int(time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday,
+                            0, 0, 0, 0, 0, -1)))
+
+
+def presence_tier(pres: dict, now: float | None = None) -> str:
+    """Map an honest presence record onto the requested priority tiers."""
+    if pres["online"]:
+        return "ONLINE_NOW"
+    if pres["exact"] and pres["ts"]:
+        return "TODAY_OPEN" if pres["ts"] >= _day_start(now) else "EXACT_OLDER"
+    b = pres["bucket"]
+    if b == "recently":
+        return "RECENTLY_HIDDEN"
+    if b in ("weekago", "lastweek", "last week"):
+        return "WEEK_HIDDEN"
+    if b in ("monthago", "lastmonth", "last month"):
+        return "MONTH_HIDDEN"
+    return "COLD"
+
+
+def build_order(users, chats, strategy: str = "priority",
                 include_excluded: bool = False):
     """THE PROPOSED LIST. Returns (ordered_records, report_dict).
 
     One paginated getContacts + one paginated getChats is all it costs — the
     same two calls the panel already performs.
     """
-    prio = {t: i for i, t in enumerate(STRATEGIES.get(strategy, STRATEGIES["hybrid"]))}
+    strategy = strategy if strategy in STRATEGIES else "priority"
 
     by_guid = {}
     for ch in chats or []:
@@ -334,14 +374,13 @@ def build_order(users, chats, strategy: str = "hybrid",
     dropped = [r for r in recs if r["excluded"]]
 
     def sort_key(r):
-        # inside a tier: exact presence first, then newest presence, then
-        # newest chat activity, then the privacy bucket.
+        # strategy group -> presence tier -> newest first -> stable tiebreak.
         return (
-            prio.get(r["tier"], 99),
-            0 if r["exact"] else 1,
+            _group_rank(r, strategy),
+            _TIER_INDEX.get(r["tier"], 99),
             -int(r["ts"] or 0),
-            -int(r["chat_time"] or 0),
             _APPROX_ORDER.get(r["bucket"], 9),
+            -int(r["chat_time"] or 0),
             r["guid"],
         )
 
@@ -432,19 +471,35 @@ def verdict_twoway(requested: int, succeeded: int, with_chat: int,
             "   Nothing is proven either way; fix the failures above and",
             "   re-run. Absence of data is NOT evidence of correctness.",
         ]
-    if with_chat == 0:
-        return "confirmed", [
-            f"✓ CONFIRMED on {succeeded} probes. None of the sampled",
-            "  'no-chat' contacts has a chat, so getChats was complete and",
-            "  the two-way count is real: this account never had a",
-            "  conversation with most of its contacts.",
-            "  (Mass-sending with no reply leaves no two-way signal — the",
-            "   recipient must open or answer the chat for it to show.)",
+    # The question is about TWO-WAY contacts, so `engaged` decides it.
+    # `with_chat` must not: getUserInfo returns a `chat` envelope for every
+    # user, conversation or not, so keying on it reported "UNDERCOUNT" while
+    # the extrapolation on the very next line said ~0.
+    if engaged == 0:
+        lines = [
+            f"✓ CONFIRMED on {succeeded} probes. NOT ONE sampled contact",
+            "  outside the chat list shows two-way engagement, so the",
+            "  two-way count is real.",
+            "  Mass-sending with no reply leaves no two-way signal: the",
+            "  recipient has to OPEN or ANSWER for last_seen_peer_mid to fill.",
+            f"  (0 of {succeeded} => at 95% confidence under ~"
+            f"{int(300 / max(1, succeeded))}% of the {nochat_total} remaining,",
+            "   so the two-way set stays small either way.)",
         ]
+        if with_chat:
+            lines += [
+                "",
+                f"⚠ SEPARATE finding: {with_chat} of {succeeded} do carry a",
+                "  chat object that getChats never listed. That does not add",
+                "  two-way contacts, but it means the ONE-WAY/'has chat' tier",
+                "  is undercounted — tier assignment should consult",
+                "  getUserInfo, not the getChats list.",
+            ]
+        return "confirmed", lines
     est = nochat_total * engaged // max(1, succeeded)
     return "undercount", [
-        f"✗ UNDERCOUNT. {with_chat} of {succeeded} sampled contacts DO have",
-        "  a chat that getChats never listed.",
+        f"✗ UNDERCOUNT. {engaged} of {succeeded} sampled contacts show",
+        "  two-way engagement that getChats never revealed.",
         f"  Extrapolated missed two-way contacts: ~{est}",
         "  The count is wrong — detection must use getUserInfo per contact",
         "  rather than the getChats list.",
@@ -528,9 +583,12 @@ def _field_audit(users, chats):
     # `warning_info` showed up on a live account and is undocumented; it may be
     # Rubika's own scam/spam marker, which would beat show_ask_spam as a filter.
     warn = [_d(u).get("warning_info") for u in users if _d(u).get("warning_info")]
+    # "longago" IS handled (it maps to COLD on purpose); only warn about
+    # buckets we have genuinely never seen, so the warning stays meaningful.
+    _known = set(_APPROX_ORDER) | {"", "online"}
     unknown_buckets = sorted(
         {str((_d(u).get("online_time") or {}).get("approximate_period") or "").lower()
-         for u in users} - set(_APPROX_TIER) - {"", "online"})
+         for u in users} - _known)
     return {
         "warning_info_count": len(warn),
         "warning_info_samples": warn[:3],
@@ -597,12 +655,7 @@ async def probe(phone: str, strategy: str, deep: int, out_json: str,
             print(f"  {i:>3}. {r['name'][:26]:<26} seen {secs:>3}s ago"
                   f"   legacy position #{legacy.index(r['guid']) + 1}")
 
-        print_header(f"PROPOSED FIRST {show}  (strategy={strategy})")
-        for i, r in enumerate(ordered[:show], 1):
-            when = (time.strftime("%Y-%m-%d %H:%M", time.localtime(r["ts"]))
-                    if r["ts"] else (r["bucket"] or "-"))
-            print(f"  {i:>3}. {r['tier']:<16} mutual={'Y' if r['mutual'] else 'n'} "
-                  f"exact={'Y' if r['exact'] else 'n'}  {when:<17} {r['name'][:22]}")
+        print_groups(ordered)
 
         deep_info = None
         if deep > 0:
@@ -952,7 +1005,9 @@ async def verify_probe(phone: str, sample_n: int, out_json: str):
                 r = await _raw(client, "getUserInfo", {"user_guid": g})
                 ch = _d(r).get("chat") or {}
                 s = chat_signals(ch) if ch else {}
-                has = bool(ch)
+                # a `chat` envelope is always returned; real history is what
+                # last_message proves.
+                has = bool(ch.get("last_message"))
                 engaged = bool(s.get("they_wrote") or s.get("peer_read_us"))
                 hits += 1 if has else 0
                 eng += 1 if engaged else 0
@@ -1195,11 +1250,34 @@ def selftest() -> int:
     ordered, rep = build_order(users, chats, "hybrid")
     tier = {r["guid"]: r["tier"] for r in ordered}
     ck("online -> ONLINE_NOW", tier.get("u_online") == "ONLINE_NOW")
-    ck("they wrote -> REPLIED", tier.get("u_replied") == "REPLIED")
-    ck("they read -> READ_US", tier.get("u_read") == "READ_US")
-    ck("chat, never read -> CHAT_ONE_WAY", tier.get("u_oneway") == "CHAT_ONE_WAY")
-    ck("no chat + exact -> EXACT_PRESENCE", tier.get("u_exact") == "EXACT_PRESENCE")
-    ck("masked -> APPROX_RECENTLY", tier.get("u_masked") == "APPROX_RECENTLY")
+    ck("seen 2 days ago -> EXACT_OLDER", tier.get("u_read") == "EXACT_OLDER")
+    ck("masked 'Recently' -> RECENTLY_HIDDEN",
+       tier.get("u_masked") == "RECENTLY_HIDDEN")
+    # two-way is a FLAG now, not a tier, so presence grouping stays clean
+    mut = {r["guid"]: r["mutual"] for r in ordered}
+    ck("they wrote -> mutual flag", mut.get("u_replied") is True)
+    ck("they read -> mutual flag", mut.get("u_read") is True)
+    ck("chat but never read -> NOT mutual", mut.get("u_oneway") is False)
+    ck("no chat -> NOT mutual", mut.get("u_exact") is False)
+
+    # the today/older boundary, with an INJECTED clock so it can never be
+    # flaky near midnight
+    noon = _day_start() + 12 * 3600
+    ck("exact, 1h before noon today -> TODAY_OPEN",
+       presence_tier({"exact": True, "ts": noon - 3600, "bucket": "",
+                      "online": False}, now=noon) == "TODAY_OPEN")
+    ck("exact, just after midnight -> TODAY_OPEN",
+       presence_tier({"exact": True, "ts": _day_start() + 5, "bucket": "",
+                      "online": False}, now=noon) == "TODAY_OPEN")
+    ck("exact, 1s BEFORE midnight -> EXACT_OLDER",
+       presence_tier({"exact": True, "ts": _day_start() - 1, "bucket": "",
+                      "online": False}, now=noon) == "EXACT_OLDER")
+    ck("online beats today", presence_tier(
+        {"exact": True, "ts": noon, "bucket": "", "online": True},
+        now=noon) == "ONLINE_NOW")
+    ck("hidden 'Recently' never counts as today", presence_tier(
+        {"exact": False, "ts": 0, "bucket": "recently", "online": False},
+        now=noon) == "RECENTLY_HIDDEN")
     ck("spam-risk excluded", "u_spam" not in tier)
     ck("deleted excluded", "u_del" not in tier)
     ck("blocked excluded", "u_blocked" not in tier)
@@ -1225,10 +1303,10 @@ def selftest() -> int:
     ck("hybrid: 'LongTimeAgo' lands in COLD",
        tier.get("u_mask_old") == "COLD")
     # regression: the REAL Rubika spellings must map to their own tiers, not COLD
-    ck("real 'WeekAgo' -> APPROX_WEEK (not COLD)",
-       tier.get("u_weekago") == "APPROX_WEEK")
-    ck("real 'MonthAgo' -> APPROX_MONTH (not COLD)",
-       tier.get("u_monthago") == "APPROX_MONTH")
+    ck("real 'WeekAgo' -> WEEK_HIDDEN (not COLD)",
+       tier.get("u_weekago") == "WEEK_HIDDEN")
+    ck("real 'MonthAgo' -> MONTH_HIDDEN (not COLD)",
+       tier.get("u_monthago") == "MONTH_HIDDEN")
     ck("real 'LongAgo' -> COLD", tier.get("u_longago") == "COLD")
     ck("WeekAgo ranks above MonthAgo",
        g.index("u_weekago") < g.index("u_monthago"))
@@ -1306,8 +1384,18 @@ def selftest() -> int:
     # with no chat data at all, only the deleted account is excluded (blocked /
     # ask_spam are chat-derived and therefore unknown) -> 14 - 1 = 13
     ck("None chat list is safe", len(build_order(users, None)[0]) == 13)
-    ck("unknown strategy falls back to hybrid",
-       [r["guid"] for r in build_order(users, chats, "zzz")[0]] == g)
+    ck("unknown strategy falls back to priority",
+       [r["guid"] for r in build_order(users, chats, "zzz")[0]]
+       == [r["guid"] for r in build_order(users, chats, "priority")[0]])
+    ck("suspended account is excluded", not any(
+        r["guid"] == "u_susp" for r in build_order(
+            users + [{"user_guid": "u_susp", "first_name": "Susp",
+                      "is_deleted": False,
+                      "warning_info": {"warning_id": "xBlockUser",
+                                       "text": "این کاربر تعلیق می باشد."},
+                      "online_time": {"type": "Exact",
+                                      "exact_time": int(time.time()) - 10}}],
+            chats, "priority")[0]))
 
     print(f"\n  ==== {npass} passed, {nfail} failed ====\n")
     return 1 if nfail else 0
@@ -1363,6 +1451,39 @@ def print_verdict(audit, rep, legacy, ordered):
         print(f"      ⚠ {spam} contact(s) carry show_ask_spam=True — Rubika is")
         print("        warning them you're a stranger. The bot messages these")
         print("        today; the proposed list excludes them.")
+
+
+def print_groups(ordered, per_group: int = 12):
+    """Show the send list as GROUPED LISTS, in send order — not a flat
+    numbered enumeration."""
+    print_header("SEND LIST — grouped, in send order")
+    pos = 1
+    for tier in TIERS:
+        members = [r for r in ordered if r["tier"] == tier]
+        if not members:
+            continue
+        first, last = pos, pos + len(members) - 1
+        print(f"\n  ■ {TIER_LABEL[tier]}  —  {len(members)} contact(s)"
+              f"   [positions {first}-{last}]")
+        if tier == "ONLINE_NOW":
+            print("    (at the phone right now)")
+        elif tier == "TODAY_OPEN":
+            print("    (last-seen visible, online earlier today, newest first)")
+        elif tier == "RECENTLY_HIDDEN":
+            print("    (last-seen hidden; Rubika only says \"Recently\")")
+        shown = members[:per_group]
+        names = [f"{r['name'][:22]}" for r in shown]
+        line = ""
+        for nm in names:
+            if len(line) + len(nm) > 62:
+                print(f"      {line}")
+                line = ""
+            line += (nm + " · ")
+        if line:
+            print(f"      {line.rstrip(' ·')}")
+        if len(members) > per_group:
+            print(f"      … +{len(members) - per_group} more")
+        pos = last + 1
 
 
 def print_header(t):
@@ -1458,8 +1579,10 @@ def main():
                     help="READ-ONLY deep probe for a precise mutual signal "
                          "(getTopChatUsers / getContactsLastOnline / "
                          "getPrivacySetting / getBlockedUsers + correlation test)")
-    ap.add_argument("--strategy", default="hybrid", choices=sorted(STRATEGIES),
-                    help="ordering strategy (default: hybrid)")
+    ap.add_argument("--strategy", default="priority", choices=sorted(STRATEGIES),
+                    help="priority = online > seen-today > Recently-hidden "
+                         "(default); hybrid = online, then two-way; "
+                         "mutual = two-way first")
     ap.add_argument("--deep", type=int, default=0, metavar="N",
                     help="also getChatInfo for the first N contacts (slow)")
     ap.add_argument("--show", type=int, default=25, metavar="N",
