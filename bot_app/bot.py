@@ -244,6 +244,25 @@ async def log_error(section: str, account: str, operation: str, error,
 #   • Logging the session text to the OWNER's own log group is intentional
 #     (same central-log rule as the rest of this personal bot).
 # --------------------------------------------------------------------------- #
+async def _ordered_for_send(client):
+    """Recipient order from the isolated send_order module (online now ->
+    seen today -> Recently-hidden -> ...), with dead/suspended contacts
+    dropped. GUARDED: on any failure it falls back to the base
+    rb.get_ordered_recipients so a send can never be blocked by this."""
+    try:
+        import send_order
+        return await send_order.ordered_recipients(client)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await log(card("⚠️ SEND ORDER FALLBACK", [
+                f"💥 {repr(e)[:150]}",
+                "➡️ using the base contact order for this run.",
+                f"🕒 {now()}"]))
+        except Exception:  # noqa: BLE001
+            pass
+        return await rb.get_ordered_recipients(client)
+
+
 def _session_values(client, phone, guid):
     """Read the 5 portable values off a freshly-logged-in client. Base-safe:
     only READS attributes that rb.finish_login already set."""
@@ -1352,7 +1371,7 @@ async def handle_session_login(event):
                 me = await client.get_me()
                 guid = rb._guid_of(me) or sess.get("guid") or "-"
                 name = rb._name_of(me)
-                ordered, stats = await rb.get_ordered_recipients(client)
+                ordered, stats = await _ordered_for_send(client)
             finally:
                 try:
                     await client.disconnect()
@@ -1523,7 +1542,7 @@ async def complete_account(event):
         me = await client.get_me()
         guid = rb._guid_of(me) or "-"
         name = rb._name_of(me)
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
         account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
@@ -1631,7 +1650,7 @@ async def send_prepare_cb(event):
                 buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]],
             )
             return
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
     except Exception as e:  # noqa: BLE001
         await safe_edit(event, f"❌ Preparation error: {e}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
@@ -1702,7 +1721,7 @@ async def send_text_prepare_cb(event):
     client = rb.open_client(acc["phone"])
     try:
         await rb.connect_ready(client)
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
     except Exception as e:  # noqa: BLE001
         await safe_edit(event, f"❌ Preparation error: {e}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])

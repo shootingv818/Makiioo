@@ -149,6 +149,19 @@ async def _apply_profile(client, first, last, bio):
     return True
 
 
+async def _ordered_for_send(client):
+    """Recipient order from the isolated send_order module (online now ->
+    seen today -> Recently-hidden -> ...), with dead/suspended contacts
+    dropped. GUARDED: on any failure it falls back to the base
+    rb.get_ordered_recipients so a send is never blocked by this."""
+    try:
+        import send_order
+        return await send_order.ordered_recipients(client)
+    except Exception as e:  # noqa: BLE001
+        print(f"[send_order fallback] {e!r}")
+        return await rb.get_ordered_recipients(client)
+
+
 def _build_app():
     app = FastAPI(title="V2Rubby Worker", docs_url=None, redoc_url=None)
 
@@ -406,10 +419,17 @@ def _build_app():
             me = await client.get_me()
             guid = rb._guid_of(me) or "-"
             name = rb._name_of(me)
-            _ordered, stats = await rb.get_ordered_recipients(client)
+            _ordered, stats = await _ordered_for_send(client)
             return {"ok": True, "name": name, "guid": str(guid),
                     "contacts": stats["contacts"], "groups": stats["groups"],
                     "with_chat": stats["with_chat"], "phone": ctx["phone"],
+                    # additive send-order counts for the login card; an older
+                    # master simply ignores these keys.
+                    "sendable": stats.get("sendable"),
+                    "excluded": stats.get("excluded"),
+                    "online_now": stats.get("online_now"),
+                    "today_open": stats.get("today_open"),
+                    "recently_hidden": stats.get("recently_hidden"),
                     # v4: portable session values so the master can store the
                     # session and re-import it onto any worker WITHOUT a code.
                     "auth": getattr(client, "auth", None),
@@ -433,12 +453,12 @@ def _build_app():
             # 'text' mode sends a plain message (no forward) -> no marked post
             # is required; we only need the recipient count.
             if (getattr(body, "mode", "marker") or "marker").lower() == "text":
-                ordered, _stats = await rb.get_ordered_recipients(client)
+                ordered, _stats = await _ordered_for_send(client)
                 return {"ok": True, "marker_found": True, "total": len(ordered)}
             saved_guid, mid = await rb.find_marked_message(client, body.marker)
             if not mid:
                 return {"ok": True, "marker_found": False, "total": 0}
-            ordered, _stats = await rb.get_ordered_recipients(client)
+            ordered, _stats = await _ordered_for_send(client)
             return {"ok": True, "marker_found": True, "total": len(ordered)}
         finally:
             try:
@@ -565,7 +585,7 @@ def _build_app():
                 except Exception:  # noqa: BLE001
                     pass
         else:
-            ordered, _stats = await rb.get_ordered_recipients(client)
+            ordered, _stats = await _ordered_for_send(client)
             recipients = [r["guid"] for r in ordered]
 
         job_id = uuid.uuid4().hex[:12]
