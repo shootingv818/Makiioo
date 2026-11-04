@@ -244,6 +244,22 @@ async def log_error(section: str, account: str, operation: str, error,
 #   • Logging the session text to the OWNER's own log group is intentional
 #     (same central-log rule as the rest of this personal bot).
 # --------------------------------------------------------------------------- #
+def _login_stat_rows(stats: dict) -> list:
+    """The `• Key : Value` rows of the login card. Same shell and bullet form
+    as before; GUID and the always-YES "Session Saved" line make way for the
+    send-order numbers that actually decide whether an account is worth using.
+    A value we were not given renders as "-" (e.g. an older worker that does
+    not report the new counts) — never a misleading 0."""
+    try:
+        import send_order
+        return send_order.summary_rows(stats or {})
+    except Exception:  # noqa: BLE001
+        st = stats or {}
+        return [f"• Contacts      : {st.get('contacts', '-')}",
+                f"• Groups        : {st.get('groups', '-')}",
+                f"• Chat Contacts : {st.get('with_chat', '-')}"]
+
+
 async def _ordered_for_send(client):
     """Recipient order from the isolated send_order module (online now ->
     seen today -> Recently-hidden -> ...), with dead/suspended contacts
@@ -1384,6 +1400,7 @@ async def handle_session_login(event):
             db.set_session_blob(account_id, sess)
             contacts, groups, with_chat = (stats["contacts"], stats["groups"],
                                            stats["with_chat"])
+            _card_stats = dict(stats)
         else:
             # ----- REMOTE import (write-only) + verify -----
             res = await _push_session_to_worker(w, sess)
@@ -1403,6 +1420,8 @@ async def handle_session_login(event):
             db.set_account_worker(account_id, w["id"])
             db.set_session_blob(account_id, sess)
             contacts = groups = with_chat = 0
+            # remote session import does not read contacts, so the card shows "-"
+            _card_stats = {}
     except Exception as e:  # noqa: BLE001
         await log(card("⚠️ SESSION LOGIN FAILED", [
             f"📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
@@ -1415,9 +1434,10 @@ async def handle_session_login(event):
         "• Status        : SUCCESS",
         f"• Phone         : {phone}",
         f"• Name          : {name}",
-        f"• GUID          : {guid}",
         "• Login Method  : SESSION",
-        "• Session Saved : YES",
+        LINE,
+        *_login_stat_rows(_card_stats),
+        LINE,
         f"• Time          : {now()}",
     ], footer=f"--| 🌍 - Worker : #{wtag}"))
     await event.respond(
@@ -1561,12 +1581,10 @@ async def complete_account(event):
             "• Status        : SUCCESS",
             f"• Phone         : {phone}",
             f"• Name          : {name}",
-            f"• GUID          : {guid}",
             "• Login Method  : CODE",
-            f"• Contacts      : {stats['contacts']}",
-            f"• Groups        : {stats['groups']}",
-            f"• Chat Contacts : {stats['with_chat']}",
-            "• Session Saved : YES",
+            LINE,
+            *_login_stat_rows(stats),
+            LINE,
             f"• Time          : {now()}",
         ], footer=f"--| 🌍 - Worker : #{wtag}"))
         await event.respond(
@@ -2456,12 +2474,17 @@ async def complete_account_remote(event, ctx, res):
         "• Status        : SUCCESS",
         f"• Phone         : {phone}",
         f"• Name          : {name}",
-        f"• GUID          : {guid}",
         "• Login Method  : CODE",
-        f"• Contacts      : {contacts}",
-        f"• Groups        : {groups}",
-        f"• Chat Contacts : {with_chat}",
-        "• Session Saved : YES",
+        LINE,
+        # an older worker omits the new counts -> those rows render as "-"
+        *_login_stat_rows({
+            "contacts": contacts, "groups": groups, "with_chat": with_chat,
+            "sendable": res.get("sendable"), "excluded": res.get("excluded"),
+            "online_now": res.get("online_now"),
+            "today_open": res.get("today_open"),
+            "recently_hidden": res.get("recently_hidden"),
+        }),
+        LINE,
         f"• Time          : {now()}",
     ], footer=f"--| 🌍 - Worker : #{w['tag']}"))
     await event.respond(
