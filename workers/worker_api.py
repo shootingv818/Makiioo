@@ -579,9 +579,8 @@ def _build_app():
             # sends leave order_by_presence False to keep the frozen order.
             if getattr(body, "order_by_presence", False):
                 try:
-                    rank = await rb.presence_rank(client)
-                    recipients = sorted(
-                        recipients, key=lambda g: rank.get(g, 10 ** 9))
+                    import send_order
+                    recipients = await send_order.rank_guids(client, recipients)
                 except Exception:  # noqa: BLE001
                     pass
         else:
@@ -1070,7 +1069,7 @@ def _build_app():
             # order like a normal send (chat-first -> online -> last-seen) when asked
             if getattr(body, "order", False) and guids:
                 try:
-                    ordered, _st = await rb.get_ordered_recipients(client)
+                    ordered, _st = await _ordered_for_send(client)
                     rank = {g: i for i, g in enumerate(ordered)}
                     guids = sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
                 except Exception:  # noqa: BLE001

@@ -1875,13 +1875,14 @@ async def run_send(owner_id: int, payload: dict):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        # order the explicit recipient list like a normal send (chat-first ->
-        # online -> last-seen) for brain/discovery, only on a fresh start.
+        # order the explicit recipient list by PRESENCE (online now -> seen
+        # today -> hidden Recently -> ...) for brain/discovery, only on a fresh
+        # start. Guards: every guid is kept, and any failure leaves the given
+        # order untouched.
         if payload.get("order_recipients") and start_idx == 0 and recipients:
             try:
-                ordered, _st = await rb.get_ordered_recipients(client)
-                rank = {g: i for i, g in enumerate(ordered)}
-                recipients = sorted(recipients, key=lambda g: rank.get(g, 10 ** 9))
+                import send_order
+                recipients = await send_order.rank_guids(client, recipients)
             except Exception:  # noqa: BLE001
                 pass
         while True:
@@ -7395,7 +7396,7 @@ async def _prepare_local(acc, marker):
         saved_guid, mid = await rb.find_marked_message(client, marker)
         if not mid:
             return None
-        ordered, _stats = await rb.get_ordered_recipients(client)
+        ordered, _stats = await _ordered_for_send(client)
         return saved_guid, mid, [r["guid"] for r in ordered]
     finally:
         try:
@@ -8230,8 +8231,12 @@ async def _pool_order_local(acc, guids):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        rank = await rb.presence_rank(client)
-        return sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
+        # presence ranking only (pool logic itself is untouched). The base
+        # rb.presence_rank ranks on the dead `status` field and never finds
+        # anyone online; send_order reads online_time instead. Every guid is
+        # kept and any failure leaves the given order as-is.
+        import send_order
+        return await send_order.rank_guids(client, guids)
     finally:
         try:
             await client.disconnect()
@@ -8470,7 +8475,7 @@ async def _local_ordered_guids(acc):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        ordered, _stats = await rb.get_ordered_recipients(client)
+        ordered, _stats = await _ordered_for_send(client)
         return [r["guid"] for r in ordered]
     finally:
         try:

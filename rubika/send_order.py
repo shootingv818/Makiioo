@@ -52,6 +52,11 @@ import db
 # Tunables (local on purpose: no new .env keys, no config.py change).
 # --------------------------------------------------------------------------- #
 ONLINE_WINDOW_SEC = 75      # exact last-seen inside this window == "online now"
+# A last-seen slightly in the future is normal clock skew between this server
+# and Rubika. Beyond this the value is not credible, and without a bound a
+# badly-skewed timestamp would look "online" forever and own the top of every
+# send list.
+FUTURE_SKEW_SEC = 120
 PAGE_CAP = 300              # pagination safety cap
 
 # VERIFIED on a live account: Rubika returns
@@ -156,7 +161,7 @@ def presence_of(user) -> dict:
             ts = 0
         age = time.time() - ts if ts else 1e9
         return {"exact": True, "ts": ts, "bucket": "",
-                "online": bool(ts) and age <= ONLINE_WINDOW_SEC}
+                "online": bool(ts) and -FUTURE_SKEW_SEC <= age <= ONLINE_WINDOW_SEC}
 
     if kind == "approximate":
         bucket = str(ot.get("approximate_period") or "").strip().lower()
@@ -370,6 +375,53 @@ async def ordered_recipients(client, strategy: str | None = None):
                         or _d(c).get("type") or "").lower() == "group")
     keep, stats = build(users, chats, strategy, groups=groups)
     return [{"guid": r["guid"], "name": r["name"]} for r in keep], stats
+
+
+async def presence_rank(client) -> dict:
+    """{guid: rank} with lower = send earlier, ranked ONLY by presence
+    (online now -> seen today -> hidden Recently -> ...). No chat-first step.
+
+    Correct replacement for rubika_client.presence_rank(), which ranks on the
+    same dead `status` field and therefore never detects anyone as online.
+    Used to order an already-chosen slice of guids (brain / pool / resume),
+    so it must not drop anyone: callers keep guids missing from this map by
+    giving them a default rank.
+    """
+    users = await _fetch(client, "contacts")
+    # Chats are fetched too: "blocked us" and "no SendMessages access" are
+    # chat-derived, so without them a blocked contact would be ranked as a
+    # perfectly good recipient and could be messaged first.
+    try:
+        chats = await _fetch(client, "chats")
+    except Exception:  # noqa: BLE001
+        chats = []
+    sigs = {}
+    for ch in chats:
+        s = chat_signals(ch)
+        if s["guid"] and s["type"] in ("user", ""):
+            sigs[s["guid"]] = s
+    recs = [classify(u, sigs.get(_guid_of(u))) for u in users if _guid_of(u)]
+    recs.sort(key=lambda r: (
+        # dead / suspended last: they are ranked (so rank_guids can keep every
+        # guid it was given) but must never outrank a live contact just because
+        # their last-seen happens to be newer.
+        1 if r["excluded"] else 0,
+        _TIER_INDEX.get(r["tier"], 99),
+        -int(r["ts"] or 0),
+        _APPROX_ORDER.get(r["bucket"], 9),
+        r["guid"],
+    ))
+    return {r["guid"]: i for i, r in enumerate(recs)}
+
+
+async def rank_guids(client, guids: list) -> list:
+    """Reorder an EXPLICIT list of guids by presence, keeping every entry.
+    Guids with no presence data keep their relative position at the end."""
+    want = list(guids or [])
+    if not want:
+        return want
+    rank = await presence_rank(client)
+    return sorted(want, key=lambda g: (rank.get(g, 10 ** 9), ))
 
 
 def summary_rows(stats: dict) -> list:
