@@ -315,6 +315,12 @@ def _build_app():
         phone: str
         ttl: int = 300
 
+    class FwdPrivacyIn(BaseModel):
+        # Forward-sender privacy (isolated module `forward_privacy.py`).
+        # hidden=None -> read only; True/False -> set and verify.
+        phone: str
+        hidden: bool = None
+
     class CapfileIn(BaseModel):
         # Caption-file auto-upload (isolated module `caption_file.py`): upload a
         # base64-encoded file into this account's Saved Messages with a caption.
@@ -837,6 +843,26 @@ def _build_app():
         _auth(authorization)
         import login_code
         return login_code.worker_drain(phone)
+
+    # ---- Forward-sender privacy (additive; isolated forward_privacy.py) -----
+    @app.post("/fwdprivacy")
+    async def fwdprivacy(body: FwdPrivacyIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import forward_privacy as fp
+        try:
+            if body.hidden is None:
+                r = await account_conn.call(body.phone, fp.read, timeout=60)
+                val = r.get("value", "")
+                return {"ok": True, "before": val, "after": val, "error": ""}
+            r = await account_conn.call(body.phone, fp.apply,
+                                        bool(body.hidden), timeout=90)
+            return {"ok": bool(r.get("ok")), "before": r.get("before", ""),
+                    "want": r.get("want", ""), "after": r.get("after", ""),
+                    "error": r.get("error", "")}
+        except account_conn.InvalidAuthError:
+            return {"ok": False, "error": "session invalid"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:110]}"}
 
     # ---- Caption-file upload (additive; served by isolated caption_file.py) --
     @app.post("/capfile/upload")

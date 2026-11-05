@@ -498,6 +498,86 @@ async def section_accounts_cb(event):
     await safe_edit(event, "👤 Accounts — choose an option:", buttons=rows)
 
 
+@bot.on(events.CallbackQuery(data=b"fwdpriv"))
+async def fwdpriv_panel_cb(event):
+    """Panel for Rubika's own 'link_forward_message' privacy switch. Reading is
+    free; applying is explicit and always verified by reading back."""
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    await safe_edit(event, "⏳ Reading the forward-privacy setting of every account …")
+    import forward_privacy as fp
+    rows_txt = []
+    accounts = db.list_accounts()
+    for acc in accounts:
+        r = await _fwdpriv_on_account(acc, None)
+        if r.get("error"):
+            rows_txt.append(f"• {r['phone']} : ⚠️ {r['error'][:46]}")
+        else:
+            val = r.get("after") or ""
+            fp.remember_previous(acc["id"], val)
+            rows_txt.append(f"• {r['phone']} : {fp.state_label(val)}")
+    text = card("🫥 HIDE SENDER ON FORWARD", [
+        "Rubika's own privacy switch:",
+        f"  {fp.KEY} = {fp.HIDDEN}  hides the sender",
+        f"  {fp.KEY} = {fp.VISIBLE}  is the default",
+        LINE,
+        *(rows_txt or ["No accounts yet."]),
+        LINE,
+        "⚠️ This removes the LINK back to the sender. Whether Rubika also",
+        "drops the \"Forwarded from\" line is unconfirmed — send one test",
+        "message and look at it on the receiving side before trusting it.",
+        "Nothing about how sends work is changed; this is reversible.",
+    ])
+    await safe_edit(event, text, buttons=[
+        [Button.inline("🫥 Hide on ALL accounts", b"fwdpriv_hide")],
+        [Button.inline("👁 Restore (show sender) on ALL", b"fwdpriv_show")],
+        [Button.inline("♻️ Refresh", b"fwdpriv")],
+        [Button.inline("🔙 Back", b"sec_settings")],
+    ])
+
+
+@bot.on(events.CallbackQuery(pattern=b"fwdpriv_(hide|show)"))
+async def fwdpriv_apply_cb(event):
+    if not is_owner(event):
+        return
+    hidden = event.pattern_match.group(1).decode() == "hide"
+    import forward_privacy as fp
+    await safe_edit(event, "⏳ Applying and verifying on every account …")
+    done = 0
+    failed = 0
+    rows_txt = []
+    for acc in db.list_accounts():
+        r = await _fwdpriv_on_account(acc, hidden)
+        if r.get("ok"):
+            done += 1
+            rows_txt.append(f"• {r['phone']} : {r.get('before') or '?'}"
+                            f" → {r.get('after')} ✅")
+        else:
+            failed += 1
+            rows_txt.append(f"• {r['phone']} : ❌ {(r.get('error') or '?')[:44]}")
+    head = "🫥 HIDE SENDER — APPLIED" if hidden else "👁 SHOW SENDER — RESTORED"
+    body = [
+        f"✅ Changed : {done}",
+        f"❌ Failed  : {failed}",
+        LINE,
+        *rows_txt,
+        LINE,
+        f"🕒 {now()}",
+    ]
+    if hidden and done:
+        body.insert(2, "➡️ Now send ONE test message and check the receiving"
+                       " side before relying on it.")
+    try:
+        await log(card(head, body))
+    except Exception:  # noqa: BLE001
+        pass
+    await safe_edit(event, card(head, body), buttons=[
+        [Button.inline("♻️ Re-read current state", b"fwdpriv")],
+        [Button.inline("🔙 Back", b"sec_settings")],
+    ])
+
+
 @bot.on(events.CallbackQuery(data=b"sec_settings"))
 async def section_settings_cb(event):
     if not is_owner(event):
@@ -508,6 +588,7 @@ async def section_settings_cb(event):
          Button.inline("⚙️ Settings", b"settings")],
         [Button.inline("🛠 Workers", b"workers"),
          Button.inline("💾 Backup", b"backup")],
+        [Button.inline("🫥 Hide Sender on Forward", b"fwdpriv")],
     ]
     portal_row = [Button.inline("🌐 Portal", b"portal_panel")]
     if is_real_owner(event):
@@ -5753,6 +5834,50 @@ async def health_engine_loop():
             await run_health_engine()
         except Exception as e:  # noqa: BLE001
             print(f"[health_engine] {e}")
+
+
+async def _fwdpriv_on_account(acc: dict, hidden: bool = None) -> dict:
+    """Read (hidden=None) or set the forward-sender privacy of ONE account.
+
+    Runs where the session lives: locally through account_conn, or on the
+    worker that owns the account. Returns the dict from
+    forward_privacy.apply()/read() plus a `phone` key.
+    """
+    import forward_privacy as fp
+    phone = acc["phone"]
+    w = worker.worker_for_account(acc)
+    out = {"phone": phone, "ok": False, "before": "", "want": "",
+           "after": "", "error": ""}
+
+    if w and not worker.is_local(w):
+        try:
+            res = await worker.api_call(w, "POST", "/fwdprivacy", {
+                "phone": phone,
+                "hidden": None if hidden is None else bool(hidden),
+            }, timeout=90) or {}
+            out.update({k: res.get(k, out[k]) for k in out if k != "phone"})
+            if not res:
+                out["error"] = "empty worker reply"
+            elif res.get("error") == "unknown route":
+                out["error"] = "worker needs update (Workers → Update All)"
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"worker: {type(e).__name__}: {str(e)[:110]}"
+        return out
+
+    # local account: one short call on its own warm connection
+    try:
+        if hidden is None:
+            r = await account_conn.call(phone, fp.read, timeout=60)
+            out.update({"ok": True, "after": r.get("value", ""),
+                        "before": r.get("value", "")})
+        else:
+            r = await account_conn.call(phone, fp.apply, bool(hidden), timeout=90)
+            out.update(r)
+    except account_conn.InvalidAuthError:
+        out["error"] = "session invalid"
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {str(e)[:110]}"
+    return out
 
 
 async def _quarantine_dead_account(botmod, observer, acc: dict, w) -> bool:
