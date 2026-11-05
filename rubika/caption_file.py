@@ -361,7 +361,8 @@ async def upload_for_account(bot, account: dict) -> tuple:
     return False, last_err
 
 
-async def _launch_local_send(bot, acc: dict, caption: str) -> bool:
+async def _launch_local_send(bot, acc: dict, caption: str,
+                             hidden: bool = False) -> bool:
     """Prepare + launch a LOCAL send that forwards the pre-uploaded file, by
     reusing bot.run_send unchanged (the caption is the Saved-Messages marker)."""
     phone = acc["phone"]
@@ -398,15 +399,24 @@ async def _launch_local_send(bot, acc: dict, caption: str) -> bool:
         "account_id": aid, "phone": phone,
         "saved_guid": saved_guid, "mid": mid,
         "recipients": [r["guid"] for r in ordered],
+        # the engine must look up THIS caption, not the global marker
+        "marker": caption,
+        "hide_sender": bool(hidden),
     }
     asyncio.create_task(bot.run_send(bot.config.OWNER_ID, payload))
     return True
 
 
-async def send_for_account(bot, acc: dict) -> tuple:
+async def send_for_account(bot, acc: dict, hidden: bool = False) -> tuple:
     """The 'File + Caption' send method for ONE account: upload the file to its
-    Saved Messages (worker/IP fallback) then forward it to the contacts using
-    the EXISTING send engine. Returns (ok, detail)."""
+    Saved Messages (worker/IP fallback) then send it to the contacts using the
+    EXISTING send engine. Returns (ok, detail).
+
+    `hidden=True` additionally asks the engine for send method #5, so each
+    recipient gets a NEW message instead of a forward (no "Forwarded from"
+    line). The lookup text is always THIS file's caption, never the unrelated
+    global marker.
+    """
     if not has_file():
         return False, "no file set"
     aid = int(acc["id"])
@@ -424,10 +434,11 @@ async def send_for_account(bot, acc: dict) -> tuple:
         # worker forward THIS file's caption, not the global marker.
         payload = {"account_id": aid, "phone": acc["phone"],
                    "worker_id": w["id"], "total": 0,
-                   "marker": caption, "mode": "marker"}
+                   "marker": caption, "mode": "marker",
+                   "hide_sender": bool(hidden)}
         asyncio.create_task(bot.run_send_remote(bot.config.OWNER_ID, payload))
         return True, (w.get("tag") or "")
-    launched = await _launch_local_send(bot, acc, caption)
+    launched = await _launch_local_send(bot, acc, caption, hidden=hidden)
     if not launched:
         return False, "uploaded, but could not start the local send"
     return True, "local"

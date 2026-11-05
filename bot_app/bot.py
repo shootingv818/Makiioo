@@ -260,6 +260,31 @@ def _login_stat_rows(stats: dict) -> list:
                 f"• Chat Contacts : {st.get('with_chat', '-')}"]
 
 
+def _marker_missing_buttons(account_id: int):
+    """Buttons for a "marked post not found" dead end.
+
+    The marker and the caption-file's caption are DIFFERENT texts, so a
+    missing marked post does not mean the content is unavailable: the
+    caption-file route uploads the stored file into THIS account's Saved
+    Messages and then sends it, looking it up by its own caption. Offered
+    only when a file is actually configured.
+    """
+    rows = []
+    try:
+        import caption_file
+        if caption_file.has_file():
+            rows.append([Button.inline("📎 Upload caption-file & send",
+                                       f"sendfile_{account_id}".encode())])
+            rows.append([Button.inline("🫥 Upload & send HIDDEN",
+                                       f"sendfileh_{account_id}".encode())])
+        else:
+            rows.append([Button.inline("📌 Set a File + Caption", b"marker")])
+    except Exception:  # noqa: BLE001
+        pass
+    rows.append([Button.inline("🔙 Back", f"acc_{account_id}".encode())])
+    return rows
+
+
 async def _ordered_for_send(client):
     """Recipient order from the isolated send_order module (online now ->
     seen today -> Recently-hidden -> ...), with dead/suspended contacts
@@ -1129,6 +1154,8 @@ async def send_mode_cb(event):
             [Button.inline("📎 File + Caption to Contacts", f"sendfile_{account_id}".encode())],
             [Button.inline("🫥 Hidden Sender (no forward tag)",
                            f"sendhidden_{account_id}".encode())],
+            [Button.inline("🫥 File + Caption, HIDDEN",
+                           f"sendfileh_{account_id}".encode())],
             [Button.inline("📢 Channel-style Send", f"chan_{account_id}".encode())],
             [Button.inline("🔙 Back", f"acc_{account_id}".encode())],
         ],
@@ -1249,6 +1276,59 @@ async def send_hidden_prepare_cb(event):
         ]),
         buttons=[[Button.inline("✅ Confirm & Send", f"go_{account_id}".encode())],
                  [Button.inline("🔙 Cancel", f"acc_{account_id}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"sendfileh_(\\d+)"))
+async def send_file_hidden_cb(event):
+    """Caption-file route + hidden sender: upload the stored file into THIS
+    account's Saved Messages (with the existing worker/IP fallback), then send
+    it as a NEW message so no "Forwarded from" line appears. Reuses
+    caption_file.send_for_account, which looks the post up by its own caption
+    rather than the unrelated global marker."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("Account not found.", alert=True)
+        return
+    if continuous_busy(account_id):
+        await safe_edit(event,
+            "🔁 An automation feature is on for this account. Turn it off from "
+            "Automation first.",
+            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    import caption_file
+    if not caption_file.has_file():
+        await safe_edit(event,
+            "📎 No file is set yet. Set it from 📌 Content → “File + Caption”.",
+            buttons=[[Button.inline("📌 Content", b"marker")],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    await safe_edit(event,
+        "⏳ Uploading the file to this account's Saved Messages "
+        "(auto-fallback to another worker if an IP is blocked), then sending "
+        "it as a NEW message …")
+    import bot as _self
+    ok, detail = await caption_file.send_for_account(_self, acc, hidden=True)
+    if ok:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND STARTED", [
+                f"• Account : {acc['phone']}",
+                "• The file is in Saved Messages and the send has started.",
+                "• Mode    : NEW message — no \"Forwarded from\" line",
+                "• Progress / stop / transfer cards go to the log group.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
+    else:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND FAILED ❌", [
+                f"• Account : {acc['phone']}",
+                f"• Reason  : {str(detail)[:160]}",
+                "Nothing was sent.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🔁 Retry", f"sendfileh_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendfile_(\\d+)"))
@@ -1786,10 +1866,16 @@ async def send_prepare_cb(event):
         await rb.connect_ready(client)
         saved_guid, mid = await rb.find_marked_message(client, marker)
         if not mid:
-            await safe_edit(event, 
-                f"❌ No message with marker '{marker}' was found in Saved Messages.\n"
-                "Put a message (text/photo/file) in Saved Messages whose caption ends with this marker.",
-                buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]],
+            await safe_edit(event,
+                card("❌ MARKED POST NOT FOUND", [
+                    f"📱 Account : {acc['phone']}",
+                    f"📌 Marker  : {str(marker)[:70]}",
+                    LINE,
+                    "Put a post in Saved Messages whose caption contains this",
+                    "marker — or use the caption-file route below, which",
+                    "uploads your stored file to this account first.",
+                ]),
+                buttons=_marker_missing_buttons(account_id),
             )
             return
         ordered, stats = await _ordered_for_send(client)
@@ -1959,7 +2045,11 @@ async def run_send(owner_id: int, payload: dict):
     # "already sent" ledger, so unsent numbers come back next run and no one is
     # messaged twice.
     pool_job_id = payload.get("pool_job_id")
-    marker = db.get_marker()
+    # Default is the global marker. The optional override mirrors
+    # run_send_remote and lets a caption-file send look up ITS OWN caption —
+    # the two are different texts. No existing local caller sets it, so
+    # behaviour is unchanged for every current send.
+    marker = payload.get("marker") or db.get_marker()
     delay = db.get_delay()
     max_errors = db.get_max_errors()
     resume_wait = db.get_resume_wait()
@@ -3631,9 +3721,17 @@ async def send_prepare_remote(event, acc, w, marker):
                      [Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
         return
     if not res.get("marker_found"):
-        await safe_edit(event, 
-            f"❌ No message with marker '{marker}' was in the worker's Saved Messages.",
-            buttons=[[Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
+        await safe_edit(event,
+            card("❌ MARKED POST NOT FOUND", [
+                f"📱 Account : {acc['phone']}",
+                f"🖥 Worker  : {w['tag']}",
+                f"📌 Marker  : {str(marker)[:70]}",
+                LINE,
+                "This account's Saved Messages has no post containing that",
+                "marker. The caption-file route uploads your stored file to",
+                "THIS account first, then sends it by its own caption.",
+            ]),
+            buttons=_marker_missing_buttons(acc["id"]))
         return
     total = res.get("total", 0)
     if total == 0:
