@@ -92,15 +92,21 @@ async def read(client) -> dict:
     return {"value": str(s.get(KEY) or ""), "raw": s}
 
 
-async def apply(client, hidden: bool) -> dict:
-    """Set the switch and VERIFY by reading it back.
+async def apply(client, hidden: bool, recheck_after: float = 2.0) -> dict:
+    """Set the switch and VERIFY by reading it back — TWICE.
 
-    Returns {ok, before, want, after, error}. `ok` is True only when the value
-    read back afterwards is the one we asked for — the write call's own reply
-    is never taken as proof.
+    Returns {ok, before, want, after, settled, error}. `ok` is True only when
+    the value still reads as requested on a SECOND read a couple of seconds
+    later. The immediate read-back is not enough: a server that accepts the
+    write and then reverts it would otherwise be reported as success, which is
+    exactly the failure mode observed on a live account (an apply reported
+    Everybody → Nobody, and a later panel read showed Everybody again).
     """
+    import asyncio
+
     want = HIDDEN if hidden else VISIBLE
-    out = {"ok": False, "before": "", "want": want, "after": "", "error": ""}
+    out = {"ok": False, "before": "", "want": want, "after": "",
+           "settled": None, "error": ""}
     try:
         out["before"] = (await read(client))["value"]
     except Exception as e:  # noqa: BLE001
@@ -119,11 +125,27 @@ async def apply(client, hidden: bool) -> dict:
     except Exception as e:  # noqa: BLE001
         out["error"] = out["error"] or f"verify failed: {type(e).__name__}"
         return out
-    out["ok"] = (out["after"] == want)
-    if out["ok"] and not out["error"]:
-        out["error"] = ""
-    elif not out["ok"] and not out["error"]:
-        out["error"] = f"setting still reads {out['after'] or '?'}"
+    if out["after"] != want:
+        out["ok"] = False
+        out["error"] = out["error"] or f"setting still reads {out['after'] or '?'}"
+        return out
+
+    # Took effect on the first read — now make sure it PERSISTS.
+    if recheck_after and recheck_after > 0:
+        try:
+            await asyncio.sleep(recheck_after)
+            out["settled"] = (await read(client))["value"]
+        except Exception as e:  # noqa: BLE001
+            out["error"] = f"recheck failed: {type(e).__name__}"
+            out["ok"] = False
+            return out
+        if out["settled"] != want:
+            out["ok"] = False
+            out["error"] = (f"did NOT stick — reverted to "
+                            f"{out['settled'] or '?'} after {recheck_after:g}s")
+            return out
+    out["ok"] = True
+    out["error"] = ""
     return out
 
 

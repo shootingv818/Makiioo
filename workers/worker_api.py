@@ -163,6 +163,16 @@ async def _apply_profile(client, first, last, bio):
     return True
 
 
+def _send_one(client, job, saved_guid, guid, mid):
+    """Forward the marked post, or — for send method #5 — send it as a NEW
+    message so Rubika adds no "Forwarded from" line. Returns a coroutine."""
+    src = (job or {}).get("hide_src")
+    if src:
+        import copy_send
+        return copy_send.send_copy(client, guid, src)
+    return rb.forward_message(client, saved_guid, guid, mid)
+
+
 async def _ordered_for_send(client):
     """Recipient order from the isolated send_order module (online now ->
     seen today -> Recently-hidden -> ...), with dead/suspended contacts
@@ -213,6 +223,8 @@ def _build_app():
         text: str = ""           # body for 'text' mode (no forward)
         order_by_presence: bool = False  # POOL BRAIN: order explicit recipients
         #                                  online -> last-seen (never chat-first)
+        hide_sender: bool = False
+
 
     class AutomationIn(BaseModel):
         phone: str
@@ -301,6 +313,9 @@ def _build_app():
         text: str = ""
         text2: str = ""          # step 5: optional Rubika second text (always text)
         order: bool = False       # reorder guids: chat-first -> online -> last-seen
+        # hidden-sender: send a NEW message instead of forwarding, so Rubika
+        # adds no "Forwarded from" line. Additive; default keeps forwarding.
+        hide_sender: bool = False
 
     class LinkdooniIn(BaseModel):
         phone: str
@@ -607,10 +622,26 @@ def _build_app():
             ordered, _stats = await _ordered_for_send(client)
             recipients = [r["guid"] for r in ordered]
 
+        # send method #5 (hidden sender): read the marked post once so each
+        # recipient can get a NEW message instead of a forward. Only when the
+        # master asks for it; on any failure we leave it None and forward.
+        hide_src = None
+        if getattr(body, "hide_sender", False) and mode != "text":
+            try:
+                import copy_send
+                hide_src, _hr = await copy_send.read_source(client, body.marker)
+                if hide_src is None:
+                    _qlog(_wcard("🫥 HIDDEN SENDER — falling back to forward",
+                                 [f"📱 {body.phone}", f"⚠️ {_hr}"]))
+            except Exception as e:  # noqa: BLE001
+                hide_src = None
+                print(f"[hidden sender] {e!r}")
+
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
                "done": False, "stopped": False, "reason": None,
-               "retry_count": 0, "state": "sending", "sent_guids": []}
+               "retry_count": 0, "state": "sending", "sent_guids": [],
+               "hide_src": hide_src}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
         # return the EXACT ordered guids so the master can mirror the list and
@@ -858,7 +889,7 @@ def _build_app():
                                         bool(body.hidden), timeout=90)
             return {"ok": bool(r.get("ok")), "before": r.get("before", ""),
                     "want": r.get("want", ""), "after": r.get("after", ""),
-                    "error": r.get("error", "")}
+                    "settled": r.get("settled"), "error": r.get("error", "")}
         except account_conn.InvalidAuthError:
             return {"ok": False, "error": "session invalid"}
         except Exception as e:  # noqa: BLE001
@@ -1616,7 +1647,7 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         )
                     else:
                         await asyncio.wait_for(
-                            rb.forward_message(client, saved_guid, guid, mid),
+                            _send_one(client, job, saved_guid, guid, mid),
                             timeout=body.send_timeout,
                         )
                     # step 5: optional second text (always text) to the SAME
