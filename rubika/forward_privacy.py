@@ -85,8 +85,24 @@ def _settings_of(resp) -> dict:
     return d
 
 
+def _require_connected(client) -> None:
+    """Fail with a readable reason when the client is not actually connected.
+
+    rubpy's generic builder() starts with `if not self.connection.api_url`, so
+    an unconnected client raises
+    "AttributeError: 'NoneType' object has no attribute 'api_url'" — a rubpy
+    internal that tells the owner nothing. On a worker this happens when the
+    account's session file is missing, so say that instead.
+    """
+    if getattr(client, "connection", None) is None:
+        raise RuntimeError(
+            "session is not connected here — re-import it with "
+            "'Distribute Session to Workers'")
+
+
 async def read(client) -> dict:
     """Return {value, raw}. `value` is "" when the key is absent."""
+    _require_connected(client)
     resp = await client.builder(name="getPrivacySetting", input={}, dict=True)
     s = _settings_of(resp)
     return {"value": str(s.get(KEY) or ""), "raw": s}
@@ -113,6 +129,7 @@ async def apply(client, hidden: bool, recheck_after: float = 2.0) -> dict:
         out["error"] = f"read failed: {type(e).__name__}: {str(e)[:120]}"
         return out
     try:
+        _require_connected(client)
         await client.builder(name="setSetting", input={
             "settings": {KEY: want},
             "update_parameters": [KEY],

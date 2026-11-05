@@ -891,6 +891,21 @@ def _build_app():
         import forward_privacy as fp
         action = (body.action or "read").strip().lower()
         try:
+            # Positive precondition, the same check /account/verify uses: if we
+            # cannot read the account's own identity, its session is not usable
+            # on this worker and any privacy call would only surface a rubpy
+            # internal ("'NoneType' object has no attribute 'api_url'").
+            try:
+                _guid = await account_conn.call(body.phone, rb.get_self_guid,
+                                                timeout=30)
+            except account_conn.InvalidAuthError:
+                raise
+            except Exception:  # noqa: BLE001
+                _guid = None
+            if not _guid:
+                return {"ok": False, "error": "session not usable on this "
+                                              "worker — use 'Distribute "
+                                              "Session to Workers'"}
             if action == "read":
                 r = await account_conn.call(body.phone, fp.read, timeout=60)
                 val = r.get("value", "")
