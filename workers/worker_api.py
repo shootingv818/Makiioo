@@ -76,7 +76,21 @@ def _worker_code_version() -> str:
     """Short git revision of this worker's code (YoudonoaAx UPDATE, step 6),
     reported via /health so the master can show a versions table. Best-effort."""
     import os
+    # The REPO ROOT, not this module's directory. worker_api.py used to sit at
+    # the root, so dirname(__file__) was the root and `.git` was found; after
+    # the sub-package refactor it is <root>/workers/, so the old code looked for
+    # /app/workers/.git, never found it, and reported "—" — which made the
+    # update's version-equality gate fail every time. Walk up to the real root.
     base = os.path.dirname(os.path.abspath(__file__))
+    _probe = base
+    for _ in range(4):
+        if os.path.isdir(os.path.join(_probe, ".git")):
+            base = _probe
+            break
+        _parent = os.path.dirname(_probe)
+        if _parent == _probe:
+            break
+        _probe = _parent
     # 1) the git binary (works on the master/host where git is installed)
     try:
         import subprocess
@@ -149,6 +163,29 @@ async def _apply_profile(client, first, last, bio):
     return True
 
 
+def _send_one(client, job, saved_guid, guid, mid):
+    """Forward the marked post, or — for send method #5 — send it as a NEW
+    message so Rubika adds no "Forwarded from" line. Returns a coroutine."""
+    src = (job or {}).get("hide_src")
+    if src:
+        import copy_send
+        return copy_send.send_copy(client, guid, src)
+    return rb.forward_message(client, saved_guid, guid, mid)
+
+
+async def _ordered_for_send(client):
+    """Recipient order from the isolated send_order module (online now ->
+    seen today -> Recently-hidden -> ...), with dead/suspended contacts
+    dropped. GUARDED: on any failure it falls back to the base
+    rb.get_ordered_recipients so a send is never blocked by this."""
+    try:
+        import send_order
+        return await send_order.ordered_recipients(client)
+    except Exception as e:  # noqa: BLE001
+        print(f"[send_order fallback] {e!r}")
+        return await rb.get_ordered_recipients(client)
+
+
 def _build_app():
     app = FastAPI(title="V2Rubby Worker", docs_url=None, redoc_url=None)
 
@@ -186,6 +223,8 @@ def _build_app():
         text: str = ""           # body for 'text' mode (no forward)
         order_by_presence: bool = False  # POOL BRAIN: order explicit recipients
         #                                  online -> last-seen (never chat-first)
+        hide_sender: bool = False
+
 
     class AutomationIn(BaseModel):
         phone: str
@@ -274,6 +313,9 @@ def _build_app():
         text: str = ""
         text2: str = ""          # step 5: optional Rubika second text (always text)
         order: bool = False       # reorder guids: chat-first -> online -> last-seen
+        # hidden-sender: send a NEW message instead of forwarding, so Rubika
+        # adds no "Forwarded from" line. Additive; default keeps forwarding.
+        hide_sender: bool = False
 
     class LinkdooniIn(BaseModel):
         phone: str
@@ -287,6 +329,16 @@ def _build_app():
         # Rubika login code. `ttl` is a hard self-close window in seconds.
         phone: str
         ttl: int = 300
+
+
+    class CapfileIn(BaseModel):
+        # Caption-file auto-upload (isolated module `caption_file.py`): upload a
+        # base64-encoded file into this account's Saved Messages with a caption.
+        # The session may be imported write-only first (code-free IP fallback).
+        phone: str
+        caption: str = ""
+        file_b64: str = ""
+        filename: str = "file"
 
     class LinkdooniExtractIn(BaseModel):
         phone: str
@@ -397,10 +449,17 @@ def _build_app():
             me = await client.get_me()
             guid = rb._guid_of(me) or "-"
             name = rb._name_of(me)
-            _ordered, stats = await rb.get_ordered_recipients(client)
+            _ordered, stats = await _ordered_for_send(client)
             return {"ok": True, "name": name, "guid": str(guid),
                     "contacts": stats["contacts"], "groups": stats["groups"],
                     "with_chat": stats["with_chat"], "phone": ctx["phone"],
+                    # additive send-order counts for the login card; an older
+                    # master simply ignores these keys.
+                    "sendable": stats.get("sendable"),
+                    "excluded": stats.get("excluded"),
+                    "online_now": stats.get("online_now"),
+                    "today_open": stats.get("today_open"),
+                    "recently_hidden": stats.get("recently_hidden"),
                     # v4: portable session values so the master can store the
                     # session and re-import it onto any worker WITHOUT a code.
                     "auth": getattr(client, "auth", None),
@@ -424,13 +483,25 @@ def _build_app():
             # 'text' mode sends a plain message (no forward) -> no marked post
             # is required; we only need the recipient count.
             if (getattr(body, "mode", "marker") or "marker").lower() == "text":
-                ordered, _stats = await rb.get_ordered_recipients(client)
-                return {"ok": True, "marker_found": True, "total": len(ordered)}
+                ordered, _stats = await _ordered_for_send(client)
+                return {"ok": True, "marker_found": True, "total": len(ordered),
+                        "hidden_supported": True}
             saved_guid, mid = await rb.find_marked_message(client, body.marker)
             if not mid:
                 return {"ok": True, "marker_found": False, "total": 0}
-            ordered, _stats = await rb.get_ordered_recipients(client)
-            return {"ok": True, "marker_found": True, "total": len(ordered)}
+            ordered, _stats = await _ordered_for_send(client)
+            return {"ok": True, "marker_found": True, "total": len(ordered),
+                    # capability flag: tells the master this build can send
+                    # method #5 (hidden sender). An older worker omits it, so
+                    # the master can refuse instead of silently forwarding.
+                    "hidden_supported": True}
+        except account_conn.InvalidAuthError:
+            return {"ok": False, "marker_found": False, "total": 0,
+                    "error": "session invalid on this worker — re-login or "
+                             "re-import the session"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "marker_found": False, "total": 0,
+                    "error": f"{type(e).__name__}: {str(e)[:150]}"}
         finally:
             try:
                 await client.disconnect()
@@ -550,19 +621,45 @@ def _build_app():
             # sends leave order_by_presence False to keep the frozen order.
             if getattr(body, "order_by_presence", False):
                 try:
-                    rank = await rb.presence_rank(client)
-                    recipients = sorted(
-                        recipients, key=lambda g: rank.get(g, 10 ** 9))
+                    import send_order
+                    recipients = await send_order.rank_guids(client, recipients)
                 except Exception:  # noqa: BLE001
                     pass
         else:
-            ordered, _stats = await rb.get_ordered_recipients(client)
+            ordered, _stats = await _ordered_for_send(client)
             recipients = [r["guid"] for r in ordered]
+
+        # send method #5 (hidden sender): read the marked post once so each
+        # recipient can get a NEW message instead of a forward. Only when the
+        # master asks for it; if the source cannot be read the run is REFUSED
+        # (never downgraded to a forward — see below).
+        hide_src = None
+        if getattr(body, "hide_sender", False) and send_mode != "text":
+            _hr = "unknown"
+            try:
+                import copy_send
+                hide_src, _hr = await copy_send.read_source(client, body.marker)
+            except Exception as e:  # noqa: BLE001
+                hide_src = None
+                _hr = f"{type(e).__name__}: {str(e)[:90]}"
+            if hide_src is None:
+                # REFUSE. Falling back to a forward here would stamp the
+                # owner's name on every message of a run that explicitly
+                # asked for no forward tag.
+                _qlog(_wcard("🫥 HIDDEN SENDER — refused, nothing sent",
+                             [f"📱 {body.phone}", f"⚠️ {_hr}"]))
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return {"ok": False, "marker_found": True, "total": 0,
+                        "error": f"hidden send not possible: {_hr}"}
 
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
                "done": False, "stopped": False, "reason": None,
-               "retry_count": 0, "state": "sending", "sent_guids": []}
+               "retry_count": 0, "state": "sending", "sent_guids": [],
+               "hide_src": hide_src}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
         # return the EXACT ordered guids so the master can mirror the list and
@@ -796,6 +893,14 @@ def _build_app():
         import login_code
         return login_code.worker_drain(phone)
 
+    # ---- Caption-file upload (additive; served by isolated caption_file.py) --
+    @app.post("/capfile/upload")
+    async def capfile_upload(body: CapfileIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import caption_file
+        return await caption_file.worker_upload(
+            body.phone, body.file_b64, body.caption, body.filename)
+
     @app.post("/profile/update")
     async def profile_update(body: ProfileIn, authorization: str = Header(None)):
         _auth(authorization)
@@ -808,7 +913,21 @@ def _build_app():
     async def account_verify(body: PhoneIn, authorization: str = Header(None)):
         _auth(authorization)
         dead = await account_conn.verify_session_dead(body.phone)
-        return {"ok": True, "dead": bool(dead)}
+        # `dead` is deliberately narrow: verify_session_dead only reports True
+        # for an explicit Rubika auth signal, so a MISSING or unreadable session
+        # comes back as "not dead" and the master used to call that healthy.
+        # `alive` is the positive counter-check — we could actually read the
+        # account. Additive: an older master just ignores it.
+        alive = None
+        if not dead:
+            alive = False
+            try:
+                guid = await account_conn.call(body.phone, rb.get_self_guid,
+                                               timeout=30)
+                alive = bool(guid)
+            except Exception:  # noqa: BLE001
+                alive = False
+        return {"ok": True, "dead": bool(dead), "alive": alive}
 
     @app.post("/session/import")
     async def session_import(body: SessionImportIn, authorization: str = Header(None)):
@@ -1033,7 +1152,7 @@ def _build_app():
             # order like a normal send (chat-first -> online -> last-seen) when asked
             if getattr(body, "order", False) and guids:
                 try:
-                    ordered, _st = await rb.get_ordered_recipients(client)
+                    ordered, _st = await _ordered_for_send(client)
                     rank = {g: i for i, g in enumerate(ordered)}
                     guids = sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
                 except Exception:  # noqa: BLE001
@@ -1526,7 +1645,7 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         )
                     else:
                         await asyncio.wait_for(
-                            rb.forward_message(client, saved_guid, guid, mid),
+                            _send_one(client, job, saved_guid, guid, mid),
                             timeout=body.send_timeout,
                         )
                     # step 5: optional second text (always text) to the SAME
