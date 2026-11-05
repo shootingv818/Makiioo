@@ -330,13 +330,6 @@ def _build_app():
         phone: str
         ttl: int = 300
 
-    class FwdPrivacyIn(BaseModel):
-        # Forward-sender privacy (isolated module `forward_privacy.py`).
-        # A STRING action, like the project's other `mode:` fields: pydantic 2
-        # (pinned at 2.6.4) rejects an explicit None for a `bool` field, which
-        # is what made every call return 422.
-        phone: str
-        action: str = "read"        # "read" | "hide" | "show"
 
     class CapfileIn(BaseModel):
         # Caption-file auto-upload (isolated module `caption_file.py`): upload a
@@ -491,12 +484,17 @@ def _build_app():
             # is required; we only need the recipient count.
             if (getattr(body, "mode", "marker") or "marker").lower() == "text":
                 ordered, _stats = await _ordered_for_send(client)
-                return {"ok": True, "marker_found": True, "total": len(ordered)}
+                return {"ok": True, "marker_found": True, "total": len(ordered),
+                        "hidden_supported": True}
             saved_guid, mid = await rb.find_marked_message(client, body.marker)
             if not mid:
                 return {"ok": True, "marker_found": False, "total": 0}
             ordered, _stats = await _ordered_for_send(client)
-            return {"ok": True, "marker_found": True, "total": len(ordered)}
+            return {"ok": True, "marker_found": True, "total": len(ordered),
+                    # capability flag: tells the master this build can send
+                    # method #5 (hidden sender). An older worker omits it, so
+                    # the master can refuse instead of silently forwarding.
+                    "hidden_supported": True}
         except account_conn.InvalidAuthError:
             return {"ok": False, "marker_found": False, "total": 0,
                     "error": "session invalid on this worker — re-login or "
@@ -883,44 +881,6 @@ def _build_app():
         _auth(authorization)
         import login_code
         return login_code.worker_drain(phone)
-
-    # ---- Forward-sender privacy (additive; isolated forward_privacy.py) -----
-    @app.post("/fwdprivacy")
-    async def fwdprivacy(body: FwdPrivacyIn, authorization: str = Header(None)):
-        _auth(authorization)
-        import forward_privacy as fp
-        action = (body.action or "read").strip().lower()
-        try:
-            # Positive precondition, the same check /account/verify uses: if we
-            # cannot read the account's own identity, its session is not usable
-            # on this worker and any privacy call would only surface a rubpy
-            # internal ("'NoneType' object has no attribute 'api_url'").
-            try:
-                _guid = await account_conn.call(body.phone, rb.get_self_guid,
-                                                timeout=30)
-            except account_conn.InvalidAuthError:
-                raise
-            except Exception:  # noqa: BLE001
-                _guid = None
-            if not _guid:
-                return {"ok": False, "error": "session not usable on this "
-                                              "worker — use 'Distribute "
-                                              "Session to Workers'"}
-            if action == "read":
-                r = await account_conn.call(body.phone, fp.read, timeout=60)
-                val = r.get("value", "")
-                return {"ok": True, "before": val, "after": val, "error": ""}
-            if action not in ("hide", "show"):
-                return {"ok": False, "error": f"unknown action {action!r}"}
-            r = await account_conn.call(body.phone, fp.apply,
-                                        action == "hide", timeout=90)
-            return {"ok": bool(r.get("ok")), "before": r.get("before", ""),
-                    "want": r.get("want", ""), "after": r.get("after", ""),
-                    "settled": r.get("settled"), "error": r.get("error", "")}
-        except account_conn.InvalidAuthError:
-            return {"ok": False, "error": "session invalid"}
-        except Exception as e:  # noqa: BLE001
-            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:110]}"}
 
     # ---- Caption-file upload (additive; served by isolated caption_file.py) --
     @app.post("/capfile/upload")
