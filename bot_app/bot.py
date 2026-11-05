@@ -2913,7 +2913,7 @@ timeout 30 git remote set-url origin {repo}
 timeout 120 git fetch --depth 1 origin {branch}
 timeout 60 git checkout -B {branch} FETCH_HEAD
 TARGET_VERSION="$(timeout 10 git rev-parse --short HEAD)"
-CURRENT_VERSION="$(timeout 20 docker exec "$CONTAINER" python -c 'import worker_api; print(worker_api._worker_code_version())' 2>/dev/null || true)"
+CURRENT_VERSION="$(timeout 20 docker exec "$CONTAINER" python -c 'import sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; print(worker_api._worker_code_version())' 2>/dev/null || true)"
 if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
     if timeout 30 docker exec "$CONTAINER" python -c 'import urllib.request; response=urllib.request.urlopen("http://127.0.0.1:{api_port}/ping", timeout=10); code=response.status; response.close(); raise SystemExit(0 if code == 200 else 1)'; then
         echo "ALREADY_CURRENT version=$TARGET_VERSION"
@@ -2947,7 +2947,7 @@ else
 fi
 
 echo STAGE=test-image
-timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,worker_api; value=worker_api._worker_code_version(); print(value); raise SystemExit(0 if value == os.environ["EXPECTED_VERSION"] else 1)'
+timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; value=worker_api._worker_code_version(); print(value); raise SystemExit(0 if value == os.environ["EXPECTED_VERSION"] else 1)'
 
 rollback_container() {{
     timeout 60 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
