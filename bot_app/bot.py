@@ -2813,7 +2813,10 @@ def master_code_version() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            # repo ROOT: this module now lives in bot_app/, and running git
+            # from a subdirectory still works, but be explicit so a future
+            # move cannot silently turn the version into "—".
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             capture_output=True, text=True, timeout=10)
         rev = (out.stdout or "").strip()
         return rev or "—"

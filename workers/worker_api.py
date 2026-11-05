@@ -76,7 +76,21 @@ def _worker_code_version() -> str:
     """Short git revision of this worker's code (YoudonoaAx UPDATE, step 6),
     reported via /health so the master can show a versions table. Best-effort."""
     import os
+    # The REPO ROOT, not this module's directory. worker_api.py used to sit at
+    # the root, so dirname(__file__) was the root and `.git` was found; after
+    # the sub-package refactor it is <root>/workers/, so the old code looked for
+    # /app/workers/.git, never found it, and reported "—" — which made the
+    # update's version-equality gate fail every time. Walk up to the real root.
     base = os.path.dirname(os.path.abspath(__file__))
+    _probe = base
+    for _ in range(4):
+        if os.path.isdir(os.path.join(_probe, ".git")):
+            base = _probe
+            break
+        _parent = os.path.dirname(_probe)
+        if _parent == _probe:
+            break
+        _probe = _parent
     # 1) the git binary (works on the master/host where git is installed)
     try:
         import subprocess
