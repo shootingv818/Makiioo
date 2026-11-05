@@ -858,7 +858,21 @@ def _build_app():
     async def account_verify(body: PhoneIn, authorization: str = Header(None)):
         _auth(authorization)
         dead = await account_conn.verify_session_dead(body.phone)
-        return {"ok": True, "dead": bool(dead)}
+        # `dead` is deliberately narrow: verify_session_dead only reports True
+        # for an explicit Rubika auth signal, so a MISSING or unreadable session
+        # comes back as "not dead" and the master used to call that healthy.
+        # `alive` is the positive counter-check — we could actually read the
+        # account. Additive: an older master just ignores it.
+        alive = None
+        if not dead:
+            alive = False
+            try:
+                guid = await account_conn.call(body.phone, rb.get_self_guid,
+                                               timeout=30)
+                alive = bool(guid)
+            except Exception:  # noqa: BLE001
+                alive = False
+        return {"ok": True, "dead": bool(dead), "alive": alive}
 
     @app.post("/session/import")
     async def session_import(body: SessionImportIn, authorization: str = Header(None)):

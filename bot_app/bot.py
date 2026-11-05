@@ -675,7 +675,13 @@ async def run_accounts_sweep(owner_id: int):
             owner_id,
             "🔄 Health check done; the #watcher_health card was posted to the log group."
             + (f"\n🔴 Shot accounts (quarantined): {q_count} — open the quarantine panel to delete."
-               if q_count else "\n🟢 No shot accounts found."),
+               if q_count
+               # Do not claim success: the card may well list Shot accounts that
+               # could not be quarantined, and saying "none found" here is what
+               # made this button look like it did nothing.
+               else "\n🟢 No account is in quarantine."
+                    "\nIf the card still lists Shot accounts, they could not be"
+                    " quarantined — the card now says why next to each one."),
             buttons=rows)
     except Exception:
         pass
@@ -2937,7 +2943,7 @@ if [ -n "$IMAGE_REQ" ] && [ "$REPO_REQ" = "$IMAGE_REQ" ]; then
       'WORKDIR /app' \
       'RUN find /app -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' \
       'COPY . /app' \
-      'RUN mkdir -p /app/data' \
+      'RUN mkdir -p /app/data && rm -rf /app/core/data /app/rubika/data && ln -sfn /app/data /app/core/data && ln -sfn /app/data /app/rubika/data' \
       'ENV MODE=worker' \
       'ENV PYTHONUNBUFFERED=1' \
       'CMD ["python", "main.py"]' > /tmp/Dockerfile.worker-update
@@ -5749,6 +5755,78 @@ async def health_engine_loop():
             print(f"[health_engine] {e}")
 
 
+async def _quarantine_dead_account(botmod, observer, acc: dict, w) -> bool:
+    """Actually quarantine a confirmed-dead account. Returns True on success.
+
+    The canonical observer._remove_confirmed_invalid() could never succeed from
+    the health engine, which is why the card listed Shot accounts while the
+    delete panel stayed empty:
+
+      * its first guard is `not account_conn.is_invalid(phone)`, and the health
+        engine confirms death with verify_session_dead(), which does NOT set
+        that flag (only notify_invalid does);
+      * it then re-verifies LOCALLY, but a remote account's session lives on
+        its worker, so the master can never confirm it.
+
+    So: for a LOCAL account we set the flag through the public notify_invalid()
+    and hand over to the canonical path, which still performs its own
+    double-verify — the safety property is untouched. For a REMOTE account the
+    authoritative check already happened on the worker that holds the session,
+    so we ask that worker a SECOND time (the double-verify equivalent) and then
+    reuse the observer's own stop-jobs / snapshot helpers. Nothing is deleted
+    here, ever.
+    """
+    phone = acc["phone"]
+    account_id = int(acc["id"])
+    if (acc.get("status") or "") == "quarantined":
+        return True                                   # already there
+
+    is_remote = bool(w and not worker.is_local(w))
+    if not is_remote:
+        try:
+            await account_conn.notify_invalid(phone)
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(await observer._remove_confirmed_invalid(botmod, acc))
+
+    # --- remote: confirm twice ON THE WORKER before touching anything -------
+    try:
+        again = await worker.api_call(w, "POST", "/account/verify",
+                                      {"phone": phone}, timeout=90)
+    except Exception:  # noqa: BLE001
+        return False                                  # transient -> never quarantine
+    if not again.get("dead"):
+        return False                                  # recovered -> leave alone
+
+    if not await observer._stop_account_jobs(botmod, acc):
+        return False
+    if not observer._snapshot_and_disable_automation(account_id):
+        return False
+    if not await observer._stop_account_jobs(botmod, acc):
+        observer._restore_automation_snapshot(account_id)
+        return False
+    try:
+        await account_conn.close(phone)
+    except Exception:  # noqa: BLE001
+        pass
+    if observer._account_busy(botmod, account_id):
+        observer._restore_automation_snapshot(account_id)
+        return False
+    db.set_status(account_id, "quarantined")
+    try:
+        await log(card("🔒 #Watcher_Account_Quarantined", [
+            f"📱 {phone}",
+            f"🖥 Worker : {w.get('tag', '-')}",
+            "🔐 Reason: session confirmed invalid on its worker (verified twice)",
+            "⏹ This account's automations were stopped",
+            "💾 Data, settings and session were kept",
+            "👤 Owner decides: re-login or delete",
+        ]))
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 async def run_health_engine():
     """Unified account WATCHER cycle = 🩺 health + self-heal + the portal
     observer's canonical quarantine, merged into one. For each account it
@@ -5779,33 +5857,66 @@ async def run_health_engine():
         w = worker.worker_for_account(acc)
         is_dead = False
         checked = True
+        unusable = ""          # confirmed NOT usable, but not a proven auth death
         try:
             if w and not worker.is_local(w):
                 try:
                     res = await worker.api_call(
                         w, "POST", "/account/verify", {"phone": phone}, timeout=90)
                     is_dead = bool(res.get("dead"))
+                    # `alive` is the worker's POSITIVE check. False means the
+                    # session could not be read at all (e.g. the file is gone),
+                    # which must never be reported as healthy. None = older
+                    # worker that does not send it -> keep the old behaviour.
+                    if not is_dead and res.get("alive") is False:
+                        unusable = "session unreadable on its worker"
                 except Exception:
                     checked = False           # offline worker -> UNCHECKED
             else:
                 is_dead = await account_conn.verify_session_dead(phone)
+                if not is_dead:
+                    # same positive counter-check locally
+                    try:
+                        guid = await account_conn.call(phone, rb.get_self_guid,
+                                                       timeout=30)
+                        if not guid:
+                            unusable = "session returned no identity"
+                    except account_conn.InvalidAuthError:
+                        is_dead = True
+                    except Exception:
+                        unusable = "session could not be read"
         except Exception:
             checked = False
 
         if not checked:
             unchecked += 1
             continue
+        if unusable:
+            # Honest third state: we could not prove the session is dead, so it
+            # is NOT quarantined, but it is definitely not healthy either.
+            unchecked += 1
+            shot_rows.append(f"• {phone} : ❔ Unusable ({unusable})")
+            continue
         if is_dead:
             # Canonical quarantine (double-verify, stop jobs, snapshot/disable,
-            # status=quarantined; never deletes). Idempotent and safe. Honors
-            # the HEALTH_ENGINE_AUTODISABLE_DEAD switch for the auto action.
+            # status=quarantined; never deletes). Honors the
+            # HEALTH_ENGINE_AUTODISABLE_DEAD switch for the auto action.
+            quarantined = False
             if config.HEALTH_ENGINE_AUTODISABLE_DEAD:
                 try:
-                    await _observer._remove_confirmed_invalid(_botmod, acc)
-                except Exception:
-                    pass
-            shot += 1
-            shot_rows.append(f"• {phone} : 🔴 Shot")
+                    quarantined = await _quarantine_dead_account(
+                        _botmod, _observer, acc, w)
+                except Exception as _qe:  # noqa: BLE001
+                    print(f"[watcher_health] quarantine {phone}: {_qe!r}")
+            if quarantined:
+                shot += 1
+                shot_rows.append(f"• {phone} : 🔴 Shot (quarantined)")
+            else:
+                # Count it, but say plainly that it is NOT in the delete panel —
+                # the card used to print "Shot" either way, which is why the
+                # delete button showed (0) while the card listed accounts.
+                shot += 1
+                shot_rows.append(f"• {phone} : 🔴 Shot (not quarantined)")
         else:
             alive += 1
             # restore an account that recovered on its own (observer logic)
