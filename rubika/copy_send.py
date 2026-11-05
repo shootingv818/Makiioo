@@ -23,10 +23,15 @@ so the send keeps its normal pace.
 
 How it is turned on
 -------------------
-It is SEND METHOD #5, picked per send from an account's 🚀 Send menu
-("🫥 Hidden Sender"). There is no global switch: the behaviour is driven only
-by `hide_sender` in the send payload, so every other method — forward marker,
-plain text, file+caption, channel — is completely unaffected.
+Through exactly ONE send method: "🫥 File + Caption, HIDDEN" in an account's
+🚀 Send menu. That route uploads the owner's stored file into the account's own
+Saved Messages first (`caption_file.send_for_account(hidden=True)`, with the
+existing worker/IP fallback) and then sends it with this module, so the content
+is guaranteed to exist on the sending account before the run starts.
+
+There is no global switch: the behaviour is driven only by `hide_sender` in the
+send payload, so every other method — forward marker, plain text, file+caption,
+channel — is completely unaffected.
 
 Safety
 ------
@@ -40,7 +45,6 @@ Safety
 """
 from __future__ import annotations
 
-import db
 import rubika_client as rb
 
 async def read_marked_full(client, marker: str):

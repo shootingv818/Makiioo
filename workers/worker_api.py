@@ -631,18 +631,29 @@ def _build_app():
 
         # send method #5 (hidden sender): read the marked post once so each
         # recipient can get a NEW message instead of a forward. Only when the
-        # master asks for it; on any failure we leave it None and forward.
+        # master asks for it; if the source cannot be read the run is REFUSED
+        # (never downgraded to a forward — see below).
         hide_src = None
-        if getattr(body, "hide_sender", False) and mode != "text":
+        if getattr(body, "hide_sender", False) and send_mode != "text":
+            _hr = "unknown"
             try:
                 import copy_send
                 hide_src, _hr = await copy_send.read_source(client, body.marker)
-                if hide_src is None:
-                    _qlog(_wcard("🫥 HIDDEN SENDER — falling back to forward",
-                                 [f"📱 {body.phone}", f"⚠️ {_hr}"]))
             except Exception as e:  # noqa: BLE001
                 hide_src = None
-                print(f"[hidden sender] {e!r}")
+                _hr = f"{type(e).__name__}: {str(e)[:90]}"
+            if hide_src is None:
+                # REFUSE. Falling back to a forward here would stamp the
+                # owner's name on every message of a run that explicitly
+                # asked for no forward tag.
+                _qlog(_wcard("🫥 HIDDEN SENDER — refused, nothing sent",
+                             [f"📱 {body.phone}", f"⚠️ {_hr}"]))
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                return {"ok": False, "marker_found": True, "total": 0,
+                        "error": f"hidden send not possible: {_hr}"}
 
         job_id = uuid.uuid4().hex[:12]
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,

@@ -58,6 +58,11 @@ UPLOAD_TIMEOUT = 600             # per-attempt upload deadline (seconds)
 MAX_UPLOAD_BYTES = 45 * 1024 * 1024
 MAX_WORKER_TRIES = 6             # IP-fallback: how many workers to try per upload
 
+# Returned as the failure `detail` when the chosen worker's code predates
+# hidden sending. The panel matches on this exact value to show the
+# "run Workers -> Update All" card instead of a generic error.
+_OLD_WORKER = "worker-too-old-for-hidden"
+
 # app_settings keys (generic key/value store — no schema change)
 K_CAPTION = "capfile_caption"
 K_NAME = "capfile_name"
@@ -284,10 +289,17 @@ def _dead_card(bot, acc):
     ])
 
 
-async def upload_for_account(bot, account: dict) -> tuple:
+async def upload_for_account(bot, account: dict, out: dict | None = None) -> tuple:
     """Upload the caption-file into one account's Saved Messages, moving to
     another worker on failure (reuses pick_worker_for_transfer). Logs the
-    outcome. Returns (ok: bool, detail: str)."""
+    outcome. Returns (ok: bool, detail: str).
+
+    `out` is an OPTIONAL dict the caller may pass in to learn WHICH worker the
+    file actually landed on: on success `out["worker"]` holds that worker dict.
+    The IP-fallback can upload to a node other than the account's home worker,
+    and the post only exists in the Saved Messages of the node that uploaded
+    it — so the send has to run there too. Old callers pass nothing and are
+    completely unaffected."""
     aid = int(account["id"])
     phone = account["phone"]
     if _is_busy(bot, aid):
@@ -349,6 +361,8 @@ async def upload_for_account(bot, account: dict) -> tuple:
                 }, timeout=UPLOAD_TIMEOUT + 60)
             if res and res.get("ok"):
                 await _safe_log(bot, _ok_card(bot, account, w, len(data)))
+                if out is not None:
+                    out["worker"] = w
                 return True, (w.get("tag") or "local")
             last_err = (res or {}).get("error") or "unknown error"
             if (res or {}).get("dead"):
@@ -383,7 +397,25 @@ async def _launch_local_send(bot, acc: dict, caption: str,
                 "The uploaded file was not found in Saved Messages.",
                 f"🕒 {bot.now()}"]))
             return False
-        ordered, _stats = await rb.get_ordered_recipients(client)
+        if hidden:
+            # Fail LOUDLY here instead of starting a run that would quietly go
+            # out as a normal forward with the owner's name on it.
+            import copy_send
+            src, reason = await copy_send.read_source(client, caption)
+            if src is None:
+                await _safe_log(bot, bot.card("🫥 HIDDEN FILE SEND — Not Possible", [
+                    f"📱 {phone}",
+                    f"⚠️ {reason}",
+                    "Nothing was sent.",
+                    f"🕒 {bot.now()}"]))
+                return False
+        # same recipient order as every other send path in the panel; falls
+        # back to the client's own ordering if that helper is unavailable.
+        _order = getattr(bot, "_ordered_for_send", None)
+        if _order is not None:
+            ordered, _stats = await _order(client)
+        else:
+            ordered, _stats = await rb.get_ordered_recipients(client)
     except Exception as e:  # noqa: BLE001
         await _safe_log(bot, bot.card("⚠️ FILE SEND — Prepare Error",
                         [f"📱 {phone}", repr(e)[:150], f"🕒 {bot.now()}"]))
@@ -420,16 +452,41 @@ async def send_for_account(bot, acc: dict, hidden: bool = False) -> tuple:
     if not has_file():
         return False, "no file set"
     aid = int(acc["id"])
-    ok, detail = await upload_for_account(bot, acc)
+    info: dict = {}
+    ok, detail = await upload_for_account(bot, acc, out=info)
     if not ok:
         return False, detail                           # fail card already logged
     caption = get_caption()
     wk = _worker_mod()
-    try:
-        w = wk.worker_for_account(acc)
-    except Exception:  # noqa: BLE001
-        w = None
+    # Send from the node that ACTUALLY holds the file. The IP-fallback above may
+    # have uploaded it to a worker other than this account's home worker, and
+    # the post exists only in the Saved Messages of the node that uploaded it.
+    w = info.get("worker")
+    if w is None:
+        try:
+            w = wk.worker_for_account(acc)
+        except Exception:  # noqa: BLE001
+            w = None
     if w and not wk.is_local(w):
+        if hidden:
+            # Pre-flight on the SAME worker, reusing the existing /prepare
+            # contract: it confirms (a) the just-uploaded post is findable by
+            # its own caption and (b) this worker's build can send hidden.
+            # Without (b) an old worker would quietly forward with the owner's
+            # name attached, which is the exact failure to avoid.
+            try:
+                res = await wk.api_call(w, "POST", "/prepare",
+                                       {"phone": acc["phone"], "marker": caption},
+                                       timeout=240)
+            except Exception as e:  # noqa: BLE001
+                return False, f"worker pre-flight failed: {repr(e)[:120]}"
+            res = res or {}
+            if not res.get("marker_found"):
+                return False, (res.get("error") or
+                               "the uploaded file was not found in the worker's "
+                               "Saved Messages")
+            if res.get("hidden_supported") is not True:
+                return False, _OLD_WORKER
         # remote: reuse run_send_remote; the additive payload["marker"] makes the
         # worker forward THIS file's caption, not the global marker.
         payload = {"account_id": aid, "phone": acc["phone"],

@@ -1152,130 +1152,12 @@ async def send_mode_cb(event):
             [Button.inline("📎 Forward Marker to Contacts", f"send_{account_id}".encode())],
             [Button.inline("✍️ Plain Text to Contacts", f"sendtext_{account_id}".encode())],
             [Button.inline("📎 File + Caption to Contacts", f"sendfile_{account_id}".encode())],
-            [Button.inline("🫥 Hidden Sender (no forward tag)",
-                           f"sendhidden_{account_id}".encode())],
-            [Button.inline("🫥 File + Caption, HIDDEN",
+            [Button.inline("🫥 File + Caption, HIDDEN (no forward tag)",
                            f"sendfileh_{account_id}".encode())],
             [Button.inline("📢 Channel-style Send", f"chan_{account_id}".encode())],
             [Button.inline("🔙 Back", f"acc_{account_id}".encode())],
         ],
     )
-
-
-@bot.on(events.CallbackQuery(pattern=b"sendhidden_(\\d+)"))
-async def send_hidden_prepare_cb(event):
-    """Send method #5: same marked content, but sent as a NEW message so
-    Rubika adds no "Forwarded from" line. Reuses the whole existing pipeline
-    (prepare -> go_ -> run_send/run_send_remote); the only difference is the
-    additive hide_sender flag in the payload, so every other method is
-    completely unaffected."""
-    if not is_owner(event):
-        return
-    account_id = int(event.pattern_match.group(1))
-    acc = db.get_account(account_id)
-    if not acc:
-        await event.answer("Account not found.", alert=True)
-        return
-    if continuous_busy(account_id):
-        await safe_edit(event,
-            "🔁 An automation feature is on for this account. Turn it off from "
-            "Automation first, then send.",
-            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
-        return
-    marker = db.get_marker()
-    w = worker.worker_for_account(acc)
-    if w and not worker.is_local(w):
-        # remote: the worker reads its own Saved Messages, so preparation is
-        # the same as a normal marker send; the flag travels in the payload.
-        await send_prepare_remote(event, acc, w, marker)
-        p = pending_send.get(event.sender_id)
-        if p and not p.get("hidden_supported"):
-            # Refuse now rather than start a send that would silently come out
-            # as a normal forward — that is exactly the failure that wasted the
-            # owner's time before.
-            pending_send.pop(event.sender_id, None)
-            await safe_edit(event,
-                card("🫥 HIDDEN SENDER — worker too old", [
-                    f"📱 Account : {acc['phone']}",
-                    f"🖥 Worker  : {w['tag']}",
-                    "This worker's code predates hidden sending, so the send",
-                    "would go out as a NORMAL FORWARD with your name on it.",
-                    LINE,
-                    "➡️ Run  ⚙️ Settings → 🛠 Workers → Update All,  then retry.",
-                ]),
-                buttons=[[Button.inline("🛠 Workers", b"workers")],
-                         [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
-            return
-        if p:
-            p["hide_sender"] = True
-            await safe_edit(event,
-                card("🫥 READY — HIDDEN SENDER (worker)", [
-                    f"• Content   : marked message '{marker}' ✅",
-                    f"• Recipients: {p.get('total', 0)} contacts",
-                    "• Mode      : sent as a NEW message (no forward tag)",
-                    LINE,
-                    "If the marked post cannot be read, the run falls back to a",
-                    "normal forward and says so in the log group.",
-                ]),
-                buttons=[[Button.inline("✅ Confirm & Send",
-                                        f"go_{account_id}".encode())],
-                         [Button.inline("🔙 Cancel",
-                                        f"acc_{account_id}".encode())]])
-        return
-
-    await safe_edit(event, "⏳ Preparing (connect, read the marked post, read contacts) ...")
-    await account_conn.close(acc["phone"])   # ensure single connection (Feature 6)
-    client = rb.open_client(acc["phone"])
-    try:
-        await rb.connect_ready(client)
-        import copy_send
-        src, reason = await copy_send.read_source(client, marker)
-        if src is None:
-            await safe_edit(event,
-                card("🫥 HIDDEN SENDER — not possible", [
-                    f"• Reason : {reason}",
-                    f"• Marker : '{marker}'",
-                    LINE,
-                    "Put a message (file/photo/text) in Saved Messages whose",
-                    "caption contains this marker, then try again.",
-                ]),
-                buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
-            return
-        ordered, stats = await _ordered_for_send(client)
-    except Exception as e:  # noqa: BLE001
-        await safe_edit(event, f"❌ Preparation error: {repr(e)[:150]}",
-                        buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
-        return
-    finally:
-        try:
-            await client.disconnect()
-        except Exception:
-            pass
-    if not ordered:
-        await safe_edit(event, "No contacts were found to send to.",
-                        buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
-        return
-    pending_send[event.sender_id] = {
-        "account_id": account_id,
-        "phone": acc["phone"],
-        "saved_guid": src["guid"],
-        "mid": src["mid"],
-        "recipients": [r["guid"] for r in ordered],
-        "hide_sender": True,
-    }
-    await safe_edit(event,
-        card("🫥 READY — HIDDEN SENDER", [
-            f"• Content   : marked message '{marker}' ✅",
-            ("• Media     : re-sent from the same uploaded file"
-             if copy_send.has_media(src) else "• Content   : text only"),
-            f"• Recipients: {len(ordered)} contacts",
-            "• Mode      : sent as a NEW message — no \"Forwarded from\" line",
-            LINE,
-            "The forward method is untouched; this is a separate option.",
-            "Send to these contacts?",
-        ]),
-        buttons=[[Button.inline("✅ Confirm & Send", f"go_{account_id}".encode())],
-                 [Button.inline("🔙 Cancel", f"acc_{account_id}".encode())]])
 
 
 @bot.on(events.CallbackQuery(pattern=b"sendfileh_(\\d+)"))
@@ -1320,6 +1202,19 @@ async def send_file_hidden_cb(event):
                 "• Progress / stop / transfer cards go to the log group.",
                 f"🕒 {now()}"]),
             buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
+    elif detail == caption_file._OLD_WORKER:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND — worker too old", [
+                f"• Account : {acc['phone']}",
+                "This worker's code predates hidden sending, so the run would",
+                "go out as a NORMAL FORWARD with your name on it. Nothing",
+                "was sent.",
+                LINE,
+                "➡️ Run  ⚙️ Settings → 🛠 Workers → Update All,  then retry.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🛠 Workers", b"workers")],
+                     [Button.inline("🔁 Retry", f"sendfileh_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
     else:
         await safe_edit(event,
             card("🫥 HIDDEN FILE SEND FAILED ❌", [
@@ -1486,18 +1381,9 @@ async def message_router(event):
         await handle_ld_interval(event, st)
     elif step == "await_ld_daily":
         await handle_ld_daily(event, st)
-    elif step == "await_tg_phone":
-        await handle_tg_phone(event)
-    elif step == "await_tg_code":
-        await handle_tg_code(event)
-    elif step == "await_tg_password":
-        await handle_tg_password(event)
-    elif step == "await_tg_msg_text":
-        await handle_tg_msg_text(event)
-    elif step == "await_tg_msg_media":
-        await handle_tg_msg_media(event)
-    elif step == "await_tg_speed":
-        await handle_tg_speed(event)
+    # NOTE: the old "await_tg_*" branches were removed with Telegram support.
+    # Nothing sets those steps any more and their handlers no longer exist, so
+    # each branch was a latent NameError. _stubs/test_scope.py now guards this.
 
 
 async def handle_delay(event):
@@ -2018,6 +1904,15 @@ async def stop_cb(event):
     await event.answer("Stop requested. It will stop after the current message.", alert=True)
 
 
+class _HiddenSendImpossible(RuntimeError):
+    """A hidden-sender run could not read its source post.
+
+    The run is ABORTED rather than quietly falling back to a forward: the whole
+    point of the method is that the owner's name must not appear, so forwarding
+    anyway would be worse than sending nothing.
+    """
+
+
 async def run_send(owner_id: int, payload: dict):
     account_id = payload["account_id"]
     # clear any stale stop flag so a resumed / multi-account / brain send is not
@@ -2089,9 +1984,6 @@ async def run_send(owner_id: int, payload: dict):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        # Hidden-sender mode (⚙️ Settings switch): read the marked post ONCE so
-        # each recipient can get a NEW message instead of a forward. If it
-        # cannot be read we fall back to forwarding, so a send is never blocked.
         # Hidden-sender send method (send method #5). ONLY active when the
         # payload explicitly asks for it, so every other send path behaves
         # exactly as before. Reads the marked post once, then each recipient
@@ -2099,18 +1991,22 @@ async def run_send(owner_id: int, payload: dict):
         _hide_src = None
         _cs = None
         if mode != "text" and payload.get("hide_sender"):
+            _hreason = "unknown"
             try:
                 import copy_send as _cs
                 _hide_src, _hreason = await _cs.read_source(client, marker)
-                if _hide_src is None:
-                    await log(card("🫥 HIDDEN SENDER — falling back to forward", [
-                        f"{_lbl()}📱 {phone}",
-                        f"⚠️ {_hreason}",
-                        "➡️ This run forwards normally.",
-                        f"🕒 {now()}"]))
             except Exception as _he:  # noqa: BLE001
                 _hide_src = None
-                print(f"[hidden sender] {_he!r}")
+                _hreason = f"{type(_he).__name__}: {str(_he)[:90]}"
+            if _hide_src is None:
+                await log(card("🫥 HIDDEN SENDER — refused, nothing sent", [
+                    f"{_lbl()}📱 {phone}",
+                    f"⚠️ {_hreason}",
+                    "➡️ Forwarding instead would put your name on every",
+                    "   message, so this run was stopped.",
+                    f"🕒 {now()}"]))
+                raise _HiddenSendImpossible(
+                    f"Hidden send not possible: {_hreason}")
 
         # order the explicit recipient list by PRESENCE (online now -> seen
         # today -> hidden Recently -> ...) for brain/discovery, only on a fresh
@@ -2247,6 +2143,8 @@ async def run_send(owner_id: int, payload: dict):
     except account_conn.InvalidAuthError:
         dead = True
         reason = "Session invalid (re-login needed)"
+    except _HiddenSendImpossible as e:
+        reason = str(e)
     except Exception as e:  # noqa: BLE001
         reason = f"General error: {repr(e)[:200]}"
     finally:
@@ -3893,7 +3791,9 @@ async def run_send_remote(owner_id: int, payload: dict):
         })
         # in text mode there is no marked post to find; only require ok
         if not res.get("ok") or (mode != "text" and not res.get("marker_found")):
-            reason = "Marker not found on worker"
+            # prefer the worker's OWN reason; "marker not found" was being
+            # shown for unrelated failures and pointed at the wrong problem.
+            reason = res.get("error") or "Marker not found on worker"
         else:
             job_id = res["job_id"]
             total = res.get("total", total)
