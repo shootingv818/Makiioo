@@ -71,6 +71,11 @@ _APPROX_ORDER = {
 }
 
 TIERS = (
+    # Tier 1, as requested: we have a real conversation with them (either
+    # direction) AND they were seen recently. Having a chat is NOT enough on
+    # its own — someone messaged long ago who has not been online in months
+    # belongs far down the list, not at the top.
+    "TWOWAY_RECENT",
     "ONLINE_NOW",
     "TODAY_OPEN",
     "RECENTLY_HIDDEN",
@@ -79,9 +84,13 @@ TIERS = (
     "MONTH_HIDDEN",
     "COLD",
 )
+
+# "Recent" for tier 1 = today or yesterday, measured from local midnight.
+RECENT_DAYS = 2
 _TIER_INDEX = {t: i for i, t in enumerate(TIERS)}
 
 TIER_LABEL = {
+    "TWOWAY_RECENT": "TWO-WAY + SEEN RECENTLY",
     "ONLINE_NOW": "ONLINE NOW",
     "TODAY_OPEN": "SEEN TODAY (last-seen open)",
     "RECENTLY_HIDDEN": "RECENTLY (last-seen hidden)",
@@ -182,6 +191,29 @@ def _day_start(ts: float | None = None) -> int:
                             0, 0, 0, 0, 0, -1)))
 
 
+def _recent_start(now: float | None = None) -> int:
+    """Local midnight of (today - (RECENT_DAYS-1)), i.e. the start of
+    yesterday. Anything at or after this counts as "seen recently"."""
+    return _day_start(now) - (RECENT_DAYS - 1) * 86400
+
+
+def is_recent(pres: dict, now: float | None = None) -> bool:
+    """Was this contact seen today or yesterday?
+
+    For a VISIBLE (exact) last-seen we compare the real timestamp.
+    For a HIDDEN one we deliberately trust ONLY Rubika's own bucket label
+    ("Recently") and never the accompanying timestamp, which is rounded down
+    to a 30-minute grid and whose true precision is unverified. That keeps
+    tier 1 correct whether or not that rounded value is meaningful.
+    """
+    if pres.get("online"):
+        return True
+    if pres.get("exact"):
+        ts = int(pres.get("ts") or 0)
+        return bool(ts) and ts >= _recent_start(now)
+    return pres.get("bucket") == "recently"
+
+
 def presence_tier(pres: dict, now: float | None = None) -> str:
     if pres["online"]:
         return "ONLINE_NOW"
@@ -262,13 +294,19 @@ def classify(user, sig: dict | None) -> dict:
     elif sig.get("ask_spam"):
         excluded = "spam risk"
     has_chat = bool(sig)
+    mutual = bool(has_chat and (sig.get("they_wrote") or sig.get("peer_read_us")))
+    tier = presence_tier(pres)
+    # Tier 1 needs BOTH halves: a real two-way conversation AND a recent
+    # last-seen. Either one on its own leaves the contact in the presence
+    # tiers — a chat from months ago is not a reason to message first.
+    if mutual and not excluded and is_recent(pres):
+        tier = "TWOWAY_RECENT"
     return {
         "guid": _guid_of(u),
         "name": _name_of(u),
-        "tier": presence_tier(pres),
+        "tier": tier,
         "excluded": excluded,
-        "mutual": bool(has_chat and (sig.get("they_wrote")
-                                     or sig.get("peer_read_us"))),
+        "mutual": mutual,
         "exact": pres["exact"],
         "ts": pres["ts"],
         "bucket": pres["bucket"],
@@ -320,6 +358,7 @@ def build(users, chats, strategy: str | None = None, groups: int = 0):
         "sendable": len(keep),
         "excluded": len(dropped),
         "excluded_reasons": reasons,
+        "twoway_recent": tiers.get("TWOWAY_RECENT", 0),
         "online_now": tiers.get("ONLINE_NOW", 0),
         "today_open": tiers.get("TODAY_OPEN", 0),
         "recently_hidden": tiers.get("RECENTLY_HIDDEN", 0),
@@ -436,6 +475,8 @@ def summary_rows(stats: dict) -> list:
         extra = stats.get("excluded") or 0
         rows.append(f"• Sendable      : {stats['sendable']}"
                     + (f"   (-{extra} dead/suspended)" if extra else ""))
+    if stats.get("twoway_recent") is not None:
+        rows.append(f"• Two-way Fresh : {g('twoway_recent')}")
     rows += [
         f"• Online Now    : {g('online_now')}",
         f"• Seen Today    : {g('today_open')}",
