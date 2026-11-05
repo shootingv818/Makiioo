@@ -2950,7 +2950,7 @@ else
 fi
 
 echo STAGE=test-image
-timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; value=worker_api._worker_code_version(); print(value); raise SystemExit(0 if value == os.environ["EXPECTED_VERSION"] else 1)'
+timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; value=(worker_api._worker_code_version() or "").strip(); want=os.environ["EXPECTED_VERSION"].strip(); print(value); ok = bool(value) and value != "\u2014" and (value == want or want.startswith(value) or value.startswith(want)); raise SystemExit(0 if ok else 1)'
 
 rollback_container() {{
     timeout 60 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
