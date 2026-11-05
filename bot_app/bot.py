@@ -3679,8 +3679,21 @@ async def send_prepare_remote(event, acc, w, marker):
         res = await worker.api_call(w, "POST", "/prepare",
                                     {"phone": acc["phone"], "marker": marker})
     except Exception as e:  # noqa: BLE001
-        await safe_edit(event, f"❌ Preparation error on the worker: {repr(e)[:150]}",
+        await safe_edit(event, f"❌ Preparation failed: {_worker_api_error(e)}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
+        return
+    # the worker reports a real reason (e.g. an invalid session) in `error`;
+    # showing "marker not found" for that would point at the wrong problem.
+    if res.get("error"):
+        await safe_edit(event,
+            card("❌ PREPARATION FAILED", [
+                f"📱 Account : {acc['phone']}",
+                f"🖥 Worker  : {w['tag']}",
+                f"💥 {str(res['error'])[:160]}",
+            ]),
+            buttons=[[Button.inline("🔑 Distribute Session to Workers",
+                                    f"sessdist_{acc['id']}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
         return
     if not res.get("marker_found"):
         await safe_edit(event, 
@@ -6014,7 +6027,10 @@ async def _fwdpriv_on_account(acc: dict, hidden: bool = None) -> dict:
         try:
             res = await worker.api_call(w, "POST", "/fwdprivacy", {
                 "phone": phone,
-                "hidden": None if hidden is None else bool(hidden),
+                # string action: pydantic 2 rejects an explicit None for a
+                # bool field, which made every one of these calls 422.
+                "action": ("read" if hidden is None
+                           else ("hide" if hidden else "show")),
             }, timeout=90) or {}
             out.update({k: res.get(k, out[k]) for k in out if k != "phone"})
             if not res:

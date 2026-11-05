@@ -332,9 +332,11 @@ def _build_app():
 
     class FwdPrivacyIn(BaseModel):
         # Forward-sender privacy (isolated module `forward_privacy.py`).
-        # hidden=None -> read only; True/False -> set and verify.
+        # A STRING action, like the project's other `mode:` fields: pydantic 2
+        # (pinned at 2.6.4) rejects an explicit None for a `bool` field, which
+        # is what made every call return 422.
         phone: str
-        hidden: bool = None
+        action: str = "read"        # "read" | "hide" | "show"
 
     class CapfileIn(BaseModel):
         # Caption-file auto-upload (isolated module `caption_file.py`): upload a
@@ -495,6 +497,13 @@ def _build_app():
                 return {"ok": True, "marker_found": False, "total": 0}
             ordered, _stats = await _ordered_for_send(client)
             return {"ok": True, "marker_found": True, "total": len(ordered)}
+        except account_conn.InvalidAuthError:
+            return {"ok": False, "marker_found": False, "total": 0,
+                    "error": "session invalid on this worker — re-login or "
+                             "re-import the session"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "marker_found": False, "total": 0,
+                    "error": f"{type(e).__name__}: {str(e)[:150]}"}
         finally:
             try:
                 await client.disconnect()
@@ -880,13 +889,16 @@ def _build_app():
     async def fwdprivacy(body: FwdPrivacyIn, authorization: str = Header(None)):
         _auth(authorization)
         import forward_privacy as fp
+        action = (body.action or "read").strip().lower()
         try:
-            if body.hidden is None:
+            if action == "read":
                 r = await account_conn.call(body.phone, fp.read, timeout=60)
                 val = r.get("value", "")
                 return {"ok": True, "before": val, "after": val, "error": ""}
+            if action not in ("hide", "show"):
+                return {"ok": False, "error": f"unknown action {action!r}"}
             r = await account_conn.call(body.phone, fp.apply,
-                                        bool(body.hidden), timeout=90)
+                                        action == "hide", timeout=90)
             return {"ok": bool(r.get("ok")), "before": r.get("before", ""),
                     "want": r.get("want", ""), "after": r.get("after", ""),
                     "settled": r.get("settled"), "error": r.get("error", "")}
