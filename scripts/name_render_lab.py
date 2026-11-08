@@ -129,6 +129,30 @@ except OSError:
 # --------------------------------------------------------------------------- #
 _PANEL_DEPS = ("dotenv", "rubpy")      # config.py needs dotenv; rb needs rubpy
 
+# When this script runs INSIDE a worker container (driven by
+# scripts/fleet_render_lab.py over SSH), the orchestrator reads its result off
+# stdout. Markers make that robust: progress text can share the stream without
+# corrupting the payload, and a crash simply means no closing marker.
+JSON_BEGIN = "###NRL-JSON-BEGIN###"
+JSON_END = "###NRL-JSON-END###"
+
+
+def extract_json(stdout: str):
+    """Pull the JSON payload out of a captured run. None when absent/invalid.
+
+    Lives here, next to the markers that produce it, so the writer and the
+    reader can never drift apart.
+    """
+    text = stdout or ""
+    i = text.find(JSON_BEGIN)
+    j = text.find(JSON_END, i + 1) if i >= 0 else -1
+    if i < 0 or j < 0:
+        return None
+    try:
+        return json.loads(text[i + len(JSON_BEGIN):j].strip())
+    except Exception:  # noqa: BLE001
+        return None
+
 
 def _missing_deps(path: str, deps=_PANEL_DEPS) -> list:
     """Which of `deps` this interpreter CANNOT import. Probed one at a time so
@@ -1232,6 +1256,9 @@ def main() -> int:
                     help="print the first N rows per account (0 = none)")
     ap.add_argument("--json", dest="out_json", metavar="FILE",
                     help="write the full per-contact result as JSON")
+    ap.add_argument("--json-stdout", action="store_true", dest="json_stdout",
+                    help="also emit the result on stdout between markers "
+                         "(used by fleet_render_lab.py over SSH)")
     a = ap.parse_args()
 
     if a.selftest:
@@ -1291,6 +1318,10 @@ def main() -> int:
             print(f"\n  full result written to {a.out_json}")
         except Exception as e:  # noqa: BLE001
             print(f"\n  could not write JSON: {repr(e)[:140]}")
+    if a.json_stdout:
+        print(JSON_BEGIN)
+        print(json.dumps(results, ensure_ascii=False))
+        print(JSON_END)
     print()
     return 0 if any(r["ok"] for r in results) else 1
 
