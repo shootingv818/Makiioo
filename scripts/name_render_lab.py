@@ -100,6 +100,8 @@ import time
 # be run directly from the repo root without touching any module.
 # --------------------------------------------------------------------------- #
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Captured BEFORE the chdir below, so a relative invocation still resolves.
+_SELF = os.path.abspath(__file__)
 for _sub in ("", "core", "rubika", "workers", "bot_app", "status"):
     _p = os.path.join(_ROOT, _sub) if _sub else _ROOT
     if os.path.isdir(_p) and _p not in sys.path:
@@ -128,6 +130,29 @@ except OSError:
 # nothing is better than reading the wrong thing.
 # --------------------------------------------------------------------------- #
 _PANEL_DEPS = ("dotenv", "rubpy")      # config.py needs dotenv; rb needs rubpy
+
+
+def _exec_target(script: str) -> str:
+    """Validate a handover target: a .py file inside THIS repo, or refuse.
+
+    The handover re-runs the SAME command under a different interpreter, so the
+    target must be the script the user actually invoked. An earlier version
+    hardcoded this module's own __file__, which meant a different script
+    importing ensure_interpreter() got re-exec'd as name_render_lab.py and died
+    on its own arguments.
+
+    Validating in one small function beats asserting a string in the source:
+    this can be unit-tested, and it also refuses an arbitrary binary outright.
+    """
+    p = os.path.abspath(script or "")
+    root = os.path.abspath(_ROOT) + os.sep
+    if not p.endswith(".py"):
+        raise ValueError(f"handover target is not a .py file: {script!r}")
+    if not p.startswith(root):
+        raise ValueError(f"handover target is outside the repo: {script!r}")
+    if not os.path.isfile(p):
+        raise ValueError(f"handover target does not exist: {script!r}")
+    return p
 
 # When this script runs INSIDE a worker container (driven by
 # scripts/fleet_render_lab.py over SSH), the orchestrator reads its result off
@@ -271,8 +296,13 @@ def _container_hint() -> list:
     return lines
 
 
-def ensure_interpreter(deps=_PANEL_DEPS) -> None:
+def ensure_interpreter(deps=_PANEL_DEPS, script: str = None) -> None:
     """Hand over to an interpreter that can import the panel, if this one can't.
+
+    `script` is the file to re-run — the CALLER'S path, not this module's.
+    fleet_render_lab.py imports this function, so defaulting to __file__ would
+    re-exec the wrong script (and did). Callers pass their own path; the
+    fallback chain is sys.argv[0] then this module.
 
     A candidate that has `dotenv` but not `rubpy` is still accepted for
     DB-only work (--list), because reading the account table needs config.py
@@ -303,11 +333,22 @@ def ensure_interpreter(deps=_PANEL_DEPS) -> None:
     if best:
         note = (f" (still missing: {', '.join(best_missing)})"
                 if best_missing else "")
-        print(f"  this python cannot import the panel ({sys.executable})")
-        print(f"  switching to {best}{note}\n")
-        os.environ["_NRL_REEXEC"] = "1"
         try:
-            os.execv(best, [best, os.path.abspath(__file__)] + sys.argv[1:])
+            target = _exec_target(script or sys.argv[0] or _SELF)
+        except ValueError as e:  # noqa: BLE001
+            print(f"  cannot hand over: {e}\n")
+            return
+        print(f"  this python cannot import the panel ({sys.executable})")
+        print(f"  switching to {best}{note}")
+        print(f"  re-running {os.path.basename(target)}\n")
+        os.environ["_NRL_REEXEC"] = "1"
+        # os.execv replaces the process WITHOUT flushing python's buffers, so
+        # everything printed above is lost whenever stdout is a pipe rather
+        # than a terminal. Flush first or the handover happens invisibly.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        try:
+            os.execv(best, [best, target] + sys.argv[1:])
         except OSError as e:  # noqa: BLE001
             print(f"  handover failed: {repr(e)[:120]}\n")
 
@@ -733,9 +774,22 @@ def _no_send_guard() -> tuple:
         if full in ("os.system", "subprocess.Popen", "subprocess.getoutput"):
             hits.append(f"{full} (arbitrary shell)")
         elif full.startswith("os.exec"):
-            # must hand over to THIS file, so the new process re-runs this check
-            if "__file__" not in body:
-                hits.append(f"{full} re-execs something other than this file")
+            # The target must come from _exec_target(), which refuses anything
+            # that is not a .py file inside this repo. A source-text check
+            # could only pretend to verify this; _exec_target is unit-tested.
+            if "target" not in body:
+                hits.append(f"{full} target is not validated by _exec_target")
+
+    # os.exec* does NOT flush python's buffers, so any diagnostic printed
+    # before the handover is lost whenever stdout is a pipe. The enclosing
+    # function must flush first; this was a real silent-handover bug.
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body_src = ast.unparse(fn)
+        if ".exec" in body_src and "os.exec" in body_src:
+            if "stdout.flush()" not in body_src:
+                hits.append(f"{fn.name}() execs without flushing stdout")
         elif full.startswith("subprocess."):
             # Allowed ONLY for three read-only probes: testing whether an
             # interpreter can import a dependency, reading a systemd unit, and
@@ -820,6 +874,32 @@ def selftest() -> int:
                 sys.executable) == [fake])
     finally:
         _sh.rmtree(_d, ignore_errors=True)
+
+    print("\n0d. handover target — re-run the CALLER, never this module")
+    # The bug: ensure_interpreter() hardcoded this module's __file__, so
+    # fleet_render_lab.py --plan was re-exec'd as name_render_lab.py --plan and
+    # died on "unrecognized arguments: --plan".
+    _fleet = os.path.join(_ROOT, "scripts", "fleet_render_lab.py")
+    if os.path.isfile(_fleet):
+        _ck("another script in the repo is a valid target",
+            _exec_target(_fleet) == os.path.abspath(_fleet))
+        _ck("...and it is NOT silently replaced by this module",
+            _exec_target(_fleet) != _SELF)
+    _ck("this module itself is a valid target", _exec_target(_SELF) == _SELF)
+    _ck("a relative path is resolved", _exec_target(
+        os.path.relpath(_SELF, _ROOT)) == _SELF)
+    for bad, why in (("/bin/sh", "an arbitrary binary"),
+                     ("/usr/bin/python3", "an interpreter"),
+                     ("/tmp/evil.py", "a .py outside the repo"),
+                     (os.path.join(_ROOT, "requirements.txt"), "a non-.py file"),
+                     (os.path.join(_ROOT, "scripts", "nope.py"), "a missing file"),
+                     ("", "an empty path")):
+        try:
+            _exec_target(bad)
+            rejected = False
+        except ValueError:
+            rejected = True
+        _ck(f"refuses {why}", rejected)
 
     # the probe must actually distinguish present from absent, per dependency
     _ck("dep probe: a real module reports nothing missing",

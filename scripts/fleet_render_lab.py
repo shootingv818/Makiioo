@@ -69,6 +69,10 @@ import time
 
 # Same sub-package path shim as main.py / the other labs.
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Captured BEFORE the chdir below. The interpreter handover re-runs THIS file,
+# so it must know this path — defaulting to the imported module's __file__ is
+# what made `--plan` get re-exec'd as name_render_lab.py.
+_SELF = os.path.abspath(__file__)
 _SCRIPTS = os.path.join(_ROOT, "scripts")
 for _sub in ("", "core", "rubika", "workers", "bot_app", "status"):
     _p = os.path.join(_ROOT, _sub) if _sub else _ROOT
@@ -300,7 +304,7 @@ async def run_local(phones: list, limit: int, delay: float,
 
 def _load_plan():
     """(groups, workers, orphans, accounts) from the panel DB. Read-only."""
-    nrl.ensure_interpreter(deps=("dotenv",))
+    nrl.ensure_interpreter(deps=("dotenv",), script=_SELF)
     import db
     import worker as wk
     accounts = [a for a in db.list_accounts()
