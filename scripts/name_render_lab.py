@@ -132,6 +132,21 @@ except OSError:
 _PANEL_DEPS = ("dotenv", "rubpy")      # config.py needs dotenv; rb needs rubpy
 
 
+def session_files(phone: str) -> list:
+    """The on-disk session file(s) for one account, or [] when absent.
+
+    MUST glob with a trailing '*': rubpy treats session_path() as a session
+    NAME and appends its own extension, so the bare path never exists on disk.
+    This is the panel's own idiom — see portal/observer.py:228.
+
+    Testing os.path.exists(session_path(...)) instead reported "no session
+    file" for all eight of the owner's accounts even inside the worker
+    containers, where the sessions were present the whole time.
+    """
+    import rubika_client as rb
+    return sorted(glob.glob(rb.session_path(rb.normalize_phone(phone)) + "*"))
+
+
 def _exec_target(script: str) -> str:
     """Validate a handover target: a .py file inside THIS repo, or refuse.
 
@@ -875,6 +890,31 @@ def selftest() -> int:
     finally:
         _sh.rmtree(_d, ignore_errors=True)
 
+    print("\n0e. session detection must glob, not stat (8 accounts were lost)")
+    try:
+        import rubika_client as _rb
+        _ph = "989999999999"
+        _base = _rb.session_path(_ph)
+        _ck("the bare session path does NOT exist on disk (the trap)",
+            not os.path.exists(_base))
+        os.makedirs(os.path.dirname(_base), exist_ok=True)
+        _fake = _base + ".rbs"          # rubpy appends its own extension
+        with open(_fake, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        try:
+            _ck("globbing finds the real file", session_files(_ph) == [_fake])
+            _ck("a stat on the bare path would have missed it",
+                not os.path.exists(_base) and bool(session_files(_ph)))
+            _ck("an unknown account still reports nothing",
+                session_files("989000000000") == [])
+        finally:
+            os.unlink(_fake)
+        _ck("once removed, it reports nothing again", session_files(_ph) == [])
+    except (ImportError, AttributeError) as e:  # noqa: BLE001
+        # degrade, never crash: a minimal test double may not expose
+        # session_path. On a real install it always does.
+        print(f"     (skipped: {type(e).__name__} — {str(e)[:70]})")
+
     print("\n0d. handover target — re-run the CALLER, never this module")
     # The bug: ensure_interpreter() hardcoded this module's __file__, so
     # fleet_render_lab.py --plan was re-exec'd as name_render_lab.py --plan and
@@ -1069,8 +1109,7 @@ def list_accounts() -> int:
         phone = str(a.get("phone") or "-")
         # A remote-worker account may have no session file on THIS machine; the
         # render run reports that honestly instead of failing cryptically.
-        here = "yes" if os.path.exists(rb.session_path(rb.normalize_phone(phone))) \
-            else "NO"
+        here = "yes" if session_files(phone) else "NO"
         print(f"  {a['id']:>4}  {phone:<16} {str(a.get('status') or '-'):<10} "
               f"{here:<13} {wtag}")
     print("\n  'session here' = NO  ->  this machine cannot read that account.")
@@ -1116,9 +1155,9 @@ async def render_account(phone: str, limit: int, delay: float,
     out = {"phone": pn, "ok": False, "error": None, "contacts": 0,
            "profiles_read": 0, "rows": [], "counts": {}, "buckets": {}}
 
-    if not os.path.exists(rb.session_path(pn)):
-        out["error"] = ("no session file on this machine — run the script on "
-                        "that account's worker, or use 🔑 Distribute Session")
+    if not session_files(pn):
+        out["error"] = ("no session file here — run the script on that "
+                        "account's worker, or use 🔑 Distribute Session")
         return out
 
     print(f"\n  connecting to {pn} (READ-ONLY, nothing is sent) ...")
