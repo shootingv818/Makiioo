@@ -86,10 +86,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import glob
 import json
 import os
 import random
 import re
+import subprocess
 import sys
 import time
 
@@ -106,6 +108,104 @@ try:
     os.chdir(_ROOT)
 except OSError:
     pass
+
+
+# --------------------------------------------------------------------------- #
+# Interpreter handover.
+#
+# The panel runs under its own interpreter (a venv, or whatever the systemd
+# unit names). The bare `python3` on the host often lacks python-dotenv, which
+# config.py needs, so `--list`/`--render` would die with ModuleNotFoundError
+# even though the panel itself works fine.
+#
+# Rather than making the owner hunt for the right python, ask the ground truth:
+# read the rubika-panel unit's ExecStart, fall back to any venv next to the
+# repo, verify the candidate can actually import the panel's deps, and re-exec.
+# `_NRL_REEXEC` makes the handover happen at most once.
+#
+# No dotenv stub is used on purpose: without the real .env, config.py would
+# fall back to defaults and `db` could open the WRONG database file. Reading
+# nothing is better than reading the wrong thing.
+# --------------------------------------------------------------------------- #
+_PANEL_DEPS = ("dotenv", "rubpy")
+
+
+def _interpreter_has_deps(path: str) -> bool:
+    try:
+        return subprocess.call(
+            [path, "-c", "import dotenv, rubpy"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30) == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _systemd_interpreters() -> list:
+    """Python paths named in the panel's own systemd unit(s)."""
+    found = []
+    for unit in ("rubika-panel", "rubika-master", "rubika-bot"):
+        try:
+            out = subprocess.run(["systemctl", "cat", unit],
+                                 capture_output=True, text=True, timeout=20)
+        except Exception:  # noqa: BLE001
+            continue
+        for line in (out.stdout or "").splitlines():
+            s = line.strip()
+            if not s.startswith("ExecStart"):
+                continue
+            for tok in s.split():
+                t = tok.strip('"\'')
+                if "python" in os.path.basename(t) and t.startswith("/"):
+                    found.append(t)
+    return found
+
+
+def _candidate_interpreters() -> list:
+    cands = _systemd_interpreters()
+    # a venv living next to the repo (venv/, .venv/, env/, any */bin/python3)
+    cands += sorted(glob.glob(os.path.join(_ROOT, "*", "bin", "python3")))
+    cands += ["/usr/local/bin/python3", "/usr/bin/python3"]
+    seen, out = set(), []
+    for c in cands:
+        rc = os.path.realpath(c)
+        if rc not in seen and os.path.isfile(c) and os.access(c, os.X_OK):
+            seen.add(rc)
+            out.append(c)
+    return out
+
+
+def ensure_interpreter() -> None:
+    """Hand over to an interpreter that can import the panel, if this one can't."""
+    try:
+        import dotenv  # noqa: F401
+        import rubpy   # noqa: F401
+        return
+    except ImportError:
+        pass
+    if os.environ.get("_NRL_REEXEC"):
+        return                       # already handed over once; report honestly
+    for path in _candidate_interpreters():
+        if os.path.realpath(path) == os.path.realpath(sys.executable):
+            continue
+        if _interpreter_has_deps(path):
+            print(f"  this python lacks the panel's deps "
+                  f"({sys.executable}) — switching to {path}\n")
+            os.environ["_NRL_REEXEC"] = "1"
+            try:
+                os.execv(path, [path, os.path.abspath(__file__)] + sys.argv[1:])
+            except OSError:
+                continue
+    # nothing worked: say exactly what was tried, so one message settles it
+    print("\n  ⚠ no interpreter on this machine can import the panel "
+          "(python-dotenv + rubpy).")
+    print(f"  this python : {sys.executable}")
+    print("  tried       :")
+    for p in _candidate_interpreters():
+        print(f"      {p}")
+    print("\n  send me the output of:   systemctl cat rubika-panel | "
+          "grep -i exec")
+    print("  (if the panel runs in Docker, the script must run inside that "
+          "container.)\n")
 
 
 # =========================================================================== #
@@ -492,6 +592,34 @@ def _no_send_guard() -> tuple:
             for kw in n.keywords:
                 if kw.arg == "name" and isinstance(kw.value, ast.Constant):
                     raw_methods.add(kw.value.value)
+    # The interpreter handover calls os.execv, which could in principle run
+    # ANY binary with any arguments. Verify every execv hands over to THIS
+    # SAME file, so the read-only guarantee survives the re-exec: the new
+    # process runs this script, which re-runs this very check.
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+            continue
+        full = dotted(n.func)
+        body = ast.unparse(n)
+        if full in ("os.system", "subprocess.Popen", "subprocess.getoutput"):
+            hits.append(f"{full} (arbitrary shell)")
+        elif full.startswith("os.exec"):
+            # must hand over to THIS file, so the new process re-runs this check
+            if "__file__" not in body:
+                hits.append(f"{full} re-execs something other than this file")
+        elif full.startswith("subprocess."):
+            # allowed ONLY to probe an interpreter or read a systemd unit
+            if not ("import dotenv" in body or "systemctl" in body):
+                hits.append(f"{full}: {body[:60]}")
+
+    # A dotenv stub would let config.py fall back to defaults and make `db`
+    # open the WRONG database file, so patching sys.modules is banned outright.
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                if isinstance(t, ast.Subscript) and "sys.modules" in ast.unparse(t):
+                    hits.append("patches sys.modules (dependency stub)")
+
     hits = sorted(set(hits)) + sorted(raw_methods - ALLOWED_RAW)
     return (not hits), hits
 
@@ -504,6 +632,7 @@ def selftest() -> int:
     print("\n0. the read-only promise is enforced, not just claimed")
     ok, hits = _no_send_guard()
     _ck(f"no sending / DB-writing / worker call is reachable {hits or ''}", ok)
+    _ck("the handover re-execs only THIS file, and stubs no dependency", ok)
 
     print("\n1. normalisation")
     _ck("arabic ي/ك fold to persian", normalize("يكتا") == "یکتا")
@@ -625,6 +754,7 @@ def selftest() -> int:
 
 def _panel():
     """Import the panel modules (read-only use only)."""
+    ensure_interpreter()
     import db
     import worker
     return db, worker
@@ -815,7 +945,9 @@ def _print_account_report(res: dict, min_confidence: int) -> None:
         print(f"  ⚠ skipped: {res['error']}")
         return
     total = res["contacts"]
-    print(f"  contacts            : {total}")
+    b = res["buckets"]
+    print(f"  📊 از {total} مخاطب، {b['NAMED']} تا رندر شد "
+          f"({_pct(b['NAMED'], total).strip()})")
     print(f"  profile lookups ok  : {res['profiles_read']}")
     print(f"\n  BUCKETS (threshold = {min_confidence})")
     for b, lbl in (("NAMED", "send WITH name"),
@@ -836,15 +968,27 @@ def _print_account_report(res: dict, min_confidence: int) -> None:
         print("    ^ eyeball these: the real names among them should be added")
 
 
+def _headline(total: int, named: int, noname: int, excluded: int) -> None:
+    """The one line the owner actually asked for: of N contacts, M rendered."""
+    print("\n" + "=" * 70)
+    print(f"  📊  از {total} مخاطب، {named} تا رندر شد  "
+          f"({_pct(named, total).strip()})")
+    print("=" * 70)
+    print(f"  ✅ رندر شد (با اسم)   : {named:>6}   {_pct(named, total)}")
+    print(f"  ➖ بی‌اسم (خنثی)      : {noname:>6}   {_pct(noname, total)}")
+    print(f"  🚫 مغازه/اداره (حذف) : {excluded:>6}   {_pct(excluded, total)}")
+    print(f"  ──────────────────────────────────────")
+    print(f"  کل مخاطبین            : {total:>6}")
+    sendable = named + noname
+    print(f"  قابلِ ارسال (با+بی اسم): {sendable:>6}   {_pct(sendable, total)}")
+
+
 def _print_fleet_report(results: list, min_confidence: int) -> None:
     good = [r for r in results if r["ok"]]
     if not good:
         print("\n  no account could be read.\n")
         return
     total = sum(r["contacts"] for r in good)
-    print("\n" + "=" * 70)
-    print(f"FLEET TOTAL — {len(good)} account(s), {total} contacts")
-    print("=" * 70)
     agg_b = {"NAMED": 0, "NO_NAME": 0, "EXCLUDE": 0}
     agg_v = {}
     for r in good:
@@ -852,6 +996,12 @@ def _print_fleet_report(results: list, min_confidence: int) -> None:
             agg_b[k] += v
         for k, v in r["counts"].items():
             agg_v[k] = agg_v.get(k, 0) + v
+
+    _headline(total, agg_b["NAMED"], agg_b["NO_NAME"], agg_b["EXCLUDE"])
+
+    print("\n" + "=" * 70)
+    print(f"FLEET DETAIL — {len(good)} account(s), {total} contacts")
+    print("=" * 70)
     print(f"\n  BUCKETS (threshold = {min_confidence})")
     for b, lbl in (("NAMED", "send WITH name"),
                    ("NO_NAME", "send without a name"),
@@ -911,9 +1061,10 @@ def main() -> int:
     a = ap.parse_args()
 
     if a.selftest:
-        return selftest()
+        return selftest()           # pure logic: no panel import, no handover
     if a.do_list:
         return list_accounts()
+    ensure_interpreter()            # may re-exec; everything below needs rubpy
     if not a.render and not a.render_all:
         ap.print_help()
         print("\n  start here:  --selftest      (offline, proves the logic)")
