@@ -193,6 +193,33 @@ def _systemd_exec() -> tuple:
     return found, raw
 
 
+def pick_candidates(paths, current: str) -> list:
+    """Keep the usable interpreters, dropping only the one already running.
+
+    Compared by INVOCATION PATH, never by realpath. A venv's bin/python is a
+    symlink to the system python, so realpath() reports them as the same file
+    — and what makes it a venv is precisely the path it is INVOKED by, since
+    that sets sys.prefix and therefore which site-packages is imported.
+
+    Filtering on realpath is what broke this on the owner's master: systemd
+    correctly yielded /opt/rubika-panel/venv/bin/python, realpath folded it
+    onto /usr/bin/python3, the only good candidate was skipped as "already
+    running", and the report said "none found" while the venv had every
+    package installed. Pinned by --selftest.
+    """
+    seen, out = set(), []
+    cur = os.path.abspath(current or "")
+    for p in paths:
+        ap = os.path.abspath(p)
+        if ap == cur or ap in seen:
+            continue
+        if not (os.path.isfile(p) and os.access(p, os.X_OK)):
+            continue
+        seen.add(ap)
+        out.append(p)
+    return out
+
+
 def _candidate_interpreters() -> list:
     cands, _raw = _systemd_exec()
     # a venv beside the repo. Both names: a venv ships `python` AND `python3`,
@@ -200,13 +227,7 @@ def _candidate_interpreters() -> list:
     for name in ("python", "python3"):
         cands += sorted(glob.glob(os.path.join(_ROOT, "*", "bin", name)))
     cands += ["/usr/local/bin/python3", "/usr/bin/python3"]
-    seen, out = set(), []
-    for c in cands:
-        rc = os.path.realpath(c)
-        if rc not in seen and os.path.isfile(c) and os.access(c, os.X_OK):
-            seen.add(rc)
-            out.append(c)
-    return out
+    return pick_candidates(cands, sys.executable)
 
 
 def _container_hint() -> list:
@@ -247,8 +268,6 @@ def ensure_interpreter(deps=_PANEL_DEPS) -> None:
 
     tried, best, best_missing = [], None, None
     for path in _candidate_interpreters():
-        if os.path.realpath(path) == os.path.realpath(sys.executable):
-            continue
         missing = _missing_deps(path, deps)
         tried.append((path, missing))
         if not missing:
@@ -747,6 +766,46 @@ def selftest() -> int:
         _parse("ExecStart=/usr/bin/docker compose up") == [])
     _ck("non-ExecStart lines are ignored",
         _parse("Environment=PYTHONPATH=/opt/x") == [])
+
+    print("\n0c. venv detection (the bug that actually blocked the owner's run)")
+    # Builds the real shape: venv/bin/python as a symlink to the system python,
+    # exactly what `python -m venv` produces. The old code compared realpath,
+    # decided this WAS the running interpreter, skipped it, and reported
+    # "none found" while every package was installed.
+    import shutil as _sh
+    import tempfile as _tf
+    _d = _tf.mkdtemp(prefix="venvtest_")
+    try:
+        os.makedirs(os.path.join(_d, "venv", "bin"))
+        fake = os.path.join(_d, "venv", "bin", "python")
+        os.symlink(sys.executable, fake)
+        _ck("a venv python IS a symlink to the system python (the trap)",
+            os.path.realpath(fake) == os.path.realpath(sys.executable))
+        _ck("...and it is STILL offered as a candidate",
+            pick_candidates([fake], sys.executable) == [fake])
+        _ck("the interpreter already running is dropped",
+            pick_candidates([sys.executable], sys.executable) == [])
+        _ck("the same path twice collapses to one",
+            pick_candidates([fake, fake], sys.executable) == [fake])
+        _ck("a non-existent path is dropped",
+            pick_candidates([os.path.join(_d, "nope", "python")],
+                            sys.executable) == [])
+        _ck("end to end: the install.sh unit line survives the whole filter",
+            pick_candidates(
+                parse_execstart(f"ExecStart={fake} /opt/rubika-panel/main.py"),
+                sys.executable) == [fake])
+    finally:
+        _sh.rmtree(_d, ignore_errors=True)
+
+    # the probe must actually distinguish present from absent, per dependency
+    _ck("dep probe: a real module reports nothing missing",
+        _missing_deps(sys.executable, ("json",)) == [])
+    _ck("dep probe: a missing module is named",
+        _missing_deps(sys.executable, ("no_such_module_xyz",))
+        == ["no_such_module_xyz"])
+    _ck("dep probe: reports only the absent one of a mixed pair",
+        _missing_deps(sys.executable, ("json", "no_such_module_xyz"))
+        == ["no_such_module_xyz"])
 
     print("\n1. normalisation")
     _ck("arabic ي/ك fold to persian", normalize("يكتا") == "یکتا")
