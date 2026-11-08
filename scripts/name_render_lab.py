@@ -127,23 +127,58 @@ except OSError:
 # fall back to defaults and `db` could open the WRONG database file. Reading
 # nothing is better than reading the wrong thing.
 # --------------------------------------------------------------------------- #
-_PANEL_DEPS = ("dotenv", "rubpy")
+_PANEL_DEPS = ("dotenv", "rubpy")      # config.py needs dotenv; rb needs rubpy
 
 
-def _interpreter_has_deps(path: str) -> bool:
-    try:
-        return subprocess.call(
-            [path, "-c", "import dotenv, rubpy"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=30) == 0
-    except Exception:  # noqa: BLE001
-        return False
+def _missing_deps(path: str, deps=_PANEL_DEPS) -> list:
+    """Which of `deps` this interpreter CANNOT import. Probed one at a time so
+    the failure report names the actual culprit instead of saying 'no'."""
+    missing = []
+    for dep in deps:
+        try:
+            rc = subprocess.call(
+                [path, "-c", f"import {dep}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                timeout=90)
+        except Exception:  # noqa: BLE001
+            rc = 1
+        if rc != 0:
+            missing.append(dep)
+    return missing
 
 
-def _systemd_interpreters() -> list:
-    """Python paths named in the panel's own systemd unit(s)."""
-    found = []
-    for unit in ("rubika-panel", "rubika-master", "rubika-bot"):
+def parse_execstart(line: str) -> list:
+    """Python interpreter paths named in one systemd ExecStart line.
+
+    install.sh:279 writes:
+        ExecStart=$INSTALL_DIR/venv/bin/python $INSTALL_DIR/main.py
+
+    so the interpreter is GLUED to "ExecStart=" and the line must be split on
+    '=' first. An earlier version only looked for tokens starting with '/',
+    found nothing, and sent the owner chasing a missing dependency instead of
+    the real interpreter. Kept as its own pure function so --selftest exercises
+    the code that actually runs, not a copy of it.
+    """
+    s = (line or "").strip()
+    if not s.startswith("ExecStart"):
+        return []
+    rhs = s.split("=", 1)[1] if "=" in s else s
+    out = []
+    for tok in rhs.split():
+        t = tok.strip('"\' ').lstrip("-@+!:")       # systemd exec prefixes
+        if t.startswith("/") and "python" in os.path.basename(t):
+            out.append(t)
+    return out
+
+
+def _systemd_exec() -> tuple:
+    """(python paths, raw ExecStart lines) from the panel's own systemd units.
+
+    The raw lines are returned too: if detection still fails, the diagnostic
+    prints the ground truth instead of costing another round trip.
+    """
+    found, raw = [], []
+    for unit in ("rubika-panel", "rubika-master", "rubika-bot", "rubika"):
         try:
             out = subprocess.run(["systemctl", "cat", unit],
                                  capture_output=True, text=True, timeout=20)
@@ -153,17 +188,17 @@ def _systemd_interpreters() -> list:
             s = line.strip()
             if not s.startswith("ExecStart"):
                 continue
-            for tok in s.split():
-                t = tok.strip('"\'')
-                if "python" in os.path.basename(t) and t.startswith("/"):
-                    found.append(t)
-    return found
+            raw.append(f"{unit}: {s}")
+            found += parse_execstart(s)
+    return found, raw
 
 
 def _candidate_interpreters() -> list:
-    cands = _systemd_interpreters()
-    # a venv living next to the repo (venv/, .venv/, env/, any */bin/python3)
-    cands += sorted(glob.glob(os.path.join(_ROOT, "*", "bin", "python3")))
+    cands, _raw = _systemd_exec()
+    # a venv beside the repo. Both names: a venv ships `python` AND `python3`,
+    # and install.sh's unit points at `python`.
+    for name in ("python", "python3"):
+        cands += sorted(glob.glob(os.path.join(_ROOT, "*", "bin", name)))
     cands += ["/usr/local/bin/python3", "/usr/bin/python3"]
     seen, out = set(), []
     for c in cands:
@@ -174,38 +209,89 @@ def _candidate_interpreters() -> list:
     return out
 
 
-def ensure_interpreter() -> None:
-    """Hand over to an interpreter that can import the panel, if this one can't."""
-    try:
-        import dotenv  # noqa: F401
-        import rubpy   # noqa: F401
+def _container_hint() -> list:
+    """Running containers, in case the panel lives in Docker rather than a venv.
+    Read-only: a `ps` listing, nothing is started, stopped or executed."""
+    lines = []
+    for cli in ("docker", "podman"):
+        try:
+            out = subprocess.run([cli, "ps", "--format", "{{.Names}}  {{.Image}}"],
+                                 capture_output=True, text=True, timeout=20)
+        except Exception:  # noqa: BLE001
+            continue
+        body = (out.stdout or "").strip()
+        if body:
+            lines.append(f"  {cli} ps:")
+            lines += [f"      {ln}" for ln in body.splitlines()]
+    return lines
+
+
+def ensure_interpreter(deps=_PANEL_DEPS) -> None:
+    """Hand over to an interpreter that can import the panel, if this one can't.
+
+    A candidate that has `dotenv` but not `rubpy` is still accepted for
+    DB-only work (--list), because reading the account table needs config.py
+    and nothing else.
+    """
+    have_all = True
+    for dep in deps:
+        try:
+            __import__(dep)
+        except ImportError:
+            have_all = False
+            break
+    if have_all:
         return
-    except ImportError:
-        pass
     if os.environ.get("_NRL_REEXEC"):
         return                       # already handed over once; report honestly
+
+    tried, best, best_missing = [], None, None
     for path in _candidate_interpreters():
         if os.path.realpath(path) == os.path.realpath(sys.executable):
             continue
-        if _interpreter_has_deps(path):
-            print(f"  this python lacks the panel's deps "
-                  f"({sys.executable}) — switching to {path}\n")
-            os.environ["_NRL_REEXEC"] = "1"
-            try:
-                os.execv(path, [path, os.path.abspath(__file__)] + sys.argv[1:])
-            except OSError:
-                continue
-    # nothing worked: say exactly what was tried, so one message settles it
-    print("\n  ⚠ no interpreter on this machine can import the panel "
-          "(python-dotenv + rubpy).")
+        missing = _missing_deps(path, deps)
+        tried.append((path, missing))
+        if not missing:
+            best, best_missing = path, missing
+            break
+        if "dotenv" not in missing and best is None:
+            best, best_missing = path, missing       # partial: DB work is fine
+
+    if best:
+        note = (f" (still missing: {', '.join(best_missing)})"
+                if best_missing else "")
+        print(f"  this python cannot import the panel ({sys.executable})")
+        print(f"  switching to {best}{note}\n")
+        os.environ["_NRL_REEXEC"] = "1"
+        try:
+            os.execv(best, [best, os.path.abspath(__file__)] + sys.argv[1:])
+        except OSError as e:  # noqa: BLE001
+            print(f"  handover failed: {repr(e)[:120]}\n")
+
+    # Nothing usable: print the GROUND TRUTH so one run settles it.
+    _paths, raw = _systemd_exec()
+    print("\n  ⚠ no interpreter on this machine can import the panel.")
     print(f"  this python : {sys.executable}")
-    print("  tried       :")
-    for p in _candidate_interpreters():
-        print(f"      {p}")
-    print("\n  send me the output of:   systemctl cat rubika-panel | "
-          "grep -i exec")
-    print("  (if the panel runs in Docker, the script must run inside that "
-          "container.)\n")
+    print(f"  needed      : {', '.join(deps)}")
+    print("\n  candidates tried (and what each one is missing):")
+    if not tried:
+        print("      — none found —")
+    for path, missing in tried:
+        print(f"      {path}   missing: {', '.join(missing) or 'nothing'}")
+    print("\n  ExecStart lines from systemd (the ground truth):")
+    for ln in raw or ["      — no rubika unit found —"]:
+        print(f"      {ln}" if not ln.startswith("    ") else ln)
+    hint = _container_hint()
+    if hint:
+        print("\n  containers running on this host:")
+        for ln in hint:
+            print(ln)
+        print("\n  if the panel is one of these, run the script INSIDE it:")
+        print("      docker exec -it <name> python /app/scripts/"
+              "name_render_lab.py --render-all")
+    print("\n  if a venv exists but is missing packages, this fixes it:")
+    print(f"      {os.path.join(_ROOT, 'venv/bin/pip')} install -r "
+          f"{os.path.join(_ROOT, 'requirements.txt')}\n")
 
 
 # =========================================================================== #
@@ -608,8 +694,12 @@ def _no_send_guard() -> tuple:
             if "__file__" not in body:
                 hits.append(f"{full} re-execs something other than this file")
         elif full.startswith("subprocess."):
-            # allowed ONLY to probe an interpreter or read a systemd unit
-            if not ("import dotenv" in body or "systemctl" in body):
+            # Allowed ONLY for three read-only probes: testing whether an
+            # interpreter can import a dependency, reading a systemd unit, and
+            # listing containers. Anything else is rejected.
+            allowed = ("import {dep}" in body or "systemctl" in body
+                       or '"ps"' in body or "'ps'" in body)
+            if not allowed:
                 hits.append(f"{full}: {body[:60]}")
 
     # A dotenv stub would let config.py fall back to defaults and make `db`
@@ -633,6 +723,30 @@ def selftest() -> int:
     ok, hits = _no_send_guard()
     _ck(f"no sending / DB-writing / worker call is reachable {hits or ''}", ok)
     _ck("the handover re-execs only THIS file, and stubs no dependency", ok)
+
+    print("\n0b. the systemd ExecStart parser (this is what failed before)")
+    # Exercises the REAL parse_execstart() used at runtime, not a copy of it:
+    # a test against a duplicated implementation would stay green while the
+    # shipped function was broken, which is how the original bug survived.
+    _parse = parse_execstart
+    _ck("real install.sh unit line -> venv/bin/python",
+        _parse("ExecStart=/opt/rubika-panel/venv/bin/python "
+               "/opt/rubika-panel/main.py")
+        == ["/opt/rubika-panel/venv/bin/python"])
+    _ck("python3 form works too",
+        _parse("ExecStart=/opt/x/venv/bin/python3 /opt/x/main.py")
+        == ["/opt/x/venv/bin/python3"])
+    _ck("systemd '-' prefix is stripped",
+        _parse("ExecStart=-/opt/x/venv/bin/python /opt/x/main.py")
+        == ["/opt/x/venv/bin/python"])
+    _ck("main.py is NOT mistaken for the interpreter",
+        "/opt/rubika-panel/main.py" not in _parse(
+            "ExecStart=/opt/rubika-panel/venv/bin/python "
+            "/opt/rubika-panel/main.py"))
+    _ck("a docker unit yields no interpreter (so we fall through to the hint)",
+        _parse("ExecStart=/usr/bin/docker compose up") == [])
+    _ck("non-ExecStart lines are ignored",
+        _parse("Environment=PYTHONPATH=/opt/x") == [])
 
     print("\n1. normalisation")
     _ck("arabic ي/ك fold to persian", normalize("يكتا") == "یکتا")
@@ -753,8 +867,9 @@ def selftest() -> int:
 # =========================================================================== #
 
 def _panel():
-    """Import the panel modules (read-only use only)."""
-    ensure_interpreter()
+    """Import the panel modules (read-only use only). Reading the account
+    table only needs config.py -> dotenv, so rubpy is not required here."""
+    ensure_interpreter(deps=("dotenv",))
     import db
     import worker
     return db, worker
@@ -1063,8 +1178,8 @@ def main() -> int:
     if a.selftest:
         return selftest()           # pure logic: no panel import, no handover
     if a.do_list:
-        return list_accounts()
-    ensure_interpreter()            # may re-exec; everything below needs rubpy
+        return list_accounts()      # DB only: dotenv is enough
+    ensure_interpreter()            # may re-exec; the render needs rubpy too
     if not a.render and not a.render_all:
         ap.print_help()
         print("\n  start here:  --selftest      (offline, proves the logic)")
