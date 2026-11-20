@@ -472,14 +472,25 @@ async def _pv_loop(bot, ex, aid):
         res = await ex.pv(acc, state)
         state = res.get("state", state)
         if res.get("ok") and not first:
-            newcomers = res.get("new", [])
-            if newcomers:
-                adb.incr_pv(aid, received=len(newcomers))
-                _set_acc(aid, pv_queue=len(newcomers))
+            # Count only DISTINCT, not-yet-answered senders as "received", so a
+            # worker that returns a non-advancing cursor can't inflate the
+            # metric by re-reporting the same person every poll.
+            fresh, _seen = [], set()
+            for u in res.get("new", []):
+                g = u.get("guid")
+                if not g or g in _seen or adb.already_replied(aid, g):
+                    continue
+                _seen.add(g)
+                fresh.append(u)
+            if fresh:
+                adb.incr_pv(aid, received=len(fresh))
+                _set_acc(aid, pv_queue=len(fresh))
             reply = adb.get("pv_text", "") or ""
-            for u in newcomers:
+            for u in fresh:
                 if engine.stop:
                     break
+                # re-check inside the loop: a poll can list the same guid twice,
+                # and we mark-replied only after the first send.
                 if adb.already_replied(aid, u["guid"]):
                     continue
                 if reply:
