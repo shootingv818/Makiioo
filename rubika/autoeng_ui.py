@@ -265,9 +265,12 @@ def register(bot) -> None:
                 rows.append([B.inline(label, b"ae_noop")])
                 continue
             mark = "✅" if aid in sel else "⬜"
-            w = bot.worker.worker_for_account(a) if hasattr(bot, "worker") else None
-            wtag = (w.get("tag") if w and not bot.worker.is_local(w) else "local") \
-                if w else "local"
+            try:
+                w = bot.worker.worker_for_account(a) if hasattr(bot, "worker") else None
+                wtag = (w.get("tag") if w and not bot.worker.is_local(w)
+                        else "local") if w else "local"
+            except Exception:  # noqa: BLE001 - never break the menu on a worker hiccup
+                wtag = "?"
             label = f"{mark} {a.get('phone')} · {wtag}"
             rows.append([B.inline(label, f"ae_tog_{aid}".encode())])
         nav = []

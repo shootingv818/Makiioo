@@ -350,7 +350,22 @@ async def _sender_loop(bot, ex, aid):
                 if core.is_fatal_account(code):
                     await _quarantine(bot, acc, "join", res.get("error", ""))
                     return
-                # approval-required or bad link -> drop, pull a replacement
+                if code == core.ACC_LIMIT:
+                    # rate-limited: keep the group ASSIGNED, cool down, retry.
+                    _set_acc(aid, icon=live.IC_LIMIT, note="rate-limited")
+                    await _err_card(bot, code=code, stage="join", acc=acc,
+                                    reason=res.get("error", ""),
+                                    action="cooling down (group kept)")
+                    await _interruptible_sleep(ACC_LIMIT_COOLDOWN)
+                    _set_acc(aid, icon=live.IC_JOIN, note=None)
+                    break        # restart the join phase next outer pass
+                if core.should_retry_link(code):
+                    # transient (NET/worker): leave ASSIGNED, retry next pass.
+                    await _interruptible_sleep(random.uniform(JOIN_GAP_MIN,
+                                                              JOIN_GAP_MAX))
+                    continue
+                # a real group fault (approval-required / bad link): drop it and
+                # pull a replacement from the reserve.
                 engine.lost_groups += 1
                 adb.set_group_state(g["guid"], adb.G_DEAD)
                 await _err_card(bot, code=code, stage="join", acc=acc,
@@ -560,9 +575,34 @@ async def start(bot, account_ids, *, executor=None):
     """Launch the engine over the selected accounts. Returns (ok, message)."""
     adb.init()
     ids = [int(a) for a in account_ids]
+    # SESSION SAFETY (golden rule): never let the engine open a 2nd connection
+    # on an account that an OLD feature (automation/secretary/reply/linkdooni)
+    # or a one-shot job already owns — that is exactly AUTH_FROM_ANOTHER. Drop
+    # such accounts before assigning roles; refuse if too few remain.
+    busy = []
+    for aid in list(ids):
+        try:
+            if getattr(bot, "continuous_busy", None) and bot.continuous_busy(aid):
+                busy.append(aid)
+            elif aid in getattr(bot, "active_jobs", set()):
+                busy.append(aid)
+        except Exception:  # noqa: BLE001
+            pass
+    if busy:
+        ids = [a for a in ids if a not in busy]
+        try:
+            await bot.log(bot.card("⚠️ Automation — skipped busy accounts", [
+                "These run an older feature / job (session is in use):",
+                ", ".join(str(b) for b in busy),
+                "Turn those off first to include them.",
+                bot.LINE, f"🕒 {bot.now()}"]))
+        except Exception:  # noqa: BLE001
+            pass
     roles = core.assign_roles(ids)
     if not roles:
-        return False, f"need at least {core.MIN_ACCOUNTS} accounts"
+        return False, (f"need at least {core.MIN_ACCOUNTS} free accounts "
+                       f"({len(busy)} skipped as busy)" if busy
+                       else f"need at least {core.MIN_ACCOUNTS} accounts")
     if not adb.list_texts():
         return False, "no ad text set"
     # resolve account dicts through the panel (db.get_account) once.

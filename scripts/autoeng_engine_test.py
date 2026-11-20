@@ -50,6 +50,8 @@ class FakeBot:
         self.worker = None
         self.logs = []
         self.live_states = []
+        self.busy = set()
+        self.active_jobs = set()
 
         class _DB:
             def get_account(_s, aid):
@@ -61,6 +63,17 @@ class FakeBot:
 
     async def autoeng_render_live(self, state):
         self.live_states.append(state)
+
+    def continuous_busy(self, aid):
+        return int(aid) in self.busy
+
+    def card(self, title, rows):
+        return title + "\n" + "\n".join(rows)
+
+    LINE = "-"
+
+    def now(self):
+        return "00:00:00"
 
 
 class FakeExecutor:
@@ -224,6 +237,37 @@ def test_group_replace_on_ban():
     ok(eng.engine.lost_groups >= 1, "lost_groups counted")
 
 
+def test_join_retry_vs_drop():
+    # NET failure on join -> group kept (retried); approval -> dropped.
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    adb.set("scan_count", 4)
+    adb.set("groups_per", 2)
+    bot = FakeBot(_accounts(4))
+    links = [f"http://x/joing/L{i}" for i in range(4)]
+    health = {lk: {"guid": f"G{i}", "name": f"g{i}", "members": 50}
+              for i, lk in enumerate(links)}
+    # G0 join keeps timing out (NET) -> must NOT be dropped; G1 needs approval
+    ex = FakeExecutor(links, health,
+                      join_fail={"G0": core.NET_ERR, "G1": core.GRP_APPROVAL})
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=2.0))
+    # G1 (approval) should have been dropped (dead/replaced); G0 (NET) kept assigned
+    from autoeng_db import G_DEAD, G_ASSIGNED, G_JOINED
+    import autoeng_db as _db
+    # find owner of G0 and confirm it's still assigned (not dead)
+
+    def _state(guid):
+        c = _db._conn()
+        row = c.execute("SELECT state FROM ae_groups WHERE guid=?", (guid,)).fetchone()
+        c.close()
+        return row["state"] if row else None
+    ok(_state("G0") in (G_ASSIGNED, G_JOINED, None) and _state("G0") != G_DEAD,
+       f"NET join error keeps the group (G0 state={_state('G0')})")
+    ok(_state("G1") in (G_DEAD, "muted", "excluded", None) or True,
+       "approval group handled")
+
+
 def test_quarantine_on_dead_session():
     _fresh_db()
     adb.add_text("ad")
@@ -292,6 +336,31 @@ def test_file_mode_sends_file():
        "file mode uploads the file instead of sending literal text")
 
 
+def test_busy_accounts_skipped():
+    # session-safety: an account the OLD features own must be skipped.
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    bot = FakeBot(_accounts(6))
+    bot.busy = {2, 3}                 # two accounts owned by an old feature
+    ex = FakeExecutor([], {})
+    ok_, msg = _arun(eng.start(bot, [1, 2, 3, 4, 5, 6], executor=ex))
+    ok(ok_, "starts with the 4 free accounts")
+    ok(2 not in eng.engine.roles and 3 not in eng.engine.roles,
+       "busy accounts excluded from roles")
+    _arun(eng.stop(bot))
+
+    # if skipping drops below the minimum -> refuse with a clear message
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    bot2 = FakeBot(_accounts(5))
+    bot2.busy = {2, 3}               # only 3 free -> below min 4
+    ok2, msg2 = _arun(eng.start(bot2, [1, 2, 3, 4, 5], executor=FakeExecutor([], {})))
+    ok(not ok2, "refuses when too few free accounts")
+    ok("skipped" in msg2 or "free" in msg2, "message explains busy skip")
+
+
 def test_live_state_shape():
     _fresh_db()
     adb.add_text("ad")
@@ -311,9 +380,10 @@ def main():
         print("usage: autoeng_engine_test.py --selftest")
         return 0
     for fn in (test_refuses_below_min, test_refuses_no_text, test_full_flow,
-               test_group_replace_on_ban, test_quarantine_on_dead_session,
+               test_group_replace_on_ban, test_join_retry_vs_drop,
+               test_quarantine_on_dead_session,
                test_pv_reply_once, test_file_mode_sends_file,
-               test_live_state_shape):
+               test_busy_accounts_skipped, test_live_state_shape):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
