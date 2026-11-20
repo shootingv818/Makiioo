@@ -106,6 +106,10 @@ class FakeExecutor:
         self.left.append((acc["id"], guid))
         return {"ok": True}
 
+    async def send_file(self, acc, guid):
+        self.sent.append((acc["id"], guid, "[FILE]"))
+        return {"ok": True}
+
     async def pv(self, acc, state):
         self.pv_calls += 1
         return {"ok": True, "new": self.pv_data.get(acc["id"], []), "state": "1"}
@@ -269,6 +273,25 @@ def test_pv_reply_once():
     eq(len(replies_to_u1), 1, "replied to U1 exactly once")
 
 
+def test_file_mode_sends_file():
+    _fresh_db()
+    adb.add_text("[FILE] caption")
+    adb.set("text_is_file", "true")      # file+caption ad content
+    adb.set("channels", "@s")
+    adb.set("scan_count", 4)
+    adb.set("groups_per", 2)
+    bot = FakeBot(_accounts(4))
+    links = [f"http://x/joing/L{i}" for i in range(4)]
+    health = {lk: {"guid": f"G{i}", "name": f"g{i}", "members": 50}
+              for i, lk in enumerate(links)}
+    ex = FakeExecutor(links, health)
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=1.5))
+    # every send went through the FILE path (marked "[FILE]")
+    ok(ex.sent, "file-mode produced sends")
+    ok(all(t == "[FILE]" for (_a, _g, t) in ex.sent),
+       "file mode uploads the file instead of sending literal text")
+
+
 def test_live_state_shape():
     _fresh_db()
     adb.add_text("ad")
@@ -289,7 +312,8 @@ def main():
         return 0
     for fn in (test_refuses_below_min, test_refuses_no_text, test_full_flow,
                test_group_replace_on_ban, test_quarantine_on_dead_session,
-               test_pv_reply_once, test_live_state_shape):
+               test_pv_reply_once, test_file_mode_sends_file,
+               test_live_state_shape):
         try:
             fn()
         except Exception as e:  # noqa: BLE001

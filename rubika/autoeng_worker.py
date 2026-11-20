@@ -161,6 +161,36 @@ async def send_to(phone: str, guid: str, text: str) -> dict:
                 "error": repr(e)[:160]}
 
 
+async def send_file_to(phone: str, guid: str, file_b64: str, caption: str = "",
+                       filename: str = "file") -> dict:
+    """Send the ad FILE + caption to ONE group. Reuses caption_file's proven
+    tolerant document-send so no new upload logic is invented."""
+    import base64
+    import caption_file
+    try:
+        data = base64.b64decode(file_b64 or "")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": core.SYS_ERR, "error": f"bad file: {e}"}
+    if not data:
+        return {"ok": False, "code": core.SYS_ERR, "error": "empty file"}
+    pn = rb.normalize_phone(phone)
+
+    async def _do(client):
+        await asyncio.wait_for(
+            caption_file._upload_document(client, guid, data, caption, filename),
+            timeout=SEND_TIMEOUT * 3)
+        return True
+
+    try:
+        await account_conn.call(pn, _do, timeout=SEND_TIMEOUT * 3 + 15)
+        return {"ok": True}
+    except account_conn.InvalidAuthError:
+        return {"ok": False, "code": core.ACC_DEAD, "error": "session invalid"}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "code": core.classify_error(e, context="send"),
+                "error": repr(e)[:160]}
+
+
 async def leave(phone: str, guid: str) -> dict:
     pn = rb.normalize_phone(phone)
 

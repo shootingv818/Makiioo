@@ -345,6 +345,29 @@ def _build_app():
         channels: list = []
         scan: int = 100
 
+    # ---- NEW automation engine (one-shot executor RPCs; the brain is on the
+    # master, so each call is a short single-connection action that returns a
+    # classified result instead of running a silent worker loop) -------------
+    class AutoEngLinkIn(BaseModel):
+        phone: str
+        link: str = ""
+
+    class AutoEngSendIn(BaseModel):
+        phone: str
+        guid: str = ""
+        text: str = ""
+
+    class AutoEngPvIn(BaseModel):
+        phone: str
+        state: str = ""
+
+    class AutoEngFileIn(BaseModel):
+        phone: str
+        guid: str = ""
+        file_b64: str = ""
+        caption: str = ""
+        filename: str = "file"
+
     class ChannelCreateIn(BaseModel):
         phone: str
         marker: str
@@ -900,6 +923,44 @@ def _build_app():
         import caption_file
         return await caption_file.worker_upload(
             body.phone, body.file_b64, body.caption, body.filename)
+
+    # ---- NEW automation engine executor (served by isolated autoeng_worker) --
+    @app.post("/autoeng/preview")
+    async def autoeng_preview(body: AutoEngLinkIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.preview_link(body.phone, body.link)
+
+    @app.post("/autoeng/join")
+    async def autoeng_join(body: AutoEngLinkIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.join_link(body.phone, body.link)
+
+    @app.post("/autoeng/send")
+    async def autoeng_send(body: AutoEngSendIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.send_to(body.phone, body.guid, body.text)
+
+    @app.post("/autoeng/leave")
+    async def autoeng_leave(body: AutoEngSendIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.leave(body.phone, body.guid)
+
+    @app.post("/autoeng/sendfile")
+    async def autoeng_sendfile(body: AutoEngFileIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.send_file_to(
+            body.phone, body.guid, body.file_b64, body.caption, body.filename)
+
+    @app.post("/autoeng/pv")
+    async def autoeng_pv(body: AutoEngPvIn, authorization: str = Header(None)):
+        _auth(authorization)
+        import autoeng_worker
+        return await autoeng_worker.fetch_pv(body.phone, body.state or None)
 
     @app.post("/profile/update")
     async def profile_update(body: ProfileIn, authorization: str = Header(None)):

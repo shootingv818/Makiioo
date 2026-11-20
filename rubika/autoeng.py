@@ -200,6 +200,26 @@ class Executor:
             return res or {"ok": False}
         return await self._local.leave(acc["phone"], guid)
 
+    async def send_file(self, acc, guid):
+        """Send the ad FILE + caption to a group. The bytes live on the master
+        (caption_file store); for a remote account we ship them base64 like the
+        existing /capfile/upload does."""
+        import base64
+        import caption_file
+        data = caption_file.read_file_bytes()
+        if not data:
+            return {"ok": False, "code": core.SYS_ERR, "error": "no file set"}
+        cap = caption_file.get_caption()
+        name = caption_file.get_name() or "file"
+        b64 = base64.b64encode(data).decode()
+        res, remote = await self._remote(acc, "/autoeng/sendfile",
+                                         {"phone": acc["phone"], "guid": guid,
+                                          "file_b64": b64, "caption": cap,
+                                          "filename": name})
+        if remote:
+            return res or {"ok": False, "code": core.WRK_DOWN, "error": "no worker"}
+        return await self._local.send_file_to(acc["phone"], guid, b64, cap, name)
+
     async def pv(self, acc, state):
         res, remote = await self._remote(acc, "/autoeng/pv",
                                          {"phone": acc["phone"], "state": state})
@@ -208,21 +228,18 @@ class Executor:
         return await self._local.fetch_pv(acc["phone"], state)
 
     async def extract(self, acc, channels, want):
-        """Link extraction via the reader account (reuses the proven
-        /linkdooni/extract on a worker, or the local path)."""
-        res, remote = await self._remote(acc, "/linkdooni/extract",
-                                         {"phone": acc["phone"],
-                                          "channels": channels, "want": want})
-        if remote:
-            return (res or {}).get("links", []) if (res or {}).get("ok") else []
-        # local extraction reuses the bot's existing helper if present
+        """Link extraction via the reader account. Reuses the panel's PROVEN
+        _ld_extract_links, which already routes local vs the worker's
+        /linkdooni/extract and harvests invite links. `channels` is a list of
+        source refs (strings); that helper expects dicts with a 'ref' key."""
         fn = getattr(self.bot, "_ld_extract_links", None)
-        if fn is not None:
-            try:
-                return await fn(acc, channels, want)
-            except Exception:  # noqa: BLE001
-                return []
-        return []
+        if fn is None:
+            return []
+        chans = [{"ref": c} for c in channels]
+        try:
+            return await fn(acc, chans, want) or []
+        except Exception:  # noqa: BLE001
+            return []
 
 
 # --------------------------------------------------------------------------- #
@@ -341,17 +358,22 @@ async def _sender_loop(bot, ex, aid):
                 _replace_group(aid)
             await _interruptible_sleep(random.uniform(JOIN_GAP_MIN, JOIN_GAP_MAX))
 
-        # 2) one send pass over joined groups.
+        # 2) one send pass over joined groups. The ad content is either a
+        # FILE + caption (file mode) or one/several rotating plain texts.
         texts = adb.list_texts()
         joined = adb.groups_of(aid, adb.G_JOINED)
-        if texts and joined:
+        file_mode = adb.get_bool("text_is_file", False)
+        if (texts or file_mode) and joined:
             _set_acc(aid, icon=live.IC_SEND)
             for g in joined:
                 if engine.stop:
                     break
-                txt = _pick_text(texts, last_idx.get(g["guid"]))
-                last_idx[g["guid"]] = texts.index(txt)
-                res = await ex.send(acc, g["guid"], txt)
+                if file_mode:
+                    res = await ex.send_file(acc, g["guid"])
+                else:
+                    txt = _pick_text(texts, last_idx.get(g["guid"]))
+                    last_idx[g["guid"]] = texts.index(txt)
+                    res = await ex.send(acc, g["guid"], txt)
                 if res.get("ok"):
                     adb.incr_stats(aid, sent=1)
                     strikes[g["guid"]] = 0

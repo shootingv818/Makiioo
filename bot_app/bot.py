@@ -496,16 +496,19 @@ async def section_automation_cb(event):
     if not is_owner(event):
         return
     state.pop(event.sender_id, None)
-    rows = [
-        [Button.inline("🚀 Send", b"send_menu"),
-         Button.inline("📤 Multi Send", b"multisend")],
-        [Button.inline("🔁 Automation", b"automation"),
-         Button.inline("🧠 Brain", b"brain")],
-        [Button.inline("🧠 Channel Brain", b"cbrain"),
-         Button.inline("🖼 PV Photo (PDF)", b"pvexport")],
-        [Button.inline("🔙 Back", b"home")],
-    ]
-    await safe_edit(event, "🔁 Automation & Sending — choose an option:", buttons=rows)
+    # The Automation button now opens the NEW unified multi-account engine
+    # (autoeng_ui). The previous sub-menu buttons — Send / Multi Send /
+    # Automation / Brain / Channel Brain / PV Photo (and Discovery / Pool under
+    # Brain) — are HIDDEN on purpose: their handlers/code still exist and are
+    # tracked in project_notes/FUTURE_UPDATES.md for possible later use.
+    try:
+        import bot as _self_ae
+        import autoeng_ui
+        await autoeng_ui.show_home(_self_ae, event)
+    except Exception as _aee:  # never trap the owner in a dead menu
+        await safe_edit(event, card("⚠️ Automation engine error",
+                        [repr(_aee)[:180], LINE, f"🕒 {now()}"]),
+                        buttons=[[Button.inline("🔙 Back", b"home")]])
 
 
 @bot.on(events.CallbackQuery(data=b"sec_accounts"))
@@ -6260,6 +6263,14 @@ async def amain():
         caption_file.register(_self2)
     except Exception as _cfe:
         await log(card("⚠️ - #CaptionFile_Error", [f"🔧 boot: {repr(_cfe)[:180]}"]))
+    # Isolated NEW automation engine (multi-account scan/send under one roof).
+    # Guarded: a failure here can never stop the panel from booting.
+    try:
+        import bot as _self3
+        import autoeng_ui
+        autoeng_ui.register(_self3)
+    except Exception as _aee:
+        await log(card("⚠️ - #AutoEngine_Error", [f"🔧 boot: {repr(_aee)[:180]}"]))
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
     # ---- Portal (isolated, additive) ----
@@ -6297,6 +6308,14 @@ async def amain():
     asyncio.create_task(linkdooni_summary_loop())
     await recover_extras()
     await recover_linkdooni()
+    # NEW automation engine: resume if it was running before the restart
+    # (roles + saved groups persisted in its own DB).
+    try:
+        import bot as _self_aer
+        import autoeng_ui as _aeui
+        await _aeui.restore(_self_aer)
+    except Exception as _aere:
+        print(f"[autoeng restore] {_aere}")
     # POOL BRAIN: resume any pool job that was mid-leech/mid-send before restart
     # (durable cursor + global sent-ledger prevent duplicate sends).
     try:
