@@ -653,6 +653,12 @@ async def _render_accounts(event, page: int = 0):
         buttons.append(nav)
     buttons.append([Button.inline("🔄 Check & Clean Dead Accounts",
                                   b"acc_sweep")])
+    # bulk delete of shot/quarantined accounts — same db.delete_account() the
+    # single-account delete uses, just applied to all of them at once.
+    _shot = _shot_accounts()
+    if _shot:
+        buttons.append([Button.inline(f"🗑 Delete all shot accounts ({len(_shot)})",
+                                      b"acc_delshot")])
     buttons.append([Button.inline("🔙 Back", b"home")])
     title = "👤 Your accounts:"
     if total_pages > 1:
@@ -665,6 +671,67 @@ async def accounts_page_cb(event):
     if not is_owner(event):
         return
     await _render_accounts(event, int(event.pattern_match.group(1)))
+
+
+# --------------------------------------------------------------------------- #
+# Bulk delete of shot accounts. The owner had to delete them one by one; this
+# does EXACTLY what the single delete does (db.delete_account) for every
+# shot/quarantined account, behind the same kind of confirmation.
+# --------------------------------------------------------------------------- #
+_SHOT_STATES = ("quarantined", "dead", "invalid", "shot")
+
+
+def _shot_accounts() -> list:
+    """Accounts the panel already considers unusable (never 'active')."""
+    out = []
+    try:
+        for a in db.list_accounts():
+            st = str(a.get("status") or "").strip().lower()
+            if st in _SHOT_STATES:
+                out.append(a)
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+@bot.on(events.CallbackQuery(data=b"acc_delshot"))
+async def acc_delshot_confirm_cb(event):
+    if not is_owner(event):
+        return
+    shot = _shot_accounts()
+    if not shot:
+        await event.answer("No shot accounts.", alert=True)
+        return
+    rows = [f"• {a['phone']} · {a.get('status')}" for a in shot[:25]]
+    if len(shot) > 25:
+        rows.append(f"… and {len(shot) - 25} more")
+    await safe_edit(event, card("🗑 Delete ALL shot accounts?", rows + [
+        LINE,
+        f"{len(shot)} account(s) will be deleted — this cannot be undone.",
+        f"🕒 {now()}"]),
+        buttons=[[Button.inline("✅ Yes, delete all", b"acc_delshot_yes")],
+                 [Button.inline("🔙 No", b"accounts")]])
+
+
+@bot.on(events.CallbackQuery(data=b"acc_delshot_yes"))
+async def acc_delshot_do_cb(event):
+    if not is_owner(event):
+        return
+    shot = _shot_accounts()
+    done, failed = [], []
+    for a in shot:
+        try:
+            db.delete_account(a["id"])          # same call as the single delete
+            done.append(a["phone"])
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{a['phone']} ({repr(e)[:40]})")
+    rows = [f"• Deleted : {len(done)}"]
+    if failed:
+        rows.append(f"• Failed  : {len(failed)}")
+        rows += [f"  - {f}" for f in failed[:10]]
+    await log(card("🗑 SHOT ACCOUNTS DELETED", rows + [LINE, f"🕒 {now()}"]))
+    await safe_edit(event, card("🗑 Done", rows + [LINE, f"🕒 {now()}"]),
+                    buttons=[[Button.inline("🔙 Accounts", b"accounts")]])
 
 
 @bot.on(events.CallbackQuery(data=b"acc_sweep"))
