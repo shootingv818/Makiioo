@@ -193,11 +193,14 @@ def register(bot) -> None:
         if _is_running():
             await event.answer("already running")
             return await show_home(bot, event)
-        # fresh live message each start.
-        adb.set("live_msg_ids", "")
-        import bot as _self
-        ok, msg = await eng.start(_self, _selected_ids())
-        await event.answer(msg[:80])
+        # `bot` IS the panel module (register() is called with it), so use it
+        # directly instead of re-importing — one source of truth, and testable.
+        ok_, msg = await eng.start(bot, _selected_ids())
+        await event.answer(str(msg)[:80])
+        if not ok_:
+            await bot.log(bot.card("▶ AUTOMATION — could not start",
+                                   [f"• Reason : {msg}", bot.LINE,
+                                    f"🕒 {bot.now()}"]))
         await show_home(bot, event)
 
     # ---- stop / reset ----------------------------------------------------- #
@@ -517,16 +520,40 @@ def register(bot) -> None:
 # boot restore (called from amain): relaunch if it was running before restart.
 # --------------------------------------------------------------------------- #
 async def restore(bot) -> None:
+    """Relaunch the engine after a restart if it was running before. NEVER
+    fails silently: if the resume cannot happen the owner is told in the log
+    group, because a silently-not-resumed engine looks identical to a working
+    one from the panel."""
     adb.init()
     if not adb.get_bool("running", False):
         return
     ids = _selected_ids()
     if len(ids) < core.MIN_ACCOUNTS:
         adb.set("running", "0")
+        await _safe_log(bot, bot.card("♻ AUTOMATION — not resumed", [
+            f"• Selected accounts : {len(ids)} (min {core.MIN_ACCOUNTS})",
+            "The engine was running before the restart but cannot resume.",
+            bot.LINE, f"🕒 {bot.now()}"]))
         return
-    adb.set("live_msg_ids", "")
     try:
-        import bot as _self
-        await eng.start(_self, ids)
-    except Exception:  # noqa: BLE001
+        ok_, msg = await eng.start(bot, ids)
+        if ok_:
+            await _safe_log(bot, bot.card("♻ AUTOMATION — resumed after restart",
+                                          [f"• {msg}", bot.LINE,
+                                           f"🕒 {bot.now()}"]))
+        else:
+            adb.set("running", "0")
+            await _safe_log(bot, bot.card("♻ AUTOMATION — not resumed",
+                                          [f"• Reason : {msg}", bot.LINE,
+                                           f"🕒 {bot.now()}"]))
+    except Exception as e:  # noqa: BLE001
         adb.set("running", "0")
+        await _safe_log(bot, bot.card("♻ AUTOMATION — resume FAILED", [
+            f"• Error : {repr(e)[:180]}", bot.LINE, f"🕒 {bot.now()}"]))
+
+
+async def _safe_log(bot, text) -> None:
+    try:
+        await bot.log(text)
+    except Exception:  # noqa: BLE001
+        pass

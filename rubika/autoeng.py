@@ -627,6 +627,20 @@ async def start(bot, account_ids, *, executor=None):
         acc["_tag"] = f"A{i}"
         engine.accounts[aid] = acc
     engine.roles = {a: roles[a] for a in roles if a in engine.accounts}
+    if not engine.roles:
+        return False, "none of the selected accounts could be loaded"
+
+    # Build the executor BEFORE flipping any state. If this fails (a missing
+    # module after a bad deploy, a broken worker import, ...) the engine must
+    # NOT be left marked "running" with zero tasks — that looks healthy in the
+    # panel while nothing actually sends.
+    try:
+        ex = executor or Executor(bot)
+    except Exception as e:  # noqa: BLE001
+        engine.running = False
+        adb.set("running", "0")
+        return False, f"engine could not initialise: {repr(e)[:140]}"
+
     adb.save_roles(engine.roles)
     engine.reset_counters()
     engine.stop = False
@@ -634,8 +648,11 @@ async def start(bot, account_ids, *, executor=None):
     engine.started_at = time.time()
     adb.set("running", "1")
     adb.set("started_at", str(int(engine.started_at)))
+    # "a NEW pinned live message on every start" is an ENGINE promise, not a UI
+    # detail: clear the stored ids here so it holds no matter which entry point
+    # started the run (panel confirm, boot restore, or a direct call).
+    adb.set("live_msg_ids", "")
 
-    ex = executor or Executor(bot)
     scanners, senders = core.split_roles(engine.roles)
     engine.tasks = []
     engine.tasks.append(asyncio.create_task(_scan_driver(bot, ex)))

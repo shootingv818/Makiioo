@@ -361,6 +361,32 @@ def test_busy_accounts_skipped():
     ok("skipped" in msg2 or "free" in msg2, "message explains busy skip")
 
 
+def test_broken_executor_never_leaves_engine_half_started():
+    """REGRESSION: start() used to flip running=True BEFORE building the
+    executor, so an init failure left the engine 'running' with zero tasks —
+    the panel looked healthy while nothing sent."""
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    bot = FakeBot(_accounts(4))
+
+    class Boom:
+        def __init__(self, *a, **k):
+            raise ModuleNotFoundError("No module named 'account_conn'")
+
+    orig = eng.Executor
+    eng.Executor = Boom
+    try:
+        ok_, msg = _arun(eng.start(bot, [1, 2, 3, 4]))   # no executor injected
+    finally:
+        eng.Executor = orig
+    ok(not ok_, "start reports failure when the executor cannot be built")
+    ok("could not initialise" in msg, f"reason surfaced ({msg})")
+    ok(not eng.engine.running, "engine NOT left marked running")
+    ok(not adb.get_bool("running"), "persisted running flag NOT left on")
+    eq(eng.engine.tasks, [], "no tasks were spawned")
+
+
 def test_live_state_shape():
     _fresh_db()
     adb.add_text("ad")
@@ -383,7 +409,9 @@ def main():
                test_group_replace_on_ban, test_join_retry_vs_drop,
                test_quarantine_on_dead_session,
                test_pv_reply_once, test_file_mode_sends_file,
-               test_busy_accounts_skipped, test_live_state_shape):
+               test_busy_accounts_skipped,
+               test_broken_executor_never_leaves_engine_half_started,
+               test_live_state_shape):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
