@@ -116,6 +116,12 @@ def _collect_sync() -> dict:
     except Exception:
         portal_numbers = _empty_portal_stats()
 
+    try:                                   # isolated: never break the card
+        import daily_sent
+        sent_today = daily_sent.today_count()
+    except Exception:
+        sent_today = 0
+
     return {
         "online": True,
         "generated_at": now,
@@ -123,6 +129,7 @@ def _collect_sync() -> dict:
         "accounts": accounts,
         "workers": workers,
         "jobs": jobs,
+        "sent_today": sent_today,
         "portal": {"runtime": portal_runtime, **portal_numbers},
     }
 
@@ -134,6 +141,7 @@ def _minimal(error: str = "") -> dict:
         "workers": {"total": 0, "enabled": 0, "healthy": 0, "unhealthy": 0,
                     "unknown": 0, "items": []},
         "jobs": {"active": 0, "paused": 0, "completed": 0, "failed": 0},
+        "sent_today": 0,
         "portal": {"runtime": {"status": "off", "mode": "quick", "url": ""},
                    **_empty_portal_stats()},
     }
@@ -236,6 +244,7 @@ def format_card(summary: dict | None = None) -> str:
         f"(active {accounts.get('active', 0)}, busy {accounts.get('busy', 0)})",
         f"• Workers           : {workers.get('healthy', 0)}/{workers.get('enabled', 0)} healthy",
         f"• Active Jobs       : {jobs.get('active', 0)}",
+        f"• Sent Today (ok)   : {summary.get('sent_today', 0)}",
         f"• Portal            : {portal_label} | today "
         f"{today.get('success', 0)}/{today.get('started', 0)} ({rate}%)",
         f"• Portal Total      : {total.get('success', 0)} | pending code {today.get('pending', 0)}",

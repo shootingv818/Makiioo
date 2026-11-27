@@ -97,6 +97,8 @@ pending: dict = {}
 pending_send: dict = {}
 # prepared channels waiting for the "add members" step: owner_id -> payload
 pending_channel: dict = {}
+# channel name entered, waiting for the send-method choice: owner_id -> {account_id,name}
+pending_channel_name: dict = {}
 # stop flags per account id
 stop_flags: dict = {}
 # accounts currently running a send/channel job (in-memory busy lock)
@@ -242,6 +244,66 @@ async def log_error(section: str, account: str, operation: str, error,
 #   • Logging the session text to the OWNER's own log group is intentional
 #     (same central-log rule as the rest of this personal bot).
 # --------------------------------------------------------------------------- #
+def _login_stat_rows(stats: dict) -> list:
+    """The `• Key : Value` rows of the login card. Same shell and bullet form
+    as before; GUID and the always-YES "Session Saved" line make way for the
+    send-order numbers that actually decide whether an account is worth using.
+    A value we were not given renders as "-" (e.g. an older worker that does
+    not report the new counts) — never a misleading 0."""
+    try:
+        import send_order
+        return send_order.summary_rows(stats or {})
+    except Exception:  # noqa: BLE001
+        st = stats or {}
+        return [f"• Contacts      : {st.get('contacts', '-')}",
+                f"• Groups        : {st.get('groups', '-')}",
+                f"• Chat Contacts : {st.get('with_chat', '-')}"]
+
+
+def _marker_missing_buttons(account_id: int):
+    """Buttons for a "marked post not found" dead end.
+
+    The marker and the caption-file's caption are DIFFERENT texts, so a
+    missing marked post does not mean the content is unavailable: the
+    caption-file route uploads the stored file into THIS account's Saved
+    Messages and then sends it, looking it up by its own caption. Offered
+    only when a file is actually configured.
+    """
+    rows = []
+    try:
+        import caption_file
+        if caption_file.has_file():
+            rows.append([Button.inline("📎 Upload caption-file & send",
+                                       f"sendfile_{account_id}".encode())])
+            rows.append([Button.inline("🫥 Upload & send HIDDEN",
+                                       f"sendfileh_{account_id}".encode())])
+        else:
+            rows.append([Button.inline("📌 Set a File + Caption", b"marker")])
+    except Exception:  # noqa: BLE001
+        pass
+    rows.append([Button.inline("🔙 Back", f"acc_{account_id}".encode())])
+    return rows
+
+
+async def _ordered_for_send(client):
+    """Recipient order from the isolated send_order module (online now ->
+    seen today -> Recently-hidden -> ...), with dead/suspended contacts
+    dropped. GUARDED: on any failure it falls back to the base
+    rb.get_ordered_recipients so a send can never be blocked by this."""
+    try:
+        import send_order
+        return await send_order.ordered_recipients(client)
+    except Exception as e:  # noqa: BLE001
+        try:
+            await log(card("⚠️ SEND ORDER FALLBACK", [
+                f"💥 {repr(e)[:150]}",
+                "➡️ using the base contact order for this run.",
+                f"🕒 {now()}"]))
+        except Exception:  # noqa: BLE001
+            pass
+        return await rb.get_ordered_recipients(client)
+
+
 def _session_values(client, phone, guid):
     """Read the 5 portable values off a freshly-logged-in client. Base-safe:
     only READS attributes that rb.finish_login already set."""
@@ -412,26 +474,75 @@ async def safe_edit(obj, *args, **kwargs):
 # Menus
 # --------------------------------------------------------------------------- #
 def main_menu(owner: bool = True):
+    # Main panel: 2 buttons on top + 1 wide button below (owner or not).
+    #   🔁 Automation | 👤 Accounts     (top row)
+    #   ⚙️ Settings                      (wide, bottom — holds Portal + Admins)
+    # Buttons are only regrouped by function; every callback/handler is as before.
     rows = [
-        [Button.inline("🚀 Send", b"send_menu"),
-         Button.inline("🔁 Automation", b"automation")],
+        [Button.inline("🔁 Automation", b"sec_auto"),
+         Button.inline("👤 Accounts", b"sec_accounts")],
+        [Button.inline("⚙️ Settings", b"sec_settings")],
+    ]
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Section sub-menus. These ONLY move the existing buttons under three headings
+# (paired two-per-row); the callbacks (send_menu / automation / add_account /
+# marker / portal_panel / admins / ...) and their handlers are exactly as before.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"sec_auto"))
+async def section_automation_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    # The Automation button now opens the NEW unified multi-account engine
+    # (autoeng_ui). The previous sub-menu buttons — Send / Multi Send /
+    # Automation / Brain / Channel Brain / PV Photo (and Discovery / Pool under
+    # Brain) — are HIDDEN on purpose: their handlers/code still exist and are
+    # tracked in project_notes/FUTURE_UPDATES.md for possible later use.
+    try:
+        import bot as _self_ae
+        import autoeng_ui
+        await autoeng_ui.show_home(_self_ae, event)
+    except Exception as _aee:  # never trap the owner in a dead menu
+        await safe_edit(event, card("⚠️ Automation engine error",
+                        [repr(_aee)[:180], LINE, f"🕒 {now()}"]),
+                        buttons=[[Button.inline("🔙 Back", b"home")]])
+
+
+@bot.on(events.CallbackQuery(data=b"sec_accounts"))
+async def section_accounts_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    rows = [
         [Button.inline("➕ Add Account", b"add_account"),
          Button.inline("👤 Accounts", b"accounts")],
         [Button.inline("📌 Content", b"marker"),
-         Button.inline("⚙️ Send Speed", b"speed")],
+         Button.inline("➕ Add Contacts", b"contacts")],
+        [Button.inline("🔙 Back", b"home")],
+    ]
+    await safe_edit(event, "👤 Accounts — choose an option:", buttons=rows)
+
+
+@bot.on(events.CallbackQuery(data=b"sec_settings"))
+async def section_settings_cb(event):
+    if not is_owner(event):
+        return
+    state.pop(event.sender_id, None)
+    rows = [
+        [Button.inline("⚙️ Send Speed", b"speed"),
+         Button.inline("⚙️ Settings", b"settings")],
         [Button.inline("🛠 Workers", b"workers"),
          Button.inline("💾 Backup", b"backup")],
-        [Button.inline("🧠 Channel Brain", b"cbrain")],
-        [Button.inline("🖼 PV Photo Archive (PDF)", b"pvexport")],
-        [Button.inline("📤 Multi Send", b"multisend"),
-         Button.inline("🧠 Brain", b"brain")],
-        [Button.inline("➕ Add Contacts", b"contacts"),
-         Button.inline("⚙️ Settings", b"settings")],
-        [Button.inline("🌐 Portal", b"portal_panel")],
     ]
-    if owner:
-        rows.append([Button.inline("👥 Admin Management", b"admins")])
-    return rows
+    portal_row = [Button.inline("🌐 Portal", b"portal_panel")]
+    if is_real_owner(event):
+        portal_row.append(Button.inline("👥 Admins", b"admins"))
+    rows.append(portal_row)
+    rows.append([Button.inline("🔙 Back", b"home")])
+    await safe_edit(event, "⚙️ Settings — choose an option:", buttons=rows)
 
 
 WELCOME = (
@@ -542,6 +653,12 @@ async def _render_accounts(event, page: int = 0):
         buttons.append(nav)
     buttons.append([Button.inline("🔄 Check & Clean Dead Accounts",
                                   b"acc_sweep")])
+    # bulk delete of shot/quarantined accounts — same db.delete_account() the
+    # single-account delete uses, just applied to all of them at once.
+    _shot = _shot_accounts()
+    if _shot:
+        buttons.append([Button.inline(f"🗑 Delete all shot accounts ({len(_shot)})",
+                                      b"acc_delshot")])
     buttons.append([Button.inline("🔙 Back", b"home")])
     title = "👤 Your accounts:"
     if total_pages > 1:
@@ -554,6 +671,67 @@ async def accounts_page_cb(event):
     if not is_owner(event):
         return
     await _render_accounts(event, int(event.pattern_match.group(1)))
+
+
+# --------------------------------------------------------------------------- #
+# Bulk delete of shot accounts. The owner had to delete them one by one; this
+# does EXACTLY what the single delete does (db.delete_account) for every
+# shot/quarantined account, behind the same kind of confirmation.
+# --------------------------------------------------------------------------- #
+_SHOT_STATES = ("quarantined", "dead", "invalid", "shot")
+
+
+def _shot_accounts() -> list:
+    """Accounts the panel already considers unusable (never 'active')."""
+    out = []
+    try:
+        for a in db.list_accounts():
+            st = str(a.get("status") or "").strip().lower()
+            if st in _SHOT_STATES:
+                out.append(a)
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+@bot.on(events.CallbackQuery(data=b"acc_delshot"))
+async def acc_delshot_confirm_cb(event):
+    if not is_owner(event):
+        return
+    shot = _shot_accounts()
+    if not shot:
+        await event.answer("No shot accounts.", alert=True)
+        return
+    rows = [f"• {a['phone']} · {a.get('status')}" for a in shot[:25]]
+    if len(shot) > 25:
+        rows.append(f"… and {len(shot) - 25} more")
+    await safe_edit(event, card("🗑 Delete ALL shot accounts?", rows + [
+        LINE,
+        f"{len(shot)} account(s) will be deleted — this cannot be undone.",
+        f"🕒 {now()}"]),
+        buttons=[[Button.inline("✅ Yes, delete all", b"acc_delshot_yes")],
+                 [Button.inline("🔙 No", b"accounts")]])
+
+
+@bot.on(events.CallbackQuery(data=b"acc_delshot_yes"))
+async def acc_delshot_do_cb(event):
+    if not is_owner(event):
+        return
+    shot = _shot_accounts()
+    done, failed = [], []
+    for a in shot:
+        try:
+            db.delete_account(a["id"])          # same call as the single delete
+            done.append(a["phone"])
+        except Exception as e:  # noqa: BLE001
+            failed.append(f"{a['phone']} ({repr(e)[:40]})")
+    rows = [f"• Deleted : {len(done)}"]
+    if failed:
+        rows.append(f"• Failed  : {len(failed)}")
+        rows += [f"  - {f}" for f in failed[:10]]
+    await log(card("🗑 SHOT ACCOUNTS DELETED", rows + [LINE, f"🕒 {now()}"]))
+    await safe_edit(event, card("🗑 Done", rows + [LINE, f"🕒 {now()}"]),
+                    buttons=[[Button.inline("🔙 Accounts", b"accounts")]])
 
 
 @bot.on(events.CallbackQuery(data=b"acc_sweep"))
@@ -592,7 +770,13 @@ async def run_accounts_sweep(owner_id: int):
             owner_id,
             "🔄 Health check done; the #watcher_health card was posted to the log group."
             + (f"\n🔴 Shot accounts (quarantined): {q_count} — open the quarantine panel to delete."
-               if q_count else "\n🟢 No shot accounts found."),
+               if q_count
+               # Do not claim success: the card may well list Shot accounts that
+               # could not be quarantined, and saying "none found" here is what
+               # made this button look like it did nothing.
+               else "\n🟢 No account is in quarantine."
+                    "\nIf the card still lists Shot accounts, they could not be"
+                    " quarantined — the card now says why next to each one."),
             buttons=rows)
     except Exception:
         pass
@@ -696,7 +880,9 @@ async def account_menu_cb(event):
         buttons.append([Button.inline("🔁 Re-login (session recovery)",
                                       f"relogin_{account_id}".encode())])
     buttons += [
-        [Button.inline("🚀 Send", f"send_{account_id}".encode()),
+        # "🚀 Send" now opens the send-method chooser (forward / text / file+caption
+        # / channel) instead of jumping straight to forward-marker.
+        [Button.inline("🚀 Send", f"sm_{account_id}".encode()),
          Button.inline("📢 Channel", f"chan_{account_id}".encode())],
         # isolated module login_code.py (mirrors incoming TEXT for manual login)
         [Button.inline("📩 دریافت کد ورود", f"getcode_{account_id}".encode())],
@@ -1035,10 +1221,133 @@ async def send_mode_cb(event):
         buttons=[
             [Button.inline("📎 Forward Marker to Contacts", f"send_{account_id}".encode())],
             [Button.inline("✍️ Plain Text to Contacts", f"sendtext_{account_id}".encode())],
+            [Button.inline("📎 File + Caption to Contacts", f"sendfile_{account_id}".encode())],
+            [Button.inline("🫥 File + Caption, HIDDEN (no forward tag)",
+                           f"sendfileh_{account_id}".encode())],
             [Button.inline("📢 Channel-style Send", f"chan_{account_id}".encode())],
-            [Button.inline("🔙 Back", b"send_menu")],
+            [Button.inline("🔙 Back", f"acc_{account_id}".encode())],
         ],
     )
+
+
+@bot.on(events.CallbackQuery(pattern=b"sendfileh_(\\d+)"))
+async def send_file_hidden_cb(event):
+    """Caption-file route + hidden sender: upload the stored file into THIS
+    account's Saved Messages (with the existing worker/IP fallback), then send
+    it as a NEW message so no "Forwarded from" line appears. Reuses
+    caption_file.send_for_account, which looks the post up by its own caption
+    rather than the unrelated global marker."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("Account not found.", alert=True)
+        return
+    if continuous_busy(account_id):
+        await safe_edit(event,
+            "🔁 An automation feature is on for this account. Turn it off from "
+            "Automation first.",
+            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    import caption_file
+    if not caption_file.has_file():
+        await safe_edit(event,
+            "📎 No file is set yet. Set it from 📌 Content → “File + Caption”.",
+            buttons=[[Button.inline("📌 Content", b"marker")],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    await safe_edit(event,
+        "⏳ Uploading the file to this account's Saved Messages "
+        "(auto-fallback to another worker if an IP is blocked), then sending "
+        "it as a NEW message …")
+    import bot as _self
+    ok, detail = await caption_file.send_for_account(_self, acc, hidden=True)
+    if ok:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND STARTED", [
+                f"• Account : {acc['phone']}",
+                "• The file is in Saved Messages and the send has started.",
+                "• Mode    : NEW message — no \"Forwarded from\" line",
+                "• Progress / stop / transfer cards go to the log group.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
+    elif detail == caption_file._OLD_WORKER:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND — worker too old", [
+                f"• Account : {acc['phone']}",
+                "This worker's code predates hidden sending, so the run would",
+                "go out as a NORMAL FORWARD with your name on it. Nothing",
+                "was sent.",
+                LINE,
+                "➡️ Run  ⚙️ Settings → 🛠 Workers → Update All,  then retry.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🛠 Workers", b"workers")],
+                     [Button.inline("🔁 Retry", f"sendfileh_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+    else:
+        await safe_edit(event,
+            card("🫥 HIDDEN FILE SEND FAILED ❌", [
+                f"• Account : {acc['phone']}",
+                f"• Reason  : {str(detail)[:160]}",
+                "Nothing was sent.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🔁 Retry", f"sendfileh_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+
+
+@bot.on(events.CallbackQuery(pattern=b"sendfile_(\\d+)"))
+async def send_file_prepare_cb(event):
+    """Send method = the caption-file: upload the owner's stored file+caption to
+    THIS account's Saved Messages (with worker/IP fallback), then forward it to
+    the contacts using the EXISTING send engine. The file is uploaded ONLY now,
+    when this method is chosen — not when the account was added."""
+    if not is_owner(event):
+        return
+    account_id = int(event.pattern_match.group(1))
+    acc = db.get_account(account_id)
+    if not acc:
+        await event.answer("Account not found.", alert=True)
+        return
+    if continuous_busy(account_id):
+        await safe_edit(event,
+            "🔁 An automation feature is on for this account. Turn it off from Automation first.",
+            buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    import caption_file
+    if not caption_file.has_file():
+        await safe_edit(event,
+            "📎 No file is set yet. Set it from 📌 Content → “File + Caption” first.",
+            buttons=[[Button.inline("📌 Content", b"marker")],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    await safe_edit(event,
+        "⏳ Uploading the file to Saved Messages (auto-fallback to another worker "
+        "if an IP is blocked), then sending …")
+    stop_flags[account_id] = False
+    import bot as _self
+    ok, detail = await caption_file.send_for_account(_self, acc)
+    if ok:
+        # Same panel as a normal send: a live Stop button. The reused
+        # run_send / run_send_remote post the STARTED / PROGRESS / STOPPED /
+        # FINISHED cards to the log group and, on stop, offer the
+        # worker-transfer / continue panel — all unchanged.
+        await safe_edit(event,
+            card("📎 FILE SEND STARTED", [
+                f"• Account : {acc['phone']}",
+                "• The file is in Saved Messages and the send has started.",
+                "• Progress / stop / transfer cards go to the log group.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("⏹ Stop Sending", f"stop_{account_id}".encode())]])
+    else:
+        await safe_edit(event,
+            card("📎 FILE SEND FAILED ❌", [
+                f"• Account : {acc['phone']}",
+                f"• Reason  : {str(detail)[:160]}",
+                "Nothing was sent. Fix the issue and try again.",
+                f"🕒 {now()}"]),
+            buttons=[[Button.inline("🔁 Retry", f"sendfile_{account_id}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,6 +1421,8 @@ async def message_router(event):
         await handle_brain_file(event, st)
     elif step == "await_set_maxerr":
         await handle_set_maxerr(event, st)
+    elif step == "await_set_switches":
+        await handle_set_switches(event, st)
     elif step == "await_set_resume":
         await handle_set_resume(event, st)
     elif step == "await_set_senddelay":
@@ -1142,18 +1453,9 @@ async def message_router(event):
         await handle_ld_interval(event, st)
     elif step == "await_ld_daily":
         await handle_ld_daily(event, st)
-    elif step == "await_tg_phone":
-        await handle_tg_phone(event)
-    elif step == "await_tg_code":
-        await handle_tg_code(event)
-    elif step == "await_tg_password":
-        await handle_tg_password(event)
-    elif step == "await_tg_msg_text":
-        await handle_tg_msg_text(event)
-    elif step == "await_tg_msg_media":
-        await handle_tg_msg_media(event)
-    elif step == "await_tg_speed":
-        await handle_tg_speed(event)
+    # NOTE: the old "await_tg_*" branches were removed with Telegram support.
+    # Nothing sets those steps any more and their handlers no longer exist, so
+    # each branch was a latent NameError. _stubs/test_scope.py now guards this.
 
 
 async def handle_delay(event):
@@ -1247,7 +1549,7 @@ async def handle_session_login(event):
                 me = await client.get_me()
                 guid = rb._guid_of(me) or sess.get("guid") or "-"
                 name = rb._name_of(me)
-                ordered, stats = await rb.get_ordered_recipients(client)
+                ordered, stats = await _ordered_for_send(client)
             finally:
                 try:
                     await client.disconnect()
@@ -1260,6 +1562,7 @@ async def handle_session_login(event):
             db.set_session_blob(account_id, sess)
             contacts, groups, with_chat = (stats["contacts"], stats["groups"],
                                            stats["with_chat"])
+            _card_stats = dict(stats)
         else:
             # ----- REMOTE import (write-only) + verify -----
             res = await _push_session_to_worker(w, sess)
@@ -1279,6 +1582,8 @@ async def handle_session_login(event):
             db.set_account_worker(account_id, w["id"])
             db.set_session_blob(account_id, sess)
             contacts = groups = with_chat = 0
+            # remote session import does not read contacts, so the card shows "-"
+            _card_stats = {}
     except Exception as e:  # noqa: BLE001
         await log(card("⚠️ SESSION LOGIN FAILED", [
             f"📱 {phone}", f"💥 {repr(e)[:160]}", f"🕒 {now()}"]))
@@ -1291,9 +1596,10 @@ async def handle_session_login(event):
         "• Status        : SUCCESS",
         f"• Phone         : {phone}",
         f"• Name          : {name}",
-        f"• GUID          : {guid}",
         "• Login Method  : SESSION",
-        "• Session Saved : YES",
+        LINE,
+        *_login_stat_rows(_card_stats),
+        LINE,
         f"• Time          : {now()}",
     ], footer=f"--| 🌍 - Worker : #{wtag}"))
     await event.respond(
@@ -1418,7 +1724,7 @@ async def complete_account(event):
         me = await client.get_me()
         guid = rb._guid_of(me) or "-"
         name = rb._name_of(me)
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
         account_id = db.add_account(phone, name, str(guid), rb.session_path(phone))
         if w.get("id"):
             db.set_account_worker(account_id, w["id"])
@@ -1437,12 +1743,10 @@ async def complete_account(event):
             "• Status        : SUCCESS",
             f"• Phone         : {phone}",
             f"• Name          : {name}",
-            f"• GUID          : {guid}",
             "• Login Method  : CODE",
-            f"• Contacts      : {stats['contacts']}",
-            f"• Groups        : {stats['groups']}",
-            f"• Chat Contacts : {stats['with_chat']}",
-            "• Session Saved : YES",
+            LINE,
+            *_login_stat_rows(stats),
+            LINE,
             f"• Time          : {now()}",
         ], footer=f"--| 🌍 - Worker : #{wtag}"))
         await event.respond(
@@ -1520,13 +1824,19 @@ async def send_prepare_cb(event):
         await rb.connect_ready(client)
         saved_guid, mid = await rb.find_marked_message(client, marker)
         if not mid:
-            await safe_edit(event, 
-                f"❌ No message with marker '{marker}' was found in Saved Messages.\n"
-                "Put a message (text/photo/file) in Saved Messages whose caption ends with this marker.",
-                buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]],
+            await safe_edit(event,
+                card("❌ MARKED POST NOT FOUND", [
+                    f"📱 Account : {acc['phone']}",
+                    f"📌 Marker  : {str(marker)[:70]}",
+                    LINE,
+                    "Put a post in Saved Messages whose caption contains this",
+                    "marker — or use the caption-file route below, which",
+                    "uploads your stored file to this account first.",
+                ]),
+                buttons=_marker_missing_buttons(account_id),
             )
             return
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
     except Exception as e:  # noqa: BLE001
         await safe_edit(event, f"❌ Preparation error: {e}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
@@ -1542,19 +1852,25 @@ async def send_prepare_cb(event):
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
 
+    # Two-phase send: strangers (no chat) first, then contacts we DO have a
+    # chat with. `mutual` already exists on send_order's records — it used to be
+    # thrown away here. `twoway_from` is the index where the two-way block
+    # starts, so the engine can jump there after 5 consecutive errors.
+    _ph_recips, _ph_from = _phase_order(ordered)
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
         "saved_guid": saved_guid,
         "mid": mid,
-        "recipients": [r["guid"] for r in ordered],
+        "recipients": _ph_recips,
+        "twoway_from": _ph_from,
     }
 
     await safe_edit(event, 
         card("🚀 READY TO SEND", [
             f"• Content   : marked message '{marker}' ✅",
             f"• Recipients: {len(ordered)} contacts",
-            "• Order     : with-chat -> online -> Last Seen",
+            f"• Phases    : 🔸 {_ph_from} one-way → 🔹 {len(_ph_recips) - _ph_from} two-way",
             LINE,
             "Send to these contacts?",
         ]),
@@ -1597,7 +1913,7 @@ async def send_text_prepare_cb(event):
     client = rb.open_client(acc["phone"])
     try:
         await rb.connect_ready(client)
-        ordered, stats = await rb.get_ordered_recipients(client)
+        ordered, stats = await _ordered_for_send(client)
     except Exception as e:  # noqa: BLE001
         await safe_edit(event, f"❌ Preparation error: {e}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
@@ -1611,6 +1927,7 @@ async def send_text_prepare_cb(event):
         await safe_edit(event, "No contacts were found to send to.",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
+    _ph_recips, _ph_from = _phase_order(ordered)
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
@@ -1618,7 +1935,8 @@ async def send_text_prepare_cb(event):
         "text": body,
         "saved_guid": "",
         "mid": "",
-        "recipients": [r["guid"] for r in ordered],
+        "recipients": _ph_recips,
+        "twoway_from": _ph_from,
     }
     await safe_edit(event, 
         card("✍️ READY TO SEND PLAIN TEXT", [
@@ -1666,6 +1984,48 @@ async def stop_cb(event):
     await event.answer("Stop requested. It will stop after the current message.", alert=True)
 
 
+# Internal stop reason that asks the post-send hook to rotate the server
+# automatically and continue the remaining list there.
+_ROTATE_REASON = "ROTATE_SERVER: 5 consecutive errors on two-way contacts"
+
+
+def _self_mod():
+    """This module, for passing to the isolated helpers (same idiom as the
+    project's `import bot as _self`)."""
+    import bot as _self
+    return _self
+
+
+def _sp_streak_limit() -> int:
+    """The owner's FIXED 5 consecutive errors. Read from send_phase so the one
+    definition is shared with its tests; falls back to 5 if unavailable."""
+    try:
+        import send_phase
+        return int(send_phase.STREAK_LIMIT)
+    except Exception:  # noqa: BLE001
+        return 5
+
+
+def _phase_order(ordered_records):
+    """(guids, twoway_from) — one-way first, then two-way. Guarded: on ANY
+    failure it falls back to the previous behaviour (plain order, no phases),
+    so a send can never be blocked by the phase logic."""
+    try:
+        import send_integrate
+        return send_integrate.phase_split(ordered_records)
+    except Exception:  # noqa: BLE001
+        return [r["guid"] for r in ordered_records], 0
+
+
+class _HiddenSendImpossible(RuntimeError):
+    """A hidden-sender run could not read its source post.
+
+    The run is ABORTED rather than quietly falling back to a forward: the whole
+    point of the method is that the owner's name must not appear, so forwarding
+    anyway would be worse than sending nothing.
+    """
+
+
 async def run_send(owner_id: int, payload: dict):
     account_id = payload["account_id"]
     # clear any stale stop flag so a resumed / multi-account / brain send is not
@@ -1693,10 +2053,28 @@ async def run_send(owner_id: int, payload: dict):
     # "already sent" ledger, so unsent numbers come back next run and no one is
     # messaged twice.
     pool_job_id = payload.get("pool_job_id")
-    marker = db.get_marker()
+    # Default is the global marker. The optional override mirrors
+    # run_send_remote and lets a caption-file send look up ITS OWN caption —
+    # the two are different texts. No existing local caller sets it, so
+    # behaviour is unchanged for every current send.
+    marker = payload.get("marker") or db.get_marker()
     delay = db.get_delay()
     max_errors = db.get_max_errors()
     resume_wait = db.get_resume_wait()
+    # Two-phase send: `twoway_from` is the index where the two-way block starts
+    # (set at prepare time). When phases are active the consecutive-error cap
+    # is the owner's FIXED 5, and hitting it means "switch phase / rotate"
+    # instead of the old cooldown-and-retry.
+    twoway_from = int(payload.get("twoway_from") or 0)
+    # a phase order was applied at prepare time (there are one-way contacts)
+    has_split = twoway_from > 0
+    # ... and there is an actual two-way block to fall back to. When every
+    # contact is one-way these differ, and jumping would land on the END of the
+    # list — which silently "finished" a run with the rest never tried.
+    can_jump = 0 < twoway_from < len(recipients)
+    phases_on = has_split
+    if phases_on:
+        max_errors = _sp_streak_limit()
     # YoudonoaAx UPDATE (step 5): optional Rubika SECOND text, sent (as plain
     # text) to the SAME recipient right AFTER the marker/forward. Always text.
     rb_text2 = db.get_rb_text2()
@@ -1723,7 +2101,23 @@ async def run_send(owner_id: int, payload: dict):
         f"🧯 Max consecutive errors : {max_errors}",
         (f"✍️ Mode : Custom text" if mode == "text"
          else f"📌 Marker : «{marker}» Found ✅"),
-    ]))
+    ] + ([f"🔸 One-way : {twoway_from}   🔹 Two-way : {total - twoway_from}"]
+         if phases_on else [])))
+
+    # ONE live card for the whole run, edited as it progresses (replaces the
+    # old "a new log message every 50 recipients" spam).
+    try:
+        import send_integrate as _si
+        _acc_now = db.get_account(account_id)
+        _wtag, _wip = _si.srot.current_server(_acc_now)
+        _si.live_begin(account_id, phone,
+                       total_oneway=(twoway_from if phases_on else 0),
+                       total_twoway=((total - twoway_from) if phases_on
+                                     else total),
+                       worker_tag=_wtag, worker_ip=_wip, tag=tag.strip("# "))
+        await _si.live_push(_self_mod(), account_id, force=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     n = total
     idx = start_idx
@@ -1733,13 +2127,38 @@ async def run_send(owner_id: int, payload: dict):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        # order the explicit recipient list like a normal send (chat-first ->
-        # online -> last-seen) for brain/discovery, only on a fresh start.
+        # Hidden-sender send method (send method #5). ONLY active when the
+        # payload explicitly asks for it, so every other send path behaves
+        # exactly as before. Reads the marked post once, then each recipient
+        # gets a NEW message instead of a forward (no "Forwarded from" line).
+        _hide_src = None
+        _cs = None
+        if mode != "text" and payload.get("hide_sender"):
+            _hreason = "unknown"
+            try:
+                import copy_send as _cs
+                _hide_src, _hreason = await _cs.read_source(client, marker)
+            except Exception as _he:  # noqa: BLE001
+                _hide_src = None
+                _hreason = f"{type(_he).__name__}: {str(_he)[:90]}"
+            if _hide_src is None:
+                await log(card("🫥 HIDDEN SENDER — refused, nothing sent", [
+                    f"{_lbl()}📱 {phone}",
+                    f"⚠️ {_hreason}",
+                    "➡️ Forwarding instead would put your name on every",
+                    "   message, so this run was stopped.",
+                    f"🕒 {now()}"]))
+                raise _HiddenSendImpossible(
+                    f"Hidden send not possible: {_hreason}")
+
+        # order the explicit recipient list by PRESENCE (online now -> seen
+        # today -> hidden Recently -> ...) for brain/discovery, only on a fresh
+        # start. Guards: every guid is kept, and any failure leaves the given
+        # order untouched.
         if payload.get("order_recipients") and start_idx == 0 and recipients:
             try:
-                ordered, _st = await rb.get_ordered_recipients(client)
-                rank = {g: i for i, g in enumerate(ordered)}
-                recipients = sorted(recipients, key=lambda g: rank.get(g, 10 ** 9))
+                import send_order
+                recipients = await send_order.rank_guids(client, recipients)
             except Exception:  # noqa: BLE001
                 pass
         while True:
@@ -1756,6 +2175,13 @@ async def run_send(owner_id: int, payload: dict):
                     if mode == "text":
                         await asyncio.wait_for(
                             rb.send_text(client, guid, send_body),
+                            timeout=config.SEND_TIMEOUT,
+                        )
+                    elif _hide_src is not None and _cs is not None:
+                        # hidden-sender mode: send the SAME content as a new
+                        # message so Rubika never adds a "Forwarded from" line.
+                        await asyncio.wait_for(
+                            _cs.send_copy(client, guid, _hide_src),
                             timeout=config.SEND_TIMEOUT,
                         )
                     else:
@@ -1783,19 +2209,38 @@ async def run_send(owner_id: int, payload: dict):
                         except Exception:
                             pass
                     attempt_fail = 0          # count CONSECUTIVE errors only
-                    done_ok = base_ok + ok
-                    if config.SEND_LOG_EVERY > 0 and done_ok % config.SEND_LOG_EVERY == 0:
-                        grand_total = base_ok + total
-                        pct = int(done_ok * 100 / grand_total) if grand_total else 0
-                        await log(card("📊 SEND PROGRESS", [
-                            f"{_lbl()}📱 {phone}",
-                            f"✅ {done_ok} of {grand_total} — {pct}%",
-                            f"⏳ Remaining : {max(0, grand_total - done_ok)}",
-                            f"🕒 {now()}",
-                        ]))
+                    # live card instead of a new message every N recipients
+                    try:
+                        import send_integrate as _si
+                        _st = _si.live_state(account_id)
+                        if _st is not None:
+                            _st.record_ok(_si._live.get(account_id, {})
+                                          .get("worker_tag", "local"))
+                        _si.live_mark(account_id)
+                        await _si.live_push(_self_mod(), account_id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception as e:  # noqa: BLE001
                     fail += 1
                     attempt_fail += 1
+                    # live card + precise auth classification + raw capture
+                    try:
+                        import send_integrate as _si
+                        _st = _si.live_state(account_id)
+                        if _st is not None:
+                            _st.record_fail(_si._live.get(account_id, {})
+                                            .get("worker_tag", "local"))
+                        _si.live_mark(account_id)
+                        await _si.live_push(_self_mod(), account_id)
+                        await _si.note_auth_error(
+                            _self_mod(), e, stage="send", phone=phone,
+                            worker_tag=_si._live.get(account_id, {})
+                                               .get("worker_tag", "local"),
+                            worker_ip=_si._live.get(account_id, {})
+                                              .get("worker_ip", ""),
+                            action="verifying the session")
+                    except Exception:  # noqa: BLE001
+                        pass
                     if account_conn.is_auth_error(e):
                         try:
                             if await account_conn.verify_session_dead(phone):
@@ -1823,6 +2268,49 @@ async def run_send(owner_id: int, payload: dict):
                 break
             if not hit_max:                  # whole list finished
                 break
+            # ---- two-phase rule (owner): 5 consecutive errors ---------------
+            # in the ONE-WAY block -> Rubika is refusing strangers, the IP is
+            # fine: skip straight to the TWO-WAY block on the SAME server.
+            if can_jump and idx < twoway_from:
+                skipped = twoway_from - idx
+                idx = twoway_from
+                await log(card("🔸→🔹 SEND PHASE CHANGE", [
+                    f"{_lbl()}📱 {phone}",
+                    f"• One-way stopped after {max_errors} consecutive errors",
+                    f"• Skipped {skipped} remaining strangers",
+                    f"• Now sending to {n - twoway_from} two-way contacts "
+                    "(same server)",
+                    f"🕒 {now()}"]))
+                try:
+                    import send_integrate as _si
+                    _st = _si.live_state(account_id)
+                    if _st is not None:
+                        _st.go_twoway()
+                        await _si.live_push(_self_mod(), account_id, force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            # ---- no phase fallback left (we are in the two-way block, or this
+            # account has NO two-way contacts at all) -> the IP is the suspect:
+            # ask for an automatic server rotation. We stop this leg and let the
+            # post-send hook do the (existing, proven) transfer + resume, which
+            # continues the UNTRIED remainder on the new server.
+            if phases_on:
+                if not can_jump:
+                    await log(card("🔸 ONE-WAY BLOCKED — no two-way contacts", [
+                        f"{_lbl()}📱 {phone}",
+                        f"• {max_errors} consecutive errors and this account has",
+                        "  no contacts with an existing chat to fall back to.",
+                        f"• {max(0, n - idx)} recipients left",
+                        f"🕒 {now()}"]))
+                try:
+                    import send_integrate as _si
+                    if _si.should_rotate(account_id, dead=False,
+                                         reason="consecutive send errors"):
+                        reason = _ROTATE_REASON
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
             if (not config.RESUME_UNLIMITED) and retry_count >= config.RESUME_MAX_RETRIES:
                 reason = f"Reached error cap ({max_errors})"
                 break
@@ -1860,6 +2348,8 @@ async def run_send(owner_id: int, payload: dict):
     except account_conn.InvalidAuthError:
         dead = True
         reason = "Session invalid (re-login needed)"
+    except _HiddenSendImpossible as e:
+        reason = str(e)
     except Exception as e:  # noqa: BLE001
         reason = f"General error: {repr(e)[:200]}"
     finally:
@@ -1869,10 +2359,26 @@ async def run_send(owner_id: int, payload: dict):
             pass
         active_jobs.discard(account_id)
 
+    # final edit of the live card + the per-phase / per-server summary, before
+    # the stop/finish cards so the log reads in the right order.
+    try:
+        import send_integrate as _si
+        await _si.live_finish(_self_mod(), account_id)
+    except Exception:  # noqa: BLE001
+        pass
+
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
 
     grand_ok = base_ok + ok
+    # Additive instrumentation only (never changes send behaviour): record this
+    # run's confirmed successes for the "sent today" control-panel line. `ok` is
+    # this leg's successes, so a resume/worker-transfer never double-counts.
+    try:
+        import daily_sent
+        daily_sent.record(ok)
+    except Exception:  # noqa: BLE001
+        pass
     remaining_list = recipients[idx:]
     if dead:
         db.set_status(account_id, "inactive")
@@ -1966,12 +2472,85 @@ async def handle_channel_name(event):
     if not acc:
         await event.respond("Account not found.", buttons=main_menu(is_real_owner(event)))
         return
-    marker = db.get_marker()
+    # Choose WHAT content to forward into the new channel: the current marker,
+    # or the caption-file (same upload-to-Saved-Messages method as the sends).
+    pending_channel_name[event.sender_id] = {"account_id": account_id, "name": name}
+    try:
+        import caption_file
+        capset = caption_file.has_file()
+    except Exception:  # noqa: BLE001
+        capset = False
+    rows = [[Button.inline(f"📌 Marker ('{db.get_marker()}')", f"chmk_{account_id}".encode())]]
+    if capset:
+        rows.append([Button.inline("📎 File + Caption", f"chcf_{account_id}".encode())])
+    else:
+        rows.append([Button.inline("📎 File + Caption (set it in Content first)",
+                                   b"marker")])
+    rows.append([Button.inline("🔙 Cancel", f"acc_{account_id}".encode())])
+    await event.respond(
+        card("📢 CHANNEL SEND METHOD", [
+            f"• Channel : {name}",
+            "Choose what to forward into the channel:",
+        ]), buttons=rows)
+
+
+async def _channel_proceed(event, use_caption_file: bool):
+    p = pending_channel_name.get(event.sender_id)
+    if not p:
+        await event.answer("Channel info expired. Start again from Channel.", alert=True)
+        return
+    account_id = p["account_id"]
+    name = p["name"]
+    acc = db.get_account(account_id)
+    if not acc:
+        await safe_edit(event, "Account not found.",
+                        buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+        return
+    if use_caption_file:
+        import caption_file
+        if not caption_file.has_file():
+            await safe_edit(event,
+                "📎 No file is set. Set it from 📌 Content → “File + Caption” first.",
+                buttons=[[Button.inline("📌 Content", b"marker")],
+                         [Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+            return
+        marker = caption_file.get_caption()
+        await safe_edit(event,
+            "⏳ Uploading the file to Saved Messages (auto-fallback to another "
+            "worker if an IP is blocked) before creating the channel …")
+        import bot as _self
+        ok, detail = await caption_file.upload_for_account(_self, acc)
+        if not ok:
+            await safe_edit(event,
+                card("📎 CHANNEL FILE UPLOAD FAILED ❌", [
+                    f"• Account : {acc['phone']}",
+                    f"• Reason  : {str(detail)[:160]}",
+                    "The channel was NOT created.",
+                    f"🕒 {now()}"]),
+                buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
+            return
+    else:
+        marker = db.get_marker()
+    pending_channel_name.pop(event.sender_id, None)
     w = worker.worker_for_account(acc)
     if w and not worker.is_local(w):
         await channel_create_remote(event, acc, w, name, marker)
     else:
         await channel_create_local(event, acc, name, marker)
+
+
+@bot.on(events.CallbackQuery(pattern=b"chmk_(\\d+)"))
+async def channel_marker_cb(event):
+    if not is_owner(event):
+        return
+    await _channel_proceed(event, use_caption_file=False)
+
+
+@bot.on(events.CallbackQuery(pattern=b"chcf_(\\d+)"))
+async def channel_capfile_cb(event):
+    if not is_owner(event):
+        return
+    await _channel_proceed(event, use_caption_file=True)
 
 
 def _channel_ready_buttons(account_id):
@@ -2251,12 +2830,17 @@ async def complete_account_remote(event, ctx, res):
         "• Status        : SUCCESS",
         f"• Phone         : {phone}",
         f"• Name          : {name}",
-        f"• GUID          : {guid}",
         "• Login Method  : CODE",
-        f"• Contacts      : {contacts}",
-        f"• Groups        : {groups}",
-        f"• Chat Contacts : {with_chat}",
-        "• Session Saved : YES",
+        LINE,
+        # an older worker omits the new counts -> those rows render as "-"
+        *_login_stat_rows({
+            "contacts": contacts, "groups": groups, "with_chat": with_chat,
+            "sendable": res.get("sendable"), "excluded": res.get("excluded"),
+            "online_now": res.get("online_now"),
+            "today_open": res.get("today_open"),
+            "recently_hidden": res.get("recently_hidden"),
+        }),
+        LINE,
         f"• Time          : {now()}",
     ], footer=f"--| 🌍 - Worker : #{w['tag']}"))
     await event.respond(
@@ -2282,6 +2866,11 @@ async def marker_cb(event):
     state[event.sender_id] = {"step": "await_marker"}
     cur2 = db.get_rb_text2()
     plain = get_plain_text()
+    try:
+        import caption_file
+        capset = caption_file.has_file()
+    except Exception:  # noqa: BLE001
+        capset = False
     await safe_edit(event, 
         f"📌 Current marker: '{db.get_marker()}'\n{LINE}\n"
         "Send the new marker (the text you put at the end of your marked message's caption):",
@@ -2292,6 +2881,9 @@ async def marker_cb(event):
             ("📝 Plain Text (no forward) : SET" if plain
              else "📝 Plain Text (no forward) : EMPTY"),
             b"plaintext")],
+                 [Button.inline(
+            ("📎 File + Caption : SET" if capset else "📎 File + Caption : EMPTY"),
+            b"capfile_set")],
                  [Button.inline("🔙 Back", b"home")]],
     )
 
@@ -2576,7 +3168,10 @@ def master_code_version() -> str:
     try:
         out = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
+            # repo ROOT: this module now lives in bot_app/, and running git
+            # from a subdirectory still works, but be explicit so a future
+            # move cannot silently turn the version into "—".
+            cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             capture_output=True, text=True, timeout=10)
         rev = (out.stdout or "").strip()
         return rev or "—"
@@ -2676,7 +3271,7 @@ timeout 30 git remote set-url origin {repo}
 timeout 120 git fetch --depth 1 origin {branch}
 timeout 60 git checkout -B {branch} FETCH_HEAD
 TARGET_VERSION="$(timeout 10 git rev-parse --short HEAD)"
-CURRENT_VERSION="$(timeout 20 docker exec "$CONTAINER" python -c 'import worker_api; print(worker_api._worker_code_version())' 2>/dev/null || true)"
+CURRENT_VERSION="$(timeout 20 docker exec "$CONTAINER" python -c 'import sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; print(worker_api._worker_code_version())' 2>/dev/null || true)"
 if [ "$CURRENT_VERSION" = "$TARGET_VERSION" ]; then
     if timeout 30 docker exec "$CONTAINER" python -c 'import urllib.request; response=urllib.request.urlopen("http://127.0.0.1:{api_port}/ping", timeout=10); code=response.status; response.close(); raise SystemExit(0 if code == 200 else 1)'; then
         echo "ALREADY_CURRENT version=$TARGET_VERSION"
@@ -2697,7 +3292,7 @@ if [ -n "$IMAGE_REQ" ] && [ "$REPO_REQ" = "$IMAGE_REQ" ]; then
       'WORKDIR /app' \
       'RUN find /app -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +' \
       'COPY . /app' \
-      'RUN mkdir -p /app/data' \
+      'RUN mkdir -p /app/data && rm -rf /app/core/data /app/rubika/data && ln -sfn /app/data /app/core/data && ln -sfn /app/data /app/rubika/data' \
       'ENV MODE=worker' \
       'ENV PYTHONUNBUFFERED=1' \
       'CMD ["python", "main.py"]' > /tmp/Dockerfile.worker-update
@@ -2710,7 +3305,7 @@ else
 fi
 
 echo STAGE=test-image
-timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,worker_api; value=worker_api._worker_code_version(); print(value); raise SystemExit(0 if value == os.environ["EXPECTED_VERSION"] else 1)'
+timeout 60 docker run --rm -e EXPECTED_VERSION="$TARGET_VERSION" --entrypoint python "$CANDIDATE" -c 'import os,sys; sys.path[:0]=["/app/core","/app/rubika","/app/workers","/app/status"]; import worker_api; value=(worker_api._worker_code_version() or "").strip(); want=os.environ["EXPECTED_VERSION"].strip(); print(value); ok = bool(value) and value != "\u2014" and (value == want or want.startswith(value) or value.startswith(want)); raise SystemExit(0 if ok else 1)'
 
 rollback_container() {{
     timeout 60 docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -3220,13 +3815,34 @@ async def send_prepare_remote(event, acc, w, marker):
         res = await worker.api_call(w, "POST", "/prepare",
                                     {"phone": acc["phone"], "marker": marker})
     except Exception as e:  # noqa: BLE001
-        await safe_edit(event, f"❌ Preparation error on the worker: {repr(e)[:150]}",
+        await safe_edit(event, f"❌ Preparation failed: {_worker_api_error(e)}",
                          buttons=[[Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
         return
+    # the worker reports a real reason (e.g. an invalid session) in `error`;
+    # showing "marker not found" for that would point at the wrong problem.
+    if res.get("error"):
+        await safe_edit(event,
+            card("❌ PREPARATION FAILED", [
+                f"📱 Account : {acc['phone']}",
+                f"🖥 Worker  : {w['tag']}",
+                f"💥 {str(res['error'])[:160]}",
+            ]),
+            buttons=[[Button.inline("🔑 Distribute Session to Workers",
+                                    f"sessdist_{acc['id']}".encode())],
+                     [Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
+        return
     if not res.get("marker_found"):
-        await safe_edit(event, 
-            f"❌ No message with marker '{marker}' was in the worker's Saved Messages.",
-            buttons=[[Button.inline("🔙 Back", f"acc_{acc['id']}".encode())]])
+        await safe_edit(event,
+            card("❌ MARKED POST NOT FOUND", [
+                f"📱 Account : {acc['phone']}",
+                f"🖥 Worker  : {w['tag']}",
+                f"📌 Marker  : {str(marker)[:70]}",
+                LINE,
+                "This account's Saved Messages has no post containing that",
+                "marker. The caption-file route uploads your stored file to",
+                "THIS account first, then sends it by its own caption.",
+            ]),
+            buttons=_marker_missing_buttons(acc["id"]))
         return
     total = res.get("total", 0)
     if total == 0:
@@ -3236,6 +3852,9 @@ async def send_prepare_remote(event, acc, w, marker):
     pending_send[event.sender_id] = {
         "account_id": acc["id"], "phone": acc["phone"],
         "remote": True, "worker_id": w["id"], "total": total,
+        # whether this worker's build can do send method #5; an older worker
+        # omits the flag, which reads as None (unsupported).
+        "hidden_supported": res.get("hidden_supported") is True,
     }
     await safe_edit(event, 
         card(f"🚀 READY TO SEND (worker {w['tag']})", [
@@ -3309,7 +3928,11 @@ async def run_send_remote(owner_id: int, payload: dict):
     stop_flags[account_id] = False
     phone = payload["phone"]
     w = db.get_worker(payload["worker_id"])
-    marker = db.get_marker()
+    # Default is unchanged (global marker). An optional payload override lets the
+    # isolated caption-file "Send File" forward ITS caption without touching the
+    # global marker. No existing caller sets payload["marker"], so behaviour is
+    # byte-identical for every current send.
+    marker = payload.get("marker") or db.get_marker()
     delay = db.get_delay()
     count = _next_counter()
     total = payload.get("total", 0)
@@ -3364,7 +3987,6 @@ async def run_send_remote(owner_id: int, payload: dict):
         ]))
 
     prev_retry = 0
-    last_log_mark = 0
     try:
         res = await worker.api_call(w, "POST", "/send/start", {
             "phone": phone, "marker": marker, "delay": delay,
@@ -3375,16 +3997,41 @@ async def run_send_remote(owner_id: int, payload: dict):
             "recipients": explicit_recipients or [],  # resume fix: remaining list
             "mode": mode, "text": send_body,   # plain-text (no forward) mode
             "order_by_presence": order_by_presence,   # POOL BRAIN slice ordering
+            # two-phase: strangers FIRST, then two-way contacts. Only for a
+            # fresh full-list run — a resume/transfer keeps its frozen order,
+            # and a pool slice keeps presence ordering.
+            "phase_order": (not explicit_recipients) and (not order_by_presence),
+            # send method #5: additive, default False -> workers that ignore it
+            # keep forwarding exactly as before.
+            "hide_sender": bool(payload.get("hide_sender")),
         })
         # in text mode there is no marked post to find; only require ok
         if not res.get("ok") or (mode != "text" and not res.get("marker_found")):
-            reason = "Marker not found on worker"
+            # prefer the worker's OWN reason; "marker not found" was being
+            # shown for unrelated failures and pointed at the wrong problem.
+            reason = res.get("error") or "Marker not found on worker"
         else:
             job_id = res["job_id"]
             total = res.get("total", total)
             # mirror the EXACT ordered list the worker is using, so we can
             # compute the precise remaining slice (guids[ok+fail:]) on stop.
             guids = res.get("guids") or guids
+            # ONE live card for this remote run. Started HERE (not before
+            # /send/start) because only now do we know the real total and the
+            # phase split — starting it with total=0 made the card show a 0
+            # denominator and silently swallow every counter.
+            try:
+                import send_integrate as _si
+                _tw = int(res.get("twoway_from") or 0)
+                _tot = int(res.get("total") or total or len(guids))
+                _si.live_begin(account_id, phone,
+                               total_oneway=_tw,
+                               total_twoway=max(0, _tot - _tw),
+                               worker_tag=w.get("tag") or "",
+                               worker_ip=w.get("ip") or "")
+                await _si.live_push(_self_mod(), account_id, force=True)
+            except Exception:  # noqa: BLE001
+                pass
             while True:
                 if stop_flags.get(account_id):
                     try:
@@ -3409,16 +4056,25 @@ async def run_send_remote(owner_id: int, payload: dict):
                                 db.pool_mark_contact_sent(pool_job_id, g)
                             except Exception:
                                 pass
-                # progress log every SEND_LOG_EVERY successful sends (+ percent)
-                if config.SEND_LOG_EVERY > 0 and ok // config.SEND_LOG_EVERY > last_log_mark:
-                    last_log_mark = ok // config.SEND_LOG_EVERY
-                    pct = int(ok * 100 / total) if total else 0
-                    await log(card("📊 SEND PROGRESS", [
-                        f"📱 {phone} (worker {w['tag']})",
-                        f"✅ {ok} of {total} — {pct}%",
-                        f"⏳ Remaining : {max(0, total - ok - fail)}",
-                        f"🕒 {now()}",
-                    ]))
+                # ONE live card, edited as the worker progresses (replaces the
+                # every-50-recipients messages). The worker reports cumulative
+                # ok/fail, so we sync the card to those totals.
+                try:
+                    import send_integrate as _si
+                    # mirror the worker's OWN per-phase tallies (it reports
+                    # them in /send/status) instead of guessing from the
+                    # cumulative totals.
+                    _si.live_sync_remote(
+                        account_id, worker_tag=(w.get("tag") or ""),
+                        oneway_ok=stt.get("oneway_ok"),
+                        oneway_fail=stt.get("oneway_fail"),
+                        twoway_ok=stt.get("twoway_ok"),
+                        twoway_fail=stt.get("twoway_fail"),
+                        total_ok=ok, total_fail=fail,
+                        phase=stt.get("phase"))
+                    await _si.live_push(_self_mod(), account_id)
+                except Exception:  # noqa: BLE001
+                    pass
                 # auto-resume happening on the worker -> master posts the ALERT
                 rc = stt.get("retry_count", 0)
                 if rc > prev_retry:
@@ -3447,9 +4103,23 @@ async def run_send_remote(owner_id: int, payload: dict):
     except Exception:
         pass
     active_jobs.discard(account_id)
+    # Additive instrumentation only (never changes send behaviour): record this
+    # run's confirmed successes for the "sent today" control-panel line.
+    try:
+        import daily_sent
+        daily_sent.record(ok)
+    except Exception:  # noqa: BLE001
+        pass
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
     is_owner_user = owner_id == config.OWNER_ID
+
+    # final edit of the live card + per-server summary (same as the local path)
+    try:
+        import send_integrate as _si
+        await _si.live_finish(_self_mod(), account_id)
+    except Exception:  # noqa: BLE001
+        pass
 
     if reason:
         await log(card("🔁 RESUME STOPPED ⛔" if is_resume else "⛔ SEND STOPPED", [
@@ -5498,6 +6168,104 @@ async def health_engine_loop():
             print(f"[health_engine] {e}")
 
 
+def _worker_api_error(e) -> str:
+    """Readable reason for a worker.api_call failure.
+
+    api_call does resp.raise_for_status(), so a worker running code older than
+    the endpoint surfaces as httpx.HTTPStatusError 404 — which is useless to
+    read as "HTTPStatusError: Client error '404 N…". Translate the cases that
+    have a clear action.
+    """
+    status = None
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        status = getattr(resp, "status_code", None)
+    if status == 404:
+        return "worker has OLD code — run Workers → Update All"
+    if status in (401, 403):
+        return "worker rejected the token"
+    if status == 503:
+        return "worker is blocked/unavailable"
+    name = type(e).__name__
+    if "Timeout" in name:
+        return "worker timed out"
+    if "Connect" in name:
+        return "worker unreachable (tunnel down)"
+    return f"{name}: {str(e)[:80]}"
+
+
+async def _quarantine_dead_account(botmod, observer, acc: dict, w) -> bool:
+    """Actually quarantine a confirmed-dead account. Returns True on success.
+
+    The canonical observer._remove_confirmed_invalid() could never succeed from
+    the health engine, which is why the card listed Shot accounts while the
+    delete panel stayed empty:
+
+      * its first guard is `not account_conn.is_invalid(phone)`, and the health
+        engine confirms death with verify_session_dead(), which does NOT set
+        that flag (only notify_invalid does);
+      * it then re-verifies LOCALLY, but a remote account's session lives on
+        its worker, so the master can never confirm it.
+
+    So: for a LOCAL account we set the flag through the public notify_invalid()
+    and hand over to the canonical path, which still performs its own
+    double-verify — the safety property is untouched. For a REMOTE account the
+    authoritative check already happened on the worker that holds the session,
+    so we ask that worker a SECOND time (the double-verify equivalent) and then
+    reuse the observer's own stop-jobs / snapshot helpers. Nothing is deleted
+    here, ever.
+    """
+    phone = acc["phone"]
+    account_id = int(acc["id"])
+    if (acc.get("status") or "") == "quarantined":
+        return True                                   # already there
+
+    is_remote = bool(w and not worker.is_local(w))
+    if not is_remote:
+        try:
+            await account_conn.notify_invalid(phone)
+        except Exception:  # noqa: BLE001
+            pass
+        return bool(await observer._remove_confirmed_invalid(botmod, acc))
+
+    # --- remote: confirm twice ON THE WORKER before touching anything -------
+    try:
+        again = await worker.api_call(w, "POST", "/account/verify",
+                                      {"phone": phone}, timeout=90)
+    except Exception:  # noqa: BLE001
+        return False                                  # transient -> never quarantine
+    if not again.get("dead"):
+        return False                                  # recovered -> leave alone
+
+    if not await observer._stop_account_jobs(botmod, acc):
+        return False
+    if not observer._snapshot_and_disable_automation(account_id):
+        return False
+    if not await observer._stop_account_jobs(botmod, acc):
+        observer._restore_automation_snapshot(account_id)
+        return False
+    try:
+        await account_conn.close(phone)
+    except Exception:  # noqa: BLE001
+        pass
+    if observer._account_busy(botmod, account_id):
+        observer._restore_automation_snapshot(account_id)
+        return False
+    db.set_status(account_id, "quarantined")
+    try:
+        await log(card("🔒 #Watcher_Account_Quarantined", [
+            f"📱 {phone}",
+            f"🖥 Worker : {w.get('tag', '-')}",
+            "🔐 Reason: session confirmed invalid on its worker (verified twice)",
+            "⏹ This account's automations were stopped",
+            "💾 Data, settings and session were kept",
+            "👤 Owner decides: re-login or delete",
+        ]))
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 async def run_health_engine():
     """Unified account WATCHER cycle = 🩺 health + self-heal + the portal
     observer's canonical quarantine, merged into one. For each account it
@@ -5528,33 +6296,66 @@ async def run_health_engine():
         w = worker.worker_for_account(acc)
         is_dead = False
         checked = True
+        unusable = ""          # confirmed NOT usable, but not a proven auth death
         try:
             if w and not worker.is_local(w):
                 try:
                     res = await worker.api_call(
                         w, "POST", "/account/verify", {"phone": phone}, timeout=90)
                     is_dead = bool(res.get("dead"))
+                    # `alive` is the worker's POSITIVE check. False means the
+                    # session could not be read at all (e.g. the file is gone),
+                    # which must never be reported as healthy. None = older
+                    # worker that does not send it -> keep the old behaviour.
+                    if not is_dead and res.get("alive") is False:
+                        unusable = "session unreadable on its worker"
                 except Exception:
                     checked = False           # offline worker -> UNCHECKED
             else:
                 is_dead = await account_conn.verify_session_dead(phone)
+                if not is_dead:
+                    # same positive counter-check locally
+                    try:
+                        guid = await account_conn.call(phone, rb.get_self_guid,
+                                                       timeout=30)
+                        if not guid:
+                            unusable = "session returned no identity"
+                    except account_conn.InvalidAuthError:
+                        is_dead = True
+                    except Exception:
+                        unusable = "session could not be read"
         except Exception:
             checked = False
 
         if not checked:
             unchecked += 1
             continue
+        if unusable:
+            # Honest third state: we could not prove the session is dead, so it
+            # is NOT quarantined, but it is definitely not healthy either.
+            unchecked += 1
+            shot_rows.append(f"• {phone} : ❔ Unusable ({unusable})")
+            continue
         if is_dead:
             # Canonical quarantine (double-verify, stop jobs, snapshot/disable,
-            # status=quarantined; never deletes). Idempotent and safe. Honors
-            # the HEALTH_ENGINE_AUTODISABLE_DEAD switch for the auto action.
+            # status=quarantined; never deletes). Honors the
+            # HEALTH_ENGINE_AUTODISABLE_DEAD switch for the auto action.
+            quarantined = False
             if config.HEALTH_ENGINE_AUTODISABLE_DEAD:
                 try:
-                    await _observer._remove_confirmed_invalid(_botmod, acc)
-                except Exception:
-                    pass
-            shot += 1
-            shot_rows.append(f"• {phone} : 🔴 Shot")
+                    quarantined = await _quarantine_dead_account(
+                        _botmod, _observer, acc, w)
+                except Exception as _qe:  # noqa: BLE001
+                    print(f"[watcher_health] quarantine {phone}: {_qe!r}")
+            if quarantined:
+                shot += 1
+                shot_rows.append(f"• {phone} : 🔴 Shot (quarantined)")
+            else:
+                # Count it, but say plainly that it is NOT in the delete panel —
+                # the card used to print "Shot" either way, which is why the
+                # delete button showed (0) while the card listed accounts.
+                shot += 1
+                shot_rows.append(f"• {phone} : 🔴 Shot (not quarantined)")
         else:
             alive += 1
             # restore an account that recovered on its own (observer logic)
@@ -5699,6 +6500,22 @@ async def amain():
         login_code.register(_self)
     except Exception as _lce:
         await log(card("⚠️ - #LoginCode_Error", [f"🔧 boot: {repr(_lce)[:180]}"]))
+    # Isolated caption-file auto-upload + "Send File" (Connect section).
+    # Guarded: a failure here can never stop the panel from booting.
+    try:
+        import bot as _self2
+        import caption_file
+        caption_file.register(_self2)
+    except Exception as _cfe:
+        await log(card("⚠️ - #CaptionFile_Error", [f"🔧 boot: {repr(_cfe)[:180]}"]))
+    # Isolated NEW automation engine (multi-account scan/send under one roof).
+    # Guarded: a failure here can never stop the panel from booting.
+    try:
+        import bot as _self3
+        import autoeng_ui
+        autoeng_ui.register(_self3)
+    except Exception as _aee:
+        await log(card("⚠️ - #AutoEngine_Error", [f"🔧 boot: {repr(_aee)[:180]}"]))
     await log(card("Online", [f"Rubika Project {config.VERSION}", LINE, f"🕒 {now()}"]))
     print(f"Panel is running (version {config.VERSION}).")
     # ---- Portal (isolated, additive) ----
@@ -5736,6 +6553,14 @@ async def amain():
     asyncio.create_task(linkdooni_summary_loop())
     await recover_extras()
     await recover_linkdooni()
+    # NEW automation engine: resume if it was running before the restart
+    # (roles + saved groups persisted in its own DB).
+    try:
+        import bot as _self_aer
+        import autoeng_ui as _aeui
+        await _aeui.restore(_self_aer)
+    except Exception as _aere:
+        print(f"[autoeng restore] {_aere}")
     # POOL BRAIN: resume any pool job that was mid-leech/mid-send before restart
     # (durable cursor + global sent-ledger prevent duplicate sends).
     try:
@@ -5839,6 +6664,48 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
     remaining = info.get("recipients") or []
     dead = info.get("dead")
     is_remote = bool(info.get("remote"))
+    # AUTOMATIC server rotation. This is the single point BOTH the local and
+    # the remote send path reach when a run stops with work left, so hooking
+    # here covers both. It performs exactly what the manual
+    # "🔁 Login to New Worker & Continue" button does (resume_relogin_cb),
+    # without asking: pick an untried worker -> code-free /session/import ->
+    # continue the remaining list. Guarded end-to-end: on ANY problem we fall
+    # through to the normal manual panel below.
+    if remaining and not dead:
+        try:
+            import send_integrate as _si
+            _reason = str(info.get("reason") or "")
+            if _si.should_rotate(account_id, dead=bool(dead), reason=_reason):
+                _self = _self_mod()
+                # persist the remaining list FIRST so the resume has it even if
+                # the transfer or the restart goes wrong.
+                _payload = {
+                    "saved_guid": info.get("saved_guid"), "mid": info.get("mid"),
+                    "recipients": remaining,
+                    "base_ok": int(info.get("base_ok") or 0),
+                    "tag": info.get("tag") or "", "remote": is_remote,
+                    "worker_id": info.get("worker_id"),
+                    "tried_workers": worker_transfer.get_tried(account_id),
+                    "mode": (info.get("mode") or "").lower()
+                            or ("text" if info.get("text") else "marker"),
+                    "text": info.get("text") or "",
+                    "text2": info.get("text2") or "",
+                    "twoway_from": 0,     # the remaining list is already two-way
+                }
+                try:
+                    db.save_paused_send(account_id, owner_id, phone, _payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await _si.auto_rotate(_self, account_id, phone,
+                                         reason=_reason or "consecutive send errors",
+                                         resume_at=int(info.get("base_ok") or 0)):
+                    await _do_resume(owner_id, account_id)
+                    return
+        except Exception as _re:  # noqa: BLE001
+            await log(card("⚠️ AUTO ROTATION — skipped", [
+                f"📱 {phone}", f"• {repr(_re)[:150]}",
+                "• Falling back to the manual transfer panel.",
+                f"🕒 {now()}"]))
     if remaining or is_remote:
         # worker-transfer bug fix: ALWAYS store the send method explicitly so a
         # later resume/transfer never falls back to the marker default. `mode`
@@ -7140,8 +8007,12 @@ async def _prepare_local(acc, marker):
         saved_guid, mid = await rb.find_marked_message(client, marker)
         if not mid:
             return None
-        ordered, _stats = await rb.get_ordered_recipients(client)
-        return saved_guid, mid, [r["guid"] for r in ordered]
+        ordered, _stats = await _ordered_for_send(client)
+        # two-phase order here too (multi-send / pool go through this helper),
+        # so EVERY send path puts strangers first instead of chat-first.
+        _g, _tw = _phase_order(ordered)
+        _prepare_local.last_twoway_from = _tw
+        return saved_guid, mid, _g
     finally:
         try:
             await client.disconnect()
@@ -7201,7 +8072,8 @@ async def _multi_send_one(owner_id, acc, tag):
         return
     await run_send(owner_id, {
         "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
-        "recipients": recips, "tag": tag, "suppress_resume_panel": True})
+        "recipients": recips, "tag": tag, "suppress_resume_panel": True,
+        "twoway_from": getattr(_prepare_local, "last_twoway_from", 0)})
 
 
 async def _run_group_sequential(owner_id, accs):
@@ -7975,8 +8847,12 @@ async def _pool_order_local(acc, guids):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        rank = await rb.presence_rank(client)
-        return sorted(guids, key=lambda g: rank.get(g, 10 ** 9))
+        # presence ranking only (pool logic itself is untouched). The base
+        # rb.presence_rank ranks on the dead `status` field and never finds
+        # anyone online; send_order reads online_time instead. Every guid is
+        # kept and any failure leaves the given order as-is.
+        import send_order
+        return await send_order.rank_guids(client, guids)
     finally:
         try:
             await client.disconnect()
@@ -8215,8 +9091,11 @@ async def _local_ordered_guids(acc):
     client = rb.open_client(phone)
     try:
         await rb.connect_ready(client)
-        ordered, _stats = await rb.get_ordered_recipients(client)
-        return [r["guid"] for r in ordered]
+        ordered, _stats = await _ordered_for_send(client)
+        # two-phase order on this path as well (text-mode fresh resume)
+        _g, _tw = _phase_order(ordered)
+        _local_ordered_guids.last_twoway_from = _tw
+        return _g
     finally:
         try:
             await client.disconnect()
@@ -8874,12 +9753,128 @@ def _settings_buttons():
          Button.inline("⏸ Pause Duration", b"set_resume")],
         [Button.inline("⏱ Send Speed", b"set_senddelay"),
          Button.inline("📇 Contact Speed", b"set_cspeed")],
+        [Button.inline("🔄 Server Switches", b"set_switches"),
+         Button.inline("🔍 Curiosity", b"curio")],
         [Button.inline("🧠 Brain Cap", b"set_braincap")],
         [Button.inline("🔎 Friend-discovery Cap", b"set_disctarget")],
         [Button.inline("🔎 Discovery Attempts Cap", b"set_discattempts")],
         [Button.inline("📢 Campaign", b"campaign")],
         [Button.inline("🔙 Back", b"home")],
     ]
+
+
+@bot.on(events.CallbackQuery(data=b"set_switches"))
+async def set_switches_cb(event):
+    """How many times a send may move the account to another server."""
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_set_switches"}
+    try:
+        import send_rotate
+        cur = send_rotate.max_switches()
+    except Exception:  # noqa: BLE001
+        cur = 3
+    await safe_edit(event, card("🔄 Automatic Server Switches", [
+        f"• Current : {cur}",
+        LINE,
+        "After 5 consecutive errors on two-way contacts the send moves the",
+        "account to another server (no code needed) and continues from where",
+        "it stopped. There is a 3-minute gap between switches.",
+        "Send the number of switches allowed (0 disables it):"]),
+        buttons=[[Button.inline("🔙 Back", b"settings")]])
+
+
+async def handle_set_switches(event, st):
+    val = (event.raw_text or "").strip()
+    state.pop(event.sender_id, None)
+    if not val.isdigit():
+        await event.respond("Send a number, please.",
+                            buttons=[[Button.inline("🔙 Back", b"settings")]])
+        return
+    try:
+        import send_rotate
+        send_rotate.set_max_switches(int(val))
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"Could not save: {repr(e)[:120]}")
+        return
+    await event.respond(card("🔄 Saved ✅", [f"• Server switches : {int(val)}",
+                                            f"🕒 {now()}"]),
+                        buttons=[[Button.inline("🔙 Settings", b"settings")]])
+
+
+# --------------------------------------------------------------------------- #
+# Curiosity mode: silent collection of RAW Rubika answers + a .txt export.
+# Always on in the background; it never posts to the log group.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"curio"))
+async def curiosity_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        st = curiosity.stats()
+    except Exception as e:  # noqa: BLE001
+        await safe_edit(event, card("🔍 Curiosity — error", [repr(e)[:160]]),
+                        buttons=[[Button.inline("🔙 Back", b"settings")]])
+        return
+    kinds = ", ".join(f"{k}:{v}" for k, v in sorted(st["kinds"].items())) or "—"
+    await safe_edit(event, card("🔍 Curiosity Mode", [
+        f"• Status  : {'🟢 collecting' if st['enabled'] else '⚪ off'}",
+        f"• Records : {st['records']}",
+        f"• Accounts: {st['accounts']}",
+        f"• Size    : {st['bytes']} bytes",
+        f"• Kinds   : {kinds}",
+        LINE,
+        "Silently stores the RAW answers Rubika gives (sessions, auth bodies,",
+        "unknown errors). Nothing is posted to the log group.",
+        "Export it as a .txt to look for things we don't know yet."]),
+        buttons=[[Button.inline("📄 Get .txt", b"curio_txt")],
+                 [Button.inline("⚪ Turn off" if st["enabled"] else "🟢 Turn on",
+                                b"curio_tog")],
+                 [Button.inline("🗑 Clear data", b"curio_clear")],
+                 [Button.inline("🔙 Back", b"settings")]])
+
+
+@bot.on(events.CallbackQuery(data=b"curio_tog"))
+async def curiosity_toggle_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        curiosity.set_enabled(not curiosity.is_enabled())
+    except Exception:  # noqa: BLE001
+        pass
+    await curiosity_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"curio_clear"))
+async def curiosity_clear_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        curiosity.clear()
+        await event.answer("Cleared.")
+    except Exception:  # noqa: BLE001
+        pass
+    await curiosity_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"curio_txt"))
+async def curiosity_txt_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("Building the file ...")
+    try:
+        import curiosity
+        path = curiosity.export_txt()
+        await bot.send_file(event.sender_id, path,
+                            caption=card("🔍 Curiosity export", [
+                                f"• Records : {curiosity.stats()['records']}",
+                                f"🕒 {now()}"]))
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(event.sender_id,
+                               f"❌ Export failed: {repr(e)[:160]}")
 
 
 @bot.on(events.CallbackQuery(data=b"settings"))
