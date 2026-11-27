@@ -401,7 +401,14 @@ async def _sender_loop(bot, ex, aid):
                         return
                 await _interruptible_sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
         elif not joined:
+            # nothing to send: try to pull work from the reserve instead of
+            # idling (self-heals a sender that started with no groups).
             _set_acc(aid, icon=live.IC_WAIT)
+            try:
+                if top_up_senders():
+                    continue               # got groups -> join them right away
+            except Exception:  # noqa: BLE001
+                pass
 
         interval = adb.get_int("send_interval", SEND_INTERVAL_DEFAULT)
         _set_acc(aid, icon=live.IC_WAIT)
@@ -445,6 +452,33 @@ def _replace_group(aid):
         return False
     adb.set_group_state(g["guid"], adb.G_ASSIGNED, owner_id=aid)
     return True
+
+
+def top_up_senders() -> int:
+    """Fill every sender up to `groups_per` from the BANKED reserve.
+
+    Without this, groups already saved from an earlier run are never handed
+    out: _hand_off_healthy only fires the moment a scanner finds a NEW group,
+    so a run that starts with a full reserve left every sender idle at G0/N
+    while healthy groups sat unused. Called at start and whenever a sender
+    finds itself with nothing to do. Returns how many groups were handed out.
+    """
+    _scanners, senders = core.split_roles(engine.roles)
+    senders = [s for s in senders if s not in engine.quarantined]
+    if not senders:
+        return 0
+    groups_per = adb.get_int("groups_per", 3)
+    handed = 0
+    counts = adb.group_counts_by_owner(senders)
+    for sid in senders:
+        while counts.get(sid, 0) < groups_per:
+            g = adb.take_reserve_group()
+            if g is None:
+                return handed              # reserve empty
+            adb.set_group_state(g["guid"], adb.G_ASSIGNED, owner_id=sid)
+            counts[sid] = counts.get(sid, 0) + 1
+            handed += 1
+    return handed
 
 
 def _pick_text(texts, last_idx):
@@ -565,6 +599,28 @@ async def _extract_round(bot, ex):
         if adb.link_seen(lk):     # only NEW links enter the queue
             new += 1
     engine.scan["extracted"] += new
+    # Never fail silently: a scan that yields nothing is the single most
+    # confusing state (the panel just sits at 0/0), so say WHY once.
+    if new == 0:
+        key = "_warned_empty_scan"
+        if not engine.acc_state.get(0, {}).get(key):
+            engine.acc_state.setdefault(0, {})[key] = True
+            if not raw:
+                rows = [
+                    f"• Sources  : {len(channels)}",
+                    "• The reader account returned NO links from them.",
+                    "• Check the linkdooni sources are reachable by this",
+                    "  account, and that their posts contain group links.",
+                ]
+            else:
+                rows = [
+                    f"• Sources  : {len(channels)}",
+                    f"• Links found : {len(raw)} — but all were already seen.",
+                    "• Add a new linkdooni source to find fresh groups.",
+                ]
+            await _safe_log(bot, bot.card("🔍 SCAN — nothing new found", rows + [
+                f"• Reserve  : {adb.count_unused_healthy()} saved groups",
+                f"🕒 {time.strftime('%H:%M:%S')}"]))
 
 
 # --------------------------------------------------------------------------- #
@@ -643,6 +699,12 @@ async def start(bot, account_ids, *, executor=None):
 
     adb.save_roles(engine.roles)
     engine.reset_counters()
+    # the live card reports THIS run, so start its counters from zero instead
+    # of inheriting the previous run's totals.
+    try:
+        adb.clear_stats()
+    except Exception:  # noqa: BLE001
+        pass
     engine.stop = False
     engine.running = True
     engine.started_at = time.time()
@@ -654,6 +716,23 @@ async def start(bot, account_ids, *, executor=None):
     adb.set("live_msg_ids", "")
 
     scanners, senders = core.split_roles(engine.roles)
+
+    # Hand the ALREADY-BANKED groups to the senders before anything else, so a
+    # run that starts with a full reserve does not sit idle waiting for a new
+    # discovery that may never come.
+    try:
+        _given = top_up_senders()
+        if _given:
+            await _safe_log(bot, bot.card("📦 GROUPS HANDED OUT", [
+                f"• From reserve : {_given} group(s)",
+                f"• Senders      : {len(senders)}",
+                f"• Reserve left : {adb.count_unused_healthy()}",
+                f"🕒 {time.strftime('%H:%M:%S')}"]))
+    except Exception as e:  # noqa: BLE001
+        await _err_card(bot, code=core.SYS_ERR, stage="handoff",
+                        acc={"phone": "-", "id": 0}, reason=repr(e)[:120],
+                        action="continuing")
+
     engine.tasks = []
     engine.tasks.append(asyncio.create_task(_scan_driver(bot, ex)))
     for aid in scanners:

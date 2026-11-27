@@ -454,6 +454,15 @@ def get_stats(account_id: int) -> dict:
 # --------------------------------------------------------------------------- #
 # reset (keeps healthy saved groups; clears roles / queue / per-run state)
 # --------------------------------------------------------------------------- #
+def clear_stats() -> None:
+    """Zero the per-account send counters. The live card is a per-RUN view, so
+    a new run must not inherit the previous run's totals."""
+    c = _conn()
+    c.execute("DELETE FROM ae_stats")
+    c.commit()
+    c.close()
+
+
 def reset_run(keep_groups: bool = True) -> None:
     c = _conn()
     c.execute("DELETE FROM ae_roles")

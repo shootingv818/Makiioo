@@ -387,6 +387,62 @@ def test_broken_executor_never_leaves_engine_half_started():
     eq(eng.engine.tasks, [], "no tasks were spawned")
 
 
+def test_banked_reserve_is_handed_out_at_start():
+    """REGRESSION (seen in production 2026-11-27): the engine started with 23
+    saved groups, scan found nothing new, and all senders sat at G0/3 forever
+    because groups were only ever handed out at the MOMENT of discovery."""
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    adb.set("groups_per", 3)
+    adb.set("scan_count", 5)
+    # bank 23 healthy groups from an "earlier run", owned by nobody
+    for i in range(23):
+        adb.upsert_group(f"R{i}", f"link{i}", f"grp{i}", adb.G_HEALTHY)
+    eq(adb.count_unused_healthy(), 23, "reserve starts with 23 banked groups")
+
+    bot = FakeBot(_accounts(4))
+    # an executor that finds NOTHING new (exactly the production situation)
+    ex = FakeExecutor([], {})
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=1.2))
+
+    senders = core.split_roles(eng.engine.roles)[1]
+    got = {s: len(adb.groups_of(s, adb.G_JOINED))
+              + len(adb.groups_of(s, adb.G_ASSIGNED)) for s in senders}
+    ok(all(v > 0 for v in got.values()),
+       f"every sender received groups from the reserve (got {got})")
+    eq(sum(got.values()), 9, "3 senders x groups_per 3 = 9 handed out")
+    eq(adb.count_unused_healthy(), 23 - 9, "the rest stays banked")
+    ok(any("GROUPS HANDED OUT" in t for t in bot.logs),
+       "the hand-out is reported to the owner")
+
+
+def test_empty_scan_is_reported():
+    """A scan that yields nothing must SAY so — the 0/0 card was the most
+    confusing state in production."""
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@src1,@src2")
+    adb.set("scan_count", 5)
+    bot = FakeBot(_accounts(4))
+    ex = FakeExecutor([], {})          # extraction returns no links at all
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=1.0))
+    ok(any("nothing new found" in t for t in bot.logs),
+       "the owner is told the scan found nothing and why")
+
+
+def test_stats_start_from_zero_each_run():
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    adb.incr_stats(2, sent=99, fail=7)        # leftovers from a previous run
+    bot = FakeBot(_accounts(4))
+    ex = FakeExecutor([], {})
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=0.6))
+    st = adb.get_stats(2)
+    ok(st["sent"] < 99, f"previous run's totals do not leak into this run ({st})")
+
+
 def test_live_state_shape():
     _fresh_db()
     adb.add_text("ad")
@@ -411,6 +467,9 @@ def main():
                test_pv_reply_once, test_file_mode_sends_file,
                test_busy_accounts_skipped,
                test_broken_executor_never_leaves_engine_half_started,
+               test_banked_reserve_is_handed_out_at_start,
+               test_empty_scan_is_reported,
+               test_stats_start_from_zero_each_run,
                test_live_state_shape):
         try:
             fn()
