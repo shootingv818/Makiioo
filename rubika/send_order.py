@@ -339,6 +339,11 @@ def build(users, chats, strategy: str | None = None, groups: int = 0):
 
     keep.sort(key=lambda r: (
         _group_rank(r, strategy),
+        # Owner's rule: ALL two-way contacts (a chat exists, either direction)
+        # first, THEN all one-way (no chat) — each group internally by
+        # last-seen. So "has a chat" outranks presence; within each group the
+        # existing presence order (tier -> timestamp -> bucket) decides.
+        0 if r["has_chat"] else 1,
         _TIER_INDEX.get(r["tier"], 99),
         -int(r["ts"] or 0),
         _APPROX_ORDER.get(r["bucket"], 9),

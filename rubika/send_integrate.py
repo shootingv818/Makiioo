@@ -109,22 +109,17 @@ def should_rotate(account_id: int, *, dead: bool, reason: str) -> bool:
 async def auto_rotate(bot, account_id: int, phone: str, *, reason: str,
                       resume_at: int = 0) -> bool:
     """Move the account to the next untried server and report it. Returns True
-    when the transfer succeeded (the caller then resumes the remaining list).
+    when the transfer succeeded (the caller then resumes the remaining list),
+    False otherwise.
 
-    Pauses SWITCH_PAUSE_SEC between switches, as the owner asked. A failed
-    transfer does NOT consume the chance to try the next server, unless there
-    is no server left at all.
+    The 3-minute pause and the "switch N/total" announcement are the CALLER's
+    job (run_send's _rotate_in_place) so they are not duplicated here; this
+    just performs the move and posts the from→to card.
     """
     aid = int(account_id)
     st = _rot.setdefault(aid, {"switches": 0, "last_switch": 0.0})
     n = st["switches"] + 1
     total = budget()
-
-    # 3-minute gap between switches (skipped before the very first one)
-    if st["last_switch"]:
-        wait = sp.SWITCH_PAUSE_SEC - (time.time() - st["last_switch"])
-        if wait > 0:
-            await asyncio.sleep(wait)
 
     acc = None
     try:

@@ -1852,25 +1852,21 @@ async def send_prepare_cb(event):
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
 
-    # Two-phase send: strangers (no chat) first, then contacts we DO have a
-    # chat with. `mutual` already exists on send_order's records — it used to be
-    # thrown away here. `twoway_from` is the index where the two-way block
-    # starts, so the engine can jump there after 5 consecutive errors.
-    _ph_recips, _ph_from = _phase_order(ordered)
+    # Recipient order is send_order's own (two-way seen-recently first, down to
+    # strangers last) — the original, proven project order. No re-phasing.
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
         "saved_guid": saved_guid,
         "mid": mid,
-        "recipients": _ph_recips,
-        "twoway_from": _ph_from,
+        "recipients": [r["guid"] for r in ordered],
     }
 
     await safe_edit(event, 
         card("🚀 READY TO SEND", [
             f"• Content   : marked message '{marker}' ✅",
             f"• Recipients: {len(ordered)} contacts",
-            f"• Phases    : 🔸 {_ph_from} one-way → 🔹 {len(_ph_recips) - _ph_from} two-way",
+            "• Order     : two-way (seen recently) first, strangers last",
             LINE,
             "Send to these contacts?",
         ]),
@@ -1927,7 +1923,6 @@ async def send_text_prepare_cb(event):
         await safe_edit(event, "No contacts were found to send to.",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
-    _ph_recips, _ph_from = _phase_order(ordered)
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
@@ -1935,8 +1930,7 @@ async def send_text_prepare_cb(event):
         "text": body,
         "saved_guid": "",
         "mid": "",
-        "recipients": _ph_recips,
-        "twoway_from": _ph_from,
+        "recipients": [r["guid"] for r in ordered],
     }
     await safe_edit(event, 
         card("✍️ READY TO SEND PLAIN TEXT", [
@@ -1984,9 +1978,72 @@ async def stop_cb(event):
     await event.answer("Stop requested. It will stop after the current message.", alert=True)
 
 
-# Internal stop reason that asks the post-send hook to rotate the server
-# automatically and continue the remaining list there.
-_ROTATE_REASON = "ROTATE_SERVER: 5 consecutive errors on two-way contacts"
+# a leg that ended because the account was moved to another server; the
+# remaining list continues there, so this is NOT a failure.
+_SWITCHED_REASON = "SWITCHED_SERVER"
+
+
+def _rotation_enabled() -> bool:
+    """Server rotation is on unless the owner set the switch budget to 0."""
+    return _rotation_max() > 0
+
+
+def _rotation_max() -> int:
+    try:
+        import send_rotate
+        return int(send_rotate.max_switches())
+    except Exception:  # noqa: BLE001
+        return 3
+
+
+async def _rotate_in_place(owner_id, account_id, phone, *, remaining, base_ok,
+                           mode, text, text2, tag):
+    """The owner's simple server switch: after 5 consecutive errors, wait 3
+    minutes, move the account to the next untried server (code-free, reusing
+    the project's own transfer chain), and continue the remaining list there.
+
+    Returns one of:
+      "switched"  — moved and a resume run was launched on the new server
+      "exhausted" — no server left / budget spent -> stop
+      "off"       — rotation disabled
+      "error"     — could not rotate (fall back to the old cooldown)
+    """
+    try:
+        import send_integrate as _si
+    except Exception:  # noqa: BLE001
+        return "error"
+    if not remaining:
+        return "off"
+    # count this account's switches; stop once the budget is spent
+    used = _si.switches_used(account_id)
+    if used >= _rotation_max():
+        return "exhausted"
+    await log(card("🔄 SERVER SWITCH — 5 errors in a row", [
+        (tag + " " if tag else "") + f"📱 {phone}",
+        f"• Switch {used + 1}/{_rotation_max()} — waiting 3 min before moving",
+        f"• {len(remaining)} recipients left",
+        f"🕒 {now()}"]))
+    # 3-minute gap from the errors, interruptible by a manual stop
+    if await _wait_or_stop(account_id, _si.sp.SWITCH_PAUSE_SEC):
+        return "off"
+    # persist the remaining list BEFORE moving (survives a crash mid-transfer)
+    try:
+        db.save_paused_send(account_id, owner_id, phone, {
+            "recipients": remaining, "base_ok": base_ok, "tag": tag,
+            "mode": mode, "text": text, "text2": text2,
+            "tried_workers": worker_transfer.get_tried(account_id),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    res = await _si.auto_rotate(_self_mod(), account_id, phone,
+                                reason="5 consecutive send errors",
+                                resume_at=base_ok)
+    if res is True:
+        await _do_resume(owner_id, account_id)
+        return "switched"
+    # auto_rotate already logged WHY (no worker / import failed). Treat "no
+    # server left" as exhausted so we stop instead of looping.
+    return "exhausted" if _si.switches_used(account_id) >= _rotation_max() else "error"
 
 
 def _self_mod():
@@ -1994,27 +2051,6 @@ def _self_mod():
     project's `import bot as _self`)."""
     import bot as _self
     return _self
-
-
-def _sp_streak_limit() -> int:
-    """The owner's FIXED 5 consecutive errors. Read from send_phase so the one
-    definition is shared with its tests; falls back to 5 if unavailable."""
-    try:
-        import send_phase
-        return int(send_phase.STREAK_LIMIT)
-    except Exception:  # noqa: BLE001
-        return 5
-
-
-def _phase_order(ordered_records):
-    """(guids, twoway_from) — one-way first, then two-way. Guarded: on ANY
-    failure it falls back to the previous behaviour (plain order, no phases),
-    so a send can never be blocked by the phase logic."""
-    try:
-        import send_integrate
-        return send_integrate.phase_split(ordered_records)
-    except Exception:  # noqa: BLE001
-        return [r["guid"] for r in ordered_records], 0
 
 
 class _HiddenSendImpossible(RuntimeError):
@@ -2061,20 +2097,10 @@ async def run_send(owner_id: int, payload: dict):
     delay = db.get_delay()
     max_errors = db.get_max_errors()
     resume_wait = db.get_resume_wait()
-    # Two-phase send: `twoway_from` is the index where the two-way block starts
-    # (set at prepare time). When phases are active the consecutive-error cap
-    # is the owner's FIXED 5, and hitting it means "switch phase / rotate"
-    # instead of the old cooldown-and-retry.
-    twoway_from = int(payload.get("twoway_from") or 0)
-    # a phase order was applied at prepare time (there are one-way contacts)
-    has_split = twoway_from > 0
-    # ... and there is an actual two-way block to fall back to. When every
-    # contact is one-way these differ, and jumping would land on the END of the
-    # list — which silently "finished" a run with the rest never tried.
-    can_jump = 0 < twoway_from < len(recipients)
-    phases_on = has_split
-    if phases_on:
-        max_errors = _sp_streak_limit()
+    # Automatic server rotation: after `max_errors` consecutive errors we move
+    # the account to the next server (code-free) and continue. `switch_mode`
+    # (owner-set, default on) picks rotation over the old cooldown-and-retry.
+    switch_mode = _rotation_enabled()
     # YoudonoaAx UPDATE (step 5): optional Rubika SECOND text, sent (as plain
     # text) to the SAME recipient right AFTER the marker/forward. Always text.
     rb_text2 = db.get_rb_text2()
@@ -2101,8 +2127,7 @@ async def run_send(owner_id: int, payload: dict):
         f"🧯 Max consecutive errors : {max_errors}",
         (f"✍️ Mode : Custom text" if mode == "text"
          else f"📌 Marker : «{marker}» Found ✅"),
-    ] + ([f"🔸 One-way : {twoway_from}   🔹 Two-way : {total - twoway_from}"]
-         if phases_on else [])))
+    ]))
 
     # ONE live card for the whole run, edited as it progresses (replaces the
     # old "a new log message every 50 recipients" spam).
@@ -2110,10 +2135,7 @@ async def run_send(owner_id: int, payload: dict):
         import send_integrate as _si
         _acc_now = db.get_account(account_id)
         _wtag, _wip = _si.srot.current_server(_acc_now)
-        _si.live_begin(account_id, phone,
-                       total_oneway=(twoway_from if phases_on else 0),
-                       total_twoway=((total - twoway_from) if phases_on
-                                     else total),
+        _si.live_begin(account_id, phone, total_oneway=0, total_twoway=total,
                        worker_tag=_wtag, worker_ip=_wip, tag=tag.strip("# "))
         await _si.live_push(_self_mod(), account_id, force=True)
     except Exception:  # noqa: BLE001
@@ -2268,49 +2290,25 @@ async def run_send(owner_id: int, payload: dict):
                 break
             if not hit_max:                  # whole list finished
                 break
-            # ---- two-phase rule (owner): 5 consecutive errors ---------------
-            # in the ONE-WAY block -> Rubika is refusing strangers, the IP is
-            # fine: skip straight to the TWO-WAY block on the SAME server.
-            if can_jump and idx < twoway_from:
-                skipped = twoway_from - idx
-                idx = twoway_from
-                await log(card("🔸→🔹 SEND PHASE CHANGE", [
-                    f"{_lbl()}📱 {phone}",
-                    f"• One-way stopped after {max_errors} consecutive errors",
-                    f"• Skipped {skipped} remaining strangers",
-                    f"• Now sending to {n - twoway_from} two-way contacts "
-                    "(same server)",
-                    f"🕒 {now()}"]))
-                try:
-                    import send_integrate as _si
-                    _st = _si.live_state(account_id)
-                    if _st is not None:
-                        _st.go_twoway()
-                        await _si.live_push(_self_mod(), account_id, force=True)
-                except Exception:  # noqa: BLE001
-                    pass
-                continue
-            # ---- no phase fallback left (we are in the two-way block, or this
-            # account has NO two-way contacts at all) -> the IP is the suspect:
-            # ask for an automatic server rotation. We stop this leg and let the
-            # post-send hook do the (existing, proven) transfer + resume, which
-            # continues the UNTRIED remainder on the new server.
-            if phases_on:
-                if not can_jump:
-                    await log(card("🔸 ONE-WAY BLOCKED — no two-way contacts", [
-                        f"{_lbl()}📱 {phone}",
-                        f"• {max_errors} consecutive errors and this account has",
-                        "  no contacts with an existing chat to fall back to.",
-                        f"• {max(0, n - idx)} recipients left",
-                        f"🕒 {now()}"]))
-                try:
-                    import send_integrate as _si
-                    if _si.should_rotate(account_id, dead=False,
-                                         reason="consecutive send errors"):
-                        reason = _ROTATE_REASON
-                        break
-                except Exception:  # noqa: BLE001
-                    pass
+
+            # ---- SERVER SWITCH (simple, owner's rule) -----------------------
+            # 5 consecutive errors -> wait 3 min -> move to the next server ->
+            # continue from here. Up to _rotation_max() times; then give up.
+            if switch_mode:
+                moved = await _rotate_in_place(
+                    owner_id, account_id, phone, remaining=recipients[idx:],
+                    base_ok=base_ok + ok, mode=mode, text=send_body,
+                    text2=rb_text2, tag=tag)
+                if moved == "switched":
+                    # the remaining list continues on the new server in its own
+                    # run; this leg is done.
+                    reason = _SWITCHED_REASON
+                    break
+                if moved == "exhausted":
+                    reason = f"Gave up after {_rotation_max()} server switches"
+                    break
+                # moved == "off"/"error" -> fall through to the old cooldown
+
             if (not config.RESUME_UNLIMITED) and retry_count >= config.RESUME_MAX_RETRIES:
                 reason = f"Reached error cap ({max_errors})"
                 break
@@ -3997,10 +3995,6 @@ async def run_send_remote(owner_id: int, payload: dict):
             "recipients": explicit_recipients or [],  # resume fix: remaining list
             "mode": mode, "text": send_body,   # plain-text (no forward) mode
             "order_by_presence": order_by_presence,   # POOL BRAIN slice ordering
-            # two-phase: strangers FIRST, then two-way contacts. Only for a
-            # fresh full-list run — a resume/transfer keeps its frozen order,
-            # and a pool slice keeps presence ordering.
-            "phase_order": (not explicit_recipients) and (not order_by_presence),
             # send method #5: additive, default False -> workers that ignore it
             # keep forwarding exactly as before.
             "hide_sender": bool(payload.get("hide_sender")),
@@ -4022,11 +4016,9 @@ async def run_send_remote(owner_id: int, payload: dict):
             # denominator and silently swallow every counter.
             try:
                 import send_integrate as _si
-                _tw = int(res.get("twoway_from") or 0)
                 _tot = int(res.get("total") or total or len(guids))
-                _si.live_begin(account_id, phone,
-                               total_oneway=_tw,
-                               total_twoway=max(0, _tot - _tw),
+                _si.live_begin(account_id, phone, total_oneway=0,
+                               total_twoway=_tot,
                                worker_tag=w.get("tag") or "",
                                worker_ip=w.get("ip") or "")
                 await _si.live_push(_self_mod(), account_id, force=True)
@@ -6664,48 +6656,11 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
     remaining = info.get("recipients") or []
     dead = info.get("dead")
     is_remote = bool(info.get("remote"))
-    # AUTOMATIC server rotation. This is the single point BOTH the local and
-    # the remote send path reach when a run stops with work left, so hooking
-    # here covers both. It performs exactly what the manual
-    # "🔁 Login to New Worker & Continue" button does (resume_relogin_cb),
-    # without asking: pick an untried worker -> code-free /session/import ->
-    # continue the remaining list. Guarded end-to-end: on ANY problem we fall
-    # through to the normal manual panel below.
-    if remaining and not dead:
-        try:
-            import send_integrate as _si
-            _reason = str(info.get("reason") or "")
-            if _si.should_rotate(account_id, dead=bool(dead), reason=_reason):
-                _self = _self_mod()
-                # persist the remaining list FIRST so the resume has it even if
-                # the transfer or the restart goes wrong.
-                _payload = {
-                    "saved_guid": info.get("saved_guid"), "mid": info.get("mid"),
-                    "recipients": remaining,
-                    "base_ok": int(info.get("base_ok") or 0),
-                    "tag": info.get("tag") or "", "remote": is_remote,
-                    "worker_id": info.get("worker_id"),
-                    "tried_workers": worker_transfer.get_tried(account_id),
-                    "mode": (info.get("mode") or "").lower()
-                            or ("text" if info.get("text") else "marker"),
-                    "text": info.get("text") or "",
-                    "text2": info.get("text2") or "",
-                    "twoway_from": 0,     # the remaining list is already two-way
-                }
-                try:
-                    db.save_paused_send(account_id, owner_id, phone, _payload)
-                except Exception:  # noqa: BLE001
-                    pass
-                if await _si.auto_rotate(_self, account_id, phone,
-                                         reason=_reason or "consecutive send errors",
-                                         resume_at=int(info.get("base_ok") or 0)):
-                    await _do_resume(owner_id, account_id)
-                    return
-        except Exception as _re:  # noqa: BLE001
-            await log(card("⚠️ AUTO ROTATION — skipped", [
-                f"📱 {phone}", f"• {repr(_re)[:150]}",
-                "• Falling back to the manual transfer panel.",
-                f"🕒 {now()}"]))
+    # A run that ended because the account was MOVED to another server is not a
+    # stop — the remaining list already continues there (see _rotate_in_place),
+    # so there is nothing to offer here.
+    if str(info.get("reason") or "") == _SWITCHED_REASON:
+        return
     if remaining or is_remote:
         # worker-transfer bug fix: ALWAYS store the send method explicitly so a
         # later resume/transfer never falls back to the marker default. `mode`
@@ -8008,11 +7963,8 @@ async def _prepare_local(acc, marker):
         if not mid:
             return None
         ordered, _stats = await _ordered_for_send(client)
-        # two-phase order here too (multi-send / pool go through this helper),
-        # so EVERY send path puts strangers first instead of chat-first.
-        _g, _tw = _phase_order(ordered)
-        _prepare_local.last_twoway_from = _tw
-        return saved_guid, mid, _g
+        # send_order's own order (two-way seen-recently first, strangers last).
+        return saved_guid, mid, [r["guid"] for r in ordered]
     finally:
         try:
             await client.disconnect()
@@ -8072,8 +8024,7 @@ async def _multi_send_one(owner_id, acc, tag):
         return
     await run_send(owner_id, {
         "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
-        "recipients": recips, "tag": tag, "suppress_resume_panel": True,
-        "twoway_from": getattr(_prepare_local, "last_twoway_from", 0)})
+        "recipients": recips, "tag": tag, "suppress_resume_panel": True})
 
 
 async def _run_group_sequential(owner_id, accs):
@@ -9092,10 +9043,7 @@ async def _local_ordered_guids(acc):
     try:
         await rb.connect_ready(client)
         ordered, _stats = await _ordered_for_send(client)
-        # two-phase order on this path as well (text-mode fresh resume)
-        _g, _tw = _phase_order(ordered)
-        _local_ordered_guids.last_twoway_from = _tw
-        return _g
+        return [r["guid"] for r in ordered]
     finally:
         try:
             await client.disconnect()

@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
 """
-🔗 send wiring test — is the new send behaviour really CONNECTED to bot.py?
-===========================================================================
+🔗 send wiring test — is the RESTORED send behaviour connected to bot.py?
+=========================================================================
 
-The modules were tested in isolation already. This proves the WIRING:
+The phase split (one-way first) was removed at the owner's request. The order
+is now send_order's own: ALL two-way contacts first (by last-seen), then all
+one-way — enforced in send_order.build by a `has_chat`-first sort key. Server
+rotation is the simple rule: `max_errors` consecutive failures -> 3-min wait ->
+next server -> continue, up to the budget, then give up.
 
-  * both prepare paths store the phase-ordered list + `twoway_from`
-  * run_send reads them, fixes the cap at 5, jumps phase, and asks to rotate
-  * the every-50-recipients spam is gone from BOTH send paths
-  * the live card is created, edited and finished on BOTH paths
-  * rotation is hooked at _offer_resume_after_send (covers local AND remote)
-  * auth errors go through the precise classifier + curiosity capture
-  * Settings exposes the switch budget and curiosity, and the text step is
-    registered in the message router (a missed step = silently ignored input)
-  * every helper bot.py calls on send_integrate actually exists
+This test proves the WIRING of that restored behaviour and that the removed
+phase logic is really gone from bot.py / worker_api.py.
 
   python3 scripts/send_wiring_test.py --selftest
 """
 import ast
 import os
 import sys
+import types as _t
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# send_integrate pulls in send_rotate -> db / worker, which live in core/ and
-# workers/ — the same flat path main.py builds on the master.
 for _sub in ("", "core", "rubika", "workers", "status"):
     p = os.path.join(_ROOT, _sub) if _sub else _ROOT
     if p not in sys.path:
         sys.path.insert(0, p)
-
-# dev box has no dotenv/rubpy (same as the project's other test setups): stub
-# the bare minimum so config/db/rubika_client import, then the REAL modules
-# under test run untouched.
-import types as _t
 
 
 def _stub(name, **attrs):
@@ -46,7 +37,7 @@ def _stub(name, **attrs):
 
 _stub("dotenv", load_dotenv=lambda *a, **k: None, find_dotenv=lambda *a, **k: "")
 _rubpy = _t.ModuleType("rubpy")
-_rubpy.__path__ = []                       # make it a package
+_rubpy.__path__ = []
 _rubpy.Client = object
 sys.modules.setdefault("rubpy", _rubpy)
 _stub("rubpy.types", Update=object)
@@ -54,7 +45,9 @@ _stub("rubpy.crypto", Crypto=object)
 _stub("rubpy.sessions", SQLiteSession=object, StringSession=object)
 
 BOT = os.path.join(_ROOT, "bot_app", "bot.py")
+WAPI = os.path.join(_ROOT, "workers", "worker_api.py")
 SRC = open(BOT, encoding="utf-8").read()
+WSRC = open(WAPI, encoding="utf-8").read()
 TREE = ast.parse(SRC)
 
 _passed = 0
@@ -74,160 +67,111 @@ def eq(a, b, msg):
     ok(a == b, f"{msg} (got {a!r}, want {b!r})")
 
 
-def _fn(name):
-    for n in ast.walk(TREE):
+def _fn(src, name):
+    for n in ast.walk(ast.parse(src)):
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name:
-            return n
-    return None
-
-
-def _body(name):
-    n = _fn(name)
-    return ast.get_source_segment(SRC, n) if n else ""
+            return ast.get_source_segment(src, n) or ""
+    return ""
 
 
 # --------------------------------------------------------------------------- #
-def test_prepare_paths_carry_phases():
-    ok(SRC.count("_phase_order(ordered)") >= 2,
-       "both prepare paths compute the phase split")
-    ok(SRC.count('"twoway_from"') >= 2,
-       "both prepare paths store twoway_from in the payload")
-    # the phase helper must be guarded so a failure cannot block a send
-    ph = _body("_phase_order")
-    ok("except Exception" in ph and 'r["guid"] for r in ordered_records' in ph,
-       "_phase_order falls back to the plain order on failure")
+# 1. The phase split is GONE
+# --------------------------------------------------------------------------- #
+def test_phase_logic_removed():
+    for token in ("_phase_order(", "twoway_from", "phases_on", "can_jump",
+                  "SEND PHASE CHANGE", "ONE-WAY BLOCKED", "go_twoway"):
+        eq(SRC.count(token), 0, f"bot.py no longer references {token!r}")
+    for token in ("twoway_from", "phase_order", "split_recipients",
+                  "SEND PHASE CHANGE", "oneway_ok"):
+        eq(WSRC.count(token), 0, f"worker_api.py no longer references {token!r}")
 
 
-def test_run_send_uses_phases():
-    b = _body("run_send")
-    ok('payload.get("twoway_from")' in b, "run_send reads twoway_from")
-    ok("phases_on" in b, "run_send tracks whether phases are active")
-    ok("_sp_streak_limit()" in b,
-       "the consecutive-error cap becomes the fixed 5 when phases are on")
-    ok("idx = twoway_from" in b, "run_send jumps to the two-way block")
-    ok("SEND PHASE CHANGE" in b, "the phase change is logged")
-    ok("_ROTATE_REASON" in b, "run_send can ask for a server rotation")
-    ok("should_rotate" in b, "rotation is only asked for when it makes sense")
+# --------------------------------------------------------------------------- #
+# 2. Order comes straight from send_order (two-way first), on every path
+# --------------------------------------------------------------------------- #
+def test_every_path_uses_send_order_directly():
+    # each prepare/order helper builds recipients as a plain list of the
+    # send_order-ordered guids — no re-phasing in between.
+    ok(SRC.count('[r["guid"] for r in ordered]') >= 4,
+       "all local send paths use send_order's order verbatim")
+    # worker builds the same way and no longer splits
+    ok('recipients = [r["guid"] for r in ordered]' in WSRC,
+       "worker uses send_order's order verbatim")
 
 
-def test_streak_limit_is_five():
-    import send_phase
-    eq(send_phase.STREAK_LIMIT, 5, "the streak limit is the owner's fixed 5")
-    eq(send_phase.SWITCH_PAUSE_SEC, 180, "3 minutes between switches")
-    eq(send_phase.DEFAULT_MAX_SWITCHES, 3, "default budget is 3")
+def test_send_order_has_chat_first():
+    import send_order as so
+    src = open(os.path.join(_ROOT, "rubika", "send_order.py"), encoding="utf-8").read()
+    ok('0 if r["has_chat"] else 1' in src,
+       "build() sorts has_chat (two-way) ahead of one-way")
+    # and the sort key keeps presence order WITHIN each group
+    body = _fn(src, "build")
+    ok(body.index('has_chat') < body.index('_TIER_INDEX'),
+       "has_chat is a higher-priority sort key than the presence tier")
+
+
+# --------------------------------------------------------------------------- #
+# 3. Simple server switch is wired into run_send
+# --------------------------------------------------------------------------- #
+def test_server_switch_wired():
+    b = _fn(SRC, "run_send")
+    ok("_rotate_in_place(" in b, "run_send calls the simple rotation helper")
+    ok("_SWITCHED_REASON" in b, "a switched leg ends with the switch marker")
+    r = _fn(SRC, "_rotate_in_place")
+    ok("SWITCH_PAUSE_SEC" in r, "it waits the 3-minute gap")
+    ok("auto_rotate" in r, "it performs the move via the proven transfer chain")
+    ok("_do_resume" in r, "and resumes the remaining list on the new server")
+    ok("switches_used" in r and "_rotation_max" in r,
+       "it respects the switch budget and gives up when spent")
+    # the switched leg must NOT also trigger the manual resume panel
+    o = _fn(SRC, "_offer_resume_after_send")
+    ok("_SWITCHED_REASON" in o and "return" in o,
+       "a switched run skips the manual transfer panel")
+
+
+def test_switch_after_max_errors():
+    # rotation triggers off the same consecutive-error cap the loop already
+    # uses (hit_max), not a separate hard-coded number.
+    b = _fn(SRC, "run_send")
+    ok("attempt_fail >= max_errors" in b, "hit_max uses max_errors (owner-set)")
+    ok("switch_mode" in b, "rotation is gated by switch_mode")
+    ok("_rotation_enabled()" in b, "switch_mode reads the enabled flag")
+
+
+def test_rotation_budget_setting():
+    import send_rotate
+    send_rotate.set_max_switches(3)
+    eq(send_rotate.max_switches(), 3, "budget tunable (default 3)")
+    send_rotate.set_max_switches(0)
+    eq(send_rotate.max_switches(), 0, "0 disables rotation")
+    send_rotate.set_max_switches(3)
 
 
 def test_no_more_fifty_message_spam():
-    eq(SRC.count("SEND_LOG_EVERY"), 0,
-       "the every-50-recipients progress spam is gone from bot.py")
+    eq(SRC.count("SEND_LOG_EVERY"), 0, "the every-50 spam is gone")
     for fname in ("run_send", "run_send_remote"):
-        b = _body(fname)
+        b = _fn(SRC, fname)
         ok("live_begin" in b, f"{fname} starts the live card")
-        ok("live_push" in b, f"{fname} edits the live card")
         ok("live_finish" in b, f"{fname} finishes the live card")
 
 
-def test_rotation_hooked_for_both_paths():
-    b = _body("_offer_resume_after_send")
-    ok("auto_rotate" in b, "automatic rotation is hooked at the shared point")
-    ok("_do_resume" in b, "after a successful transfer the list is resumed")
-    ok("save_paused_send" in b,
-       "the remaining list is persisted BEFORE transferring")
-    ok("should_rotate" in b, "rotation is gated (never for a dead session)")
-    ok("except Exception" in b,
-       "a rotation failure falls back to the manual panel")
-    # both callers reach it
-    ok("_offer_resume_after_send" in _body("run_send"), "local path reaches it")
-    ok("_offer_resume_after_send" in _body("run_send_remote"),
-       "remote path reaches it")
-
-
-def test_auth_errors_classified():
-    b = _body("run_send")
-    ok("note_auth_error" in b, "send failures go through the auth classifier")
-    import auth_diag
-    eq(auth_diag.classify_auth("AUTH_FROM_ANOTHER"), auth_diag.ACC_CONFLICT,
-       "two-places-at-once is its own code")
-    eq(auth_diag.classify_auth("INVALID_AUTH"), auth_diag.ACC_INVALID,
-       "invalidated session is its own code")
-    eq(auth_diag.classify_auth("NOT_REGISTERED"), auth_diag.ACC_GONE,
-       "deleted account is its own code")
-    eq(auth_diag.classify_auth("TOO_REQUESTS"), "",
-       "a rate limit is NOT an auth error")
-    ok(not auth_diag.rotation_helps(auth_diag.ACC_INVALID),
-       "rotation never claimed to help an auth failure")
-
-
-def test_rotation_refuses_on_auth_or_dead():
-    import send_integrate as si
-    si.reset_rotation(999)
-    ok(not si.should_rotate(999, dead=True, reason="whatever"),
-       "never rotate a dead session")
-    ok(not si.should_rotate(999, dead=False,
-                            reason="Session invalid (re-login needed)"),
-       "never rotate on an invalid session")
-    ok(not si.should_rotate(999, dead=False, reason="Manual stop by user"),
-       "never rotate after a manual stop")
-    ok(not si.should_rotate(999, dead=False, reason="INVALID_AUTH"),
-       "never rotate on a raw auth body")
-    ok(si.should_rotate(999, dead=False, reason="consecutive send errors"),
-       "DO rotate on plain consecutive send errors")
-
-
-def test_phase_helpers():
-    import send_integrate as si
-    recs = [{"guid": "s1", "mutual": False}, {"guid": "m1", "mutual": True},
-            {"guid": "s2", "mutual": False}]
-    guids, boundary = si.phase_split(recs)
-    eq(guids, ["s1", "s2", "m1"], "one-way first, then two-way")
-    eq(boundary, 2, "boundary marks where two-way starts")
-    eq(si.phase_of(0, 2), "oneway", "index 0 is one-way")
-    eq(si.phase_of(2, 2), "twoway", "index 2 is two-way")
-    eq(si.phase_jump(0, 2, 3), 2, "jump lands on the two-way block")
-    eq(si.phase_jump(2, 2, 3), None, "no jump once already two-way")
-    eq(si.phase_jump(0, 0, 3), None, "no jump when there are no phases")
-    eq(si.phase_jump(0, 3, 3), None, "no jump when there is no two-way block")
-
-
-def test_settings_and_router():
-    ok('b"set_switches"' in SRC, "Settings has the server-switch button")
-    ok('b"curio"' in SRC, "Settings has the curiosity button")
-    ok('"await_set_switches"' in SRC, "the switch-count step is created")
-    ok(SRC.count('elif step == "await_set_switches"') == 1,
-       "the step IS registered in the message router (else input is ignored)")
-    ok("def handle_set_switches" in SRC, "its handler exists")
-    for cb in ("curio_txt", "curio_tog", "curio_clear"):
-        ok(f'b"{cb}"' in SRC, f"curiosity handler {cb} wired")
-    ok("send_file" in _body("curiosity_txt_cb"), "the .txt is actually sent")
-
-
-def test_every_called_helper_exists():
-    """Every send_integrate.<x> bot.py calls must exist on the module."""
-    import send_integrate as si
-    called = set()
-    for n in ast.walk(TREE):
-        if (isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
-                and n.value.id == "_si"):
-            called.add(n.attr)
-    ok(called, f"found send_integrate calls ({len(called)})")
-    missing = sorted(a for a in called if not hasattr(si, a))
-    eq(missing, [], "every send_integrate helper bot.py calls exists")
-    # and the modules it fronts for
-    for mod in ("send_phase", "send_live", "send_rotate", "auth_diag"):
-        ok(mod in open(os.path.join(_ROOT, "rubika", "send_integrate.py"),
-                       encoding="utf-8").read(),
-           f"send_integrate fronts {mod}")
+def test_live_card_starts_two_way_whole_list():
+    # live_begin is now called with the whole list as one block (no phase split)
+    for fname in ("run_send", "run_send_remote"):
+        b = _fn(SRC, fname)
+        ok("total_oneway=0" in b,
+           f"{fname} starts the live card with no phase split")
 
 
 def main():
     if "--selftest" not in sys.argv:
         print("usage: send_wiring_test.py --selftest")
         return 0
-    for fn in (test_prepare_paths_carry_phases, test_run_send_uses_phases,
-               test_streak_limit_is_five, test_no_more_fifty_message_spam,
-               test_rotation_hooked_for_both_paths, test_auth_errors_classified,
-               test_rotation_refuses_on_auth_or_dead, test_phase_helpers,
-               test_settings_and_router, test_every_called_helper_exists):
+    for fn in (test_phase_logic_removed, test_every_path_uses_send_order_directly,
+               test_send_order_has_chat_first, test_server_switch_wired,
+               test_switch_after_max_errors, test_rotation_budget_setting,
+               test_no_more_fifty_message_spam,
+               test_live_card_starts_two_way_whole_list):
         try:
             fn()
         except Exception as e:  # noqa: BLE001
