@@ -204,6 +204,42 @@ def live_set_server(account_id: int, worker_tag: str, worker_ip: str) -> None:
         rec["dirty"] = True
 
 
+def live_sync_remote(account_id: int, *, worker_tag: str,
+                     oneway_ok=None, oneway_fail=None,
+                     twoway_ok=None, twoway_fail=None,
+                     total_ok=0, total_fail=0, phase=None) -> None:
+    """Mirror a remote job's counters into the live card.
+
+    The worker reports its own per-phase tallies; when it is an OLD worker that
+    does not, we fall back to the cumulative ok/fail so the card still shows
+    real numbers instead of zeros.
+    """
+    rec = _live.get(int(account_id))
+    if not rec:
+        return
+    st = rec["state"]
+    if phase in (sp.PHASE_ONEWAY, sp.PHASE_TWOWAY):
+        if phase == sp.PHASE_TWOWAY and st.phase == sp.PHASE_ONEWAY:
+            st.oneway_blocked = True
+        st.phase = phase
+    if oneway_ok is None and twoway_ok is None:
+        # old worker: no phase breakdown -> put everything in the phase we
+        # believe we are in, so nothing is lost.
+        bucket = st.phase if st.phase in st.stats else sp.PHASE_TWOWAY
+        st.stats[bucket]["sent"] = int(total_ok or 0)
+        st.stats[bucket]["fail"] = int(total_fail or 0)
+    else:
+        st.stats[sp.PHASE_ONEWAY]["sent"] = int(oneway_ok or 0)
+        st.stats[sp.PHASE_ONEWAY]["fail"] = int(oneway_fail or 0)
+        st.stats[sp.PHASE_TWOWAY]["sent"] = int(twoway_ok or 0)
+        st.stats[sp.PHASE_TWOWAY]["fail"] = int(twoway_fail or 0)
+    st.cursor = int(total_ok or 0) + int(total_fail or 0)
+    tag = worker_tag or "local"
+    st.per_worker[tag] = {"sent": int(total_ok or 0), "fail": int(total_fail or 0)}
+    rec["worker_tag"] = tag
+    rec["dirty"] = True
+
+
 def live_mark(account_id: int) -> None:
     rec = _live.get(int(account_id))
     if rec:

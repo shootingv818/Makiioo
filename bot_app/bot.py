@@ -3971,14 +3971,6 @@ async def run_send_remote(owner_id: int, payload: dict):
         ]))
 
     prev_retry = 0
-    # ONE live card for this remote run too (same renderer as the local path).
-    try:
-        import send_integrate as _si
-        _si.live_begin(account_id, phone, total_oneway=0, total_twoway=total,
-                       worker_tag=w.get("tag") or "", worker_ip=w.get("ip") or "")
-        await _si.live_push(_self_mod(), account_id, force=True)
-    except Exception:  # noqa: BLE001
-        pass
     try:
         res = await worker.api_call(w, "POST", "/send/start", {
             "phone": phone, "marker": marker, "delay": delay,
@@ -3989,6 +3981,10 @@ async def run_send_remote(owner_id: int, payload: dict):
             "recipients": explicit_recipients or [],  # resume fix: remaining list
             "mode": mode, "text": send_body,   # plain-text (no forward) mode
             "order_by_presence": order_by_presence,   # POOL BRAIN slice ordering
+            # two-phase: strangers FIRST, then two-way contacts. Only for a
+            # fresh full-list run — a resume/transfer keeps its frozen order,
+            # and a pool slice keeps presence ordering.
+            "phase_order": (not explicit_recipients) and (not order_by_presence),
             # send method #5: additive, default False -> workers that ignore it
             # keep forwarding exactly as before.
             "hide_sender": bool(payload.get("hide_sender")),
@@ -4004,6 +4000,22 @@ async def run_send_remote(owner_id: int, payload: dict):
             # mirror the EXACT ordered list the worker is using, so we can
             # compute the precise remaining slice (guids[ok+fail:]) on stop.
             guids = res.get("guids") or guids
+            # ONE live card for this remote run. Started HERE (not before
+            # /send/start) because only now do we know the real total and the
+            # phase split — starting it with total=0 made the card show a 0
+            # denominator and silently swallow every counter.
+            try:
+                import send_integrate as _si
+                _tw = int(res.get("twoway_from") or 0)
+                _tot = int(res.get("total") or total or len(guids))
+                _si.live_begin(account_id, phone,
+                               total_oneway=_tw,
+                               total_twoway=max(0, _tot - _tw),
+                               worker_tag=w.get("tag") or "",
+                               worker_ip=w.get("ip") or "")
+                await _si.live_push(_self_mod(), account_id, force=True)
+            except Exception:  # noqa: BLE001
+                pass
             while True:
                 if stop_flags.get(account_id):
                     try:
@@ -4033,18 +4045,18 @@ async def run_send_remote(owner_id: int, payload: dict):
                 # ok/fail, so we sync the card to those totals.
                 try:
                     import send_integrate as _si
-                    _st = _si.live_state(account_id)
-                    if _st is not None:
-                        _tot = _st.stats[_si.sp.PHASE_ONEWAY]["sent"] + \
-                               _st.stats[_si.sp.PHASE_TWOWAY]["sent"]
-                        _tfa = _st.stats[_si.sp.PHASE_ONEWAY]["fail"] + \
-                               _st.stats[_si.sp.PHASE_TWOWAY]["fail"]
-                        for _ in range(max(0, ok - _tot)):
-                            _st.record_ok(w.get("tag") or "")
-                        for _ in range(max(0, fail - _tfa)):
-                            _st.record_fail(w.get("tag") or "")
-                        _si.live_mark(account_id)
-                        await _si.live_push(_self_mod(), account_id)
+                    # mirror the worker's OWN per-phase tallies (it reports
+                    # them in /send/status) instead of guessing from the
+                    # cumulative totals.
+                    _si.live_sync_remote(
+                        account_id, worker_tag=(w.get("tag") or ""),
+                        oneway_ok=stt.get("oneway_ok"),
+                        oneway_fail=stt.get("oneway_fail"),
+                        twoway_ok=stt.get("twoway_ok"),
+                        twoway_fail=stt.get("twoway_fail"),
+                        total_ok=ok, total_fail=fail,
+                        phase=stt.get("phase"))
+                    await _si.live_push(_self_mod(), account_id)
                 except Exception:  # noqa: BLE001
                     pass
                 # auto-resume happening on the worker -> master posts the ALERT
@@ -7980,7 +7992,11 @@ async def _prepare_local(acc, marker):
         if not mid:
             return None
         ordered, _stats = await _ordered_for_send(client)
-        return saved_guid, mid, [r["guid"] for r in ordered]
+        # two-phase order here too (multi-send / pool go through this helper),
+        # so EVERY send path puts strangers first instead of chat-first.
+        _g, _tw = _phase_order(ordered)
+        _prepare_local.last_twoway_from = _tw
+        return saved_guid, mid, _g
     finally:
         try:
             await client.disconnect()
@@ -8040,7 +8056,8 @@ async def _multi_send_one(owner_id, acc, tag):
         return
     await run_send(owner_id, {
         "account_id": aid, "phone": phone, "saved_guid": saved_guid, "mid": mid,
-        "recipients": recips, "tag": tag, "suppress_resume_panel": True})
+        "recipients": recips, "tag": tag, "suppress_resume_panel": True,
+        "twoway_from": getattr(_prepare_local, "last_twoway_from", 0)})
 
 
 async def _run_group_sequential(owner_id, accs):
@@ -9059,7 +9076,10 @@ async def _local_ordered_guids(acc):
     try:
         await rb.connect_ready(client)
         ordered, _stats = await _ordered_for_send(client)
-        return [r["guid"] for r in ordered]
+        # two-phase order on this path as well (text-mode fresh resume)
+        _g, _tw = _phase_order(ordered)
+        _local_ordered_guids.last_twoway_from = _tw
+        return _g
     finally:
         try:
             await client.disconnect()

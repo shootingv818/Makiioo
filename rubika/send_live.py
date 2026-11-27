@@ -48,7 +48,13 @@ def render_live(*, phone: str, tag: str, worker_tag: str, worker_ip: str,
     """Build the live send card from a PhaseState snapshot."""
     one = state.stats[sp.PHASE_ONEWAY]
     two = state.stats[sp.PHASE_TWOWAY]
+    # Never render a 0 denominator while there IS progress: that produced the
+    # nonsensical "620/0" bar. Fall back to the whole known list, then to the
+    # work actually done.
     q_total = len(state.queue())
+    if q_total <= 0:
+        q_total = max(len(state.one_way) + len(state.two_way),
+                      state.total_sent() + state.total_fail(), state.cursor)
     head = "LIVE" if not stopped else "STOPPED"
 
     # one-way line: show why it ended, when it did

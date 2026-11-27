@@ -224,6 +224,12 @@ def _build_app():
         order_by_presence: bool = False  # POOL BRAIN: order explicit recipients
         #                                  online -> last-seen (never chat-first)
         hide_sender: bool = False
+        # Two-phase send: put contacts we have NO chat with (one-way) FIRST,
+        # then the two-way ones. send_order's default tier 1 is TWOWAY_RECENT,
+        # i.e. the opposite, so this flag is what makes the owner's "strangers
+        # first" rule apply to worker-held accounts too. Additive: an older
+        # master never sets it and nothing changes.
+        phase_order: bool = False
 
 
     class AutomationIn(BaseModel):
@@ -636,6 +642,7 @@ def _build_app():
         # recipient list (a resume / worker-transfer of the REMAINING list),
         # send EXACTLY that list in the given order. Otherwise build the full
         # ordered list as before.
+        twoway_from = 0          # index where the two-way block starts (0 = off)
         if getattr(body, "recipients", None):
             recipients = list(body.recipients)
             # POOL BRAIN (Q1/Q2): order this account's OWN slice by
@@ -651,6 +658,15 @@ def _build_app():
         else:
             ordered, _stats = await _ordered_for_send(client)
             recipients = [r["guid"] for r in ordered]
+            # two-phase order: strangers first, then contacts with a chat.
+            if getattr(body, "phase_order", False):
+                try:
+                    import send_phase
+                    _one, _two = send_phase.split_recipients(ordered)
+                    recipients = _one + _two
+                    twoway_from = len(_one)
+                except Exception as _pe:  # noqa: BLE001
+                    _qlog(f"[phase_order fallback] {_pe!r}")
 
         # send method #5 (hidden sender): read the marked post once so each
         # recipient can get a NEW message instead of a forward. Only when the
@@ -682,13 +698,21 @@ def _build_app():
         job = {"phone": body.phone, "total": len(recipients), "ok": 0, "fail": 0,
                "done": False, "stopped": False, "reason": None,
                "retry_count": 0, "state": "sending", "sent_guids": [],
-               "hide_src": hide_src}
+               "hide_src": hide_src,
+               # two-phase bookkeeping, reported back via /send/status so the
+               # master's live card can show which phase we are in.
+               "twoway_from": twoway_from, "phase": ("oneway" if twoway_from
+                                                     else "twoway"),
+               "oneway_ok": 0, "oneway_fail": 0,
+               "twoway_ok": 0, "twoway_fail": 0}
         _jobs[job_id] = job
         asyncio.create_task(_run_send(client, job, saved_guid, mid, recipients, body))
         # return the EXACT ordered guids so the master can mirror the list and
         # compute the remaining slice (guids[ok+fail:]) for a precise resume.
+        # `twoway_from` lets the master show the phase split.
         return {"ok": True, "marker_found": True, "job_id": job_id,
-                "total": len(recipients), "guids": recipients}
+                "total": len(recipients), "guids": recipients,
+                "twoway_from": twoway_from}
 
     @app.get("/send/status/{job_id}")
     async def send_status(job_id: str, authorization: str = Header(None)):
@@ -1729,11 +1753,22 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                         job.setdefault("sent_guids", []).append(guid)
                     except Exception:
                         pass
+                    # two-phase tally (idx-1 is the recipient just sent)
+                    _tw = job.get("twoway_from") or 0
+                    if _tw and (idx - 1) < _tw:
+                        job["oneway_ok"] = job.get("oneway_ok", 0) + 1
+                    else:
+                        job["twoway_ok"] = job.get("twoway_ok", 0) + 1
                     attempt_fail = 0          # reset: count CONSECUTIVE errors only
                 except Exception as e:  # noqa: BLE001
                     job["fail"] += 1
                     attempt_fail += 1
                     job["last_error"] = repr(e)[:200]
+                    _tw = job.get("twoway_from") or 0
+                    if _tw and (idx - 1) < _tw:
+                        job["oneway_fail"] = job.get("oneway_fail", 0) + 1
+                    else:
+                        job["twoway_fail"] = job.get("twoway_fail", 0) + 1
                     if attempt_fail >= body.max_errors:
                         hit_max = True
                         break
@@ -1741,6 +1776,23 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
 
             if not hit_max:
                 break  # finished the whole list
+            # Two-phase rule (same as the master's local path): N consecutive
+            # errors inside the ONE-WAY block means Rubika is refusing
+            # strangers, not that the IP is bad -> skip straight to the TWO-WAY
+            # block instead of cooling down. The master sees the phase flip via
+            # /send/status and only rotates the server if THIS block fails too.
+            _tw = job.get("twoway_from") or 0
+            if _tw and idx < _tw:
+                _skipped = _tw - idx
+                idx = _tw
+                job["phase"] = "twoway"
+                job["oneway_blocked"] = True
+                _qlog(_wcard("🔸→🔹 SEND PHASE CHANGE", [
+                    f"📱 {job.get('phone')}",
+                    f"• One-way stopped after {body.max_errors} consecutive errors",
+                    f"• Skipped {_skipped} remaining strangers",
+                    "• Now sending to two-way contacts (same server)"]))
+                continue
             # max_retries <= 0 means UNLIMITED resume (keep going until done)
             if body.max_retries > 0 and job["retry_count"] >= body.max_retries:
                 job["reason"] = f"max_errors({body.max_errors})"

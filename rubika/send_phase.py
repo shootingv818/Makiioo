@@ -108,16 +108,23 @@ class PhaseState:
                                        {"sent": 0, "fail": 0})
         w["sent" if ok else "fail"] += 1
 
-    def record_ok(self, worker_tag: str = "local"):
+    def _bucket(self) -> str:
+        """Which phase a result belongs to. A result recorded while the state
+        says DONE must NEVER vanish (that silently showed 'Sent 0' for a run
+        that really sent 36), so it is attributed to the phase we were last
+        working in."""
         if self.phase in self.stats:
-            self.stats[self.phase]["sent"] += 1
+            return self.phase
+        return PHASE_TWOWAY if (self.two_way or self.oneway_blocked) else PHASE_ONEWAY
+
+    def record_ok(self, worker_tag: str = "local"):
+        self.stats[self._bucket()]["sent"] += 1
         self._tally(worker_tag, True)
         self.streak = 0                 # a success breaks the streak
         self.cursor += 1
 
     def record_fail(self, worker_tag: str = "local"):
-        if self.phase in self.stats:
-            self.stats[self.phase]["fail"] += 1
+        self.stats[self._bucket()]["fail"] += 1
         self._tally(worker_tag, False)
         self.streak += 1
         self.cursor += 1
