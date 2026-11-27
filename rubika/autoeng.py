@@ -52,6 +52,11 @@ RESERVE_TARGET = 30
 SCAN_BATCH_MULTIPLIER = 3        # extract up to want*mult raw links to net `want` new
 ACC_LIMIT_COOLDOWN = 180         # pause an account this long after a rate-limit
 GROUP_FAULT_STRIKES = 3          # consecutive send failures -> drop the group
+# How many auth failures an account may collect before we quarantine it. The
+# OLD automation never quarantined on a send error at all, and Rubika returns
+# INVALID_AUTH for temporary restrictions too, so a single hit must not kill a
+# healthy account. A successful send clears the strikes.
+AUTH_STRIKES = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -72,6 +77,7 @@ class Engine:
         self.dead_scanners = set()
         self.quarantined = set()
         self.lost_groups = 0
+        self.auth_strikes = {}    # account_id -> consecutive auth failures
 
     def reset_counters(self):
         self.scan = {"extracted": 0, "checked": 0, "healthy": 0, "dead": 0,
@@ -80,6 +86,7 @@ class Engine:
         self.dead_scanners = set()
         self.quarantined = set()
         self.lost_groups = 0
+        self.auth_strikes = {}
 
 
 engine = Engine()
@@ -253,6 +260,15 @@ async def _safe_log(bot, text):
 
 
 async def _err_card(bot, *, code, stage, acc, reason, action):
+    # keep the RAW reason for curiosity mode — Rubika's own alert text is the
+    # most informative thing we ever get back and must not be lost to a trim.
+    try:
+        import curiosity
+        curiosity.record("engine_error", phone=str(acc.get("phone", "")),
+                         worker=_worker_label(acc.get("id")), method=stage,
+                         raw=str(reason), note=code)
+    except Exception:  # noqa: BLE001
+        pass
     await _safe_log(bot, live.error_card(
         code=code, stage=stage, account=str(acc.get("phone", "?")),
         worker=_worker_label(acc.get("id")), reason=reason, action=action,
@@ -310,10 +326,31 @@ async def _scanner_loop(bot, ex, aid):
                                   info.get("members"))
         else:
             code = info.get("code", core.SYS_ERR)
+            if code == core.ACC_RESTRICTED:
+                # temporary restriction, not a dead session -> cool down
+                adb.requeue_link(link)
+                _set_acc(aid, icon=live.IC_LIMIT, note="restricted")
+                await _err_card(bot, code=code, stage="scan", acc=acc,
+                                reason=info.get("error", ""),
+                                action="cooling down (scanner kept)")
+                await _interruptible_sleep(ACC_LIMIT_COOLDOWN)
+                _set_acc(aid, icon=live.IC_SCAN, note=None)
+                continue
             if core.is_fatal_account(code):
+                adb.requeue_link(link)        # hand its link back to the pool
+                if _note_auth_strike(aid) < AUTH_STRIKES:
+                    _set_acc(aid, icon=live.IC_LIMIT,
+                             note=f"auth error {engine.auth_strikes.get(aid, 0)}"
+                                  f"/{AUTH_STRIKES}")
+                    await _err_card(bot, code=code, stage="scan", acc=acc,
+                                    reason=info.get("error", ""),
+                                    action=f"strike {engine.auth_strikes.get(aid, 0)}"
+                                           f"/{AUTH_STRIKES} — cooling down")
+                    await _interruptible_sleep(ACC_LIMIT_COOLDOWN)
+                    _set_acc(aid, icon=live.IC_SCAN, note=None)
+                    continue
                 await _quarantine(bot, acc, "scan", info.get("error", ""))
                 engine.dead_scanners.add(aid)
-                adb.requeue_link(link)        # hand its link back to the pool
                 return
             if core.should_retry_link(code):
                 adb.requeue_link(link)        # not the link's fault -> retry later
@@ -344,7 +381,22 @@ async def _sender_loop(bot, ex, aid):
             _set_acc(aid, icon=live.IC_JOIN)
             res = await ex.join(acc, g["link"])
             if res.get("ok"):
-                adb.mark_group_joined(res["guid"] or g["guid"], aid)
+                # Mark the row WE assigned as joined, keyed by its OWN guid.
+                # Using the guid the join returned stranded the group in
+                # 'assigned' forever whenever the two differed, so the sender
+                # had nothing to send and sat idle.
+                adb.mark_group_joined(g["guid"], aid)
+                _rg = res.get("guid")
+                if _rg and _rg != g["guid"]:
+                    try:
+                        import curiosity
+                        curiosity.record(
+                            "join_guid_mismatch", phone=acc.get("phone", ""),
+                            method="join", note="preview vs join guid differ",
+                            raw={"assigned": g["guid"], "returned": _rg,
+                                 "link": g.get("link")})
+                    except Exception:  # noqa: BLE001
+                        pass
             else:
                 code = res.get("code", core.SYS_ERR)
                 if core.is_fatal_account(code):
@@ -392,12 +444,16 @@ async def _sender_loop(bot, ex, aid):
                 if res.get("ok"):
                     adb.incr_stats(aid, sent=1)
                     strikes[g["guid"]] = 0
+                    _clear_auth_strikes(aid)
+                    _set_acc(aid, icon=live.IC_SEND, note=None)
                 else:
                     adb.incr_stats(aid, fail=1)
                     code = res.get("code", core.SYS_ERR)
                     await _handle_send_fault(bot, ex, acc, aid, g, code,
                                              res.get("error", ""), strikes)
-                    if core.is_fatal_account(code):
+                    # only leave the loop when the account was ACTUALLY
+                    # quarantined (a strike/cooldown keeps it working)
+                    if aid in engine.quarantined:
                         return
                 await _interruptible_sleep(random.uniform(SEND_GAP_MIN, SEND_GAP_MAX))
         elif not joined:
@@ -416,6 +472,19 @@ async def _sender_loop(bot, ex, aid):
 
 
 async def _handle_send_fault(bot, ex, acc, aid, g, code, reason, strikes):
+    if code == core.ACC_RESTRICTED:
+        # Rubika is showing the user an alert = TEMPORARY restriction. The old
+        # automation (run_automation_local) never killed an account on a send
+        # error, and production accounts recovered afterwards — so cool down,
+        # KEEP the groups, and try again. Quarantine only after this keeps
+        # happening (see _note_auth_strike).
+        _set_acc(aid, icon=live.IC_LIMIT, note="restricted · cooling down")
+        await _err_card(bot, code=code, stage="send", acc=acc, reason=reason,
+                        action=f"cooling down {ACC_LIMIT_COOLDOWN}s "
+                               "(groups kept, account NOT quarantined)")
+        await _interruptible_sleep(ACC_LIMIT_COOLDOWN)
+        _set_acc(aid, icon=live.IC_SEND, note=None)
+        return
     if code == core.ACC_LIMIT:
         _set_acc(aid, icon=live.IC_LIMIT, note="rate-limited")
         await _err_card(bot, code=code, stage="send", acc=acc, reason=reason,
@@ -424,6 +493,19 @@ async def _handle_send_fault(bot, ex, acc, aid, g, code, reason, strikes):
         _set_acc(aid, note=None)
         return
     if core.is_fatal_account(code):
+        # Be as forgiving as the OLD automation: one auth error on a send never
+        # killed an account there. Give the account AUTH_STRIKES chances
+        # (spread over cooldowns, groups kept) before quarantining it.
+        if _note_auth_strike(aid) < AUTH_STRIKES:
+            _set_acc(aid, icon=live.IC_LIMIT,
+                     note=f"auth error {engine.auth_strikes.get(aid, 0)}"
+                          f"/{AUTH_STRIKES} · cooling down")
+            await _err_card(bot, code=code, stage="send", acc=acc, reason=reason,
+                            action=f"strike {engine.auth_strikes.get(aid, 0)}"
+                                   f"/{AUTH_STRIKES} — cooling down, groups kept")
+            await _interruptible_sleep(ACC_LIMIT_COOLDOWN)
+            _set_acc(aid, icon=live.IC_SEND, note=None)
+            return
         await _quarantine(bot, acc, "send", reason)
         return
     if core.is_group_fault(code):
@@ -443,6 +525,19 @@ async def _handle_send_fault(bot, ex, acc, aid, g, code, reason, strikes):
             await _err_card(bot, code=code, stage="send", acc=acc,
                             reason=reason, action=action)
             _replace_group(aid)
+
+
+def _note_auth_strike(aid) -> int:
+    """Count an auth failure for this account and return the new count."""
+    n = engine.auth_strikes.get(aid, 0) + 1
+    engine.auth_strikes[aid] = n
+    return n
+
+
+def _clear_auth_strikes(aid) -> None:
+    """A successful send proves the account works — forget earlier strikes."""
+    if engine.auth_strikes.get(aid):
+        engine.auth_strikes.pop(aid, None)
 
 
 def _replace_group(aid):

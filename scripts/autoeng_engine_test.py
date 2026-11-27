@@ -101,10 +101,12 @@ class FakeExecutor:
                 "members": h.get("members", 0), "approval": h.get("approval", False)}
 
     async def join(self, acc, link):
-        # find guid from health by link
+        # find guid from health by link; for groups banked straight into the DB
+        # (no preview) there is no health entry, so report no guid — the engine
+        # must then keep using the guid it assigned.
         h = self.health.get(link, {})
-        guid = h.get("guid", "G?")
-        if guid in self.join_fail:
+        guid = h.get("guid")
+        if guid and guid in self.join_fail:
             return {"ok": False, "code": self.join_fail[guid], "error": "joinfail"}
         return {"ok": True, "guid": guid}
 
@@ -417,6 +419,79 @@ def test_banked_reserve_is_handed_out_at_start():
        "the hand-out is reported to the owner")
 
 
+#: the EXACT body Rubika returned in production on 2026-11-27
+_RESTRICT_ERR = ("InvalidAuth({'status': 'ERROR_GENERIC', 'status_det': "
+                 "'INVALID_AUTH', 'client_show_message': {'link': {'type': "
+                 "'alert', 'alert_data': {'message': 'کاربر گرامی، حساب شما "
+                 "موقتا محدود شده است'}}}})")
+
+
+def test_rubika_restriction_is_not_a_dead_session():
+    """REGRESSION: Rubika returns INVALID_AUTH for a TEMPORARY restriction too,
+    with a user-facing alert attached. Three healthy accounts were quarantined
+    for this in production. It must be read as 'restricted', not 'dead'."""
+    msg = core.alert_message(_RESTRICT_ERR)
+    ok("کاربر گرامی" in msg, f"Rubika's own alert text is extracted ({msg!r})")
+    ok(core.is_restricted(_RESTRICT_ERR), "recognised as a restriction")
+    ok(not core.is_restricted("InvalidAuth({'status_det': 'INVALID_AUTH'})"),
+       "a plain INVALID_AUTH is NOT a restriction")
+    eq(core.alert_message("some other error"), "",
+       "a normal error carries no alert")
+
+    # end-to-end: an account hit by this must keep working, not be quarantined
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    adb.set("groups_per", 2)
+    for i in range(6):
+        adb.upsert_group(f"G{i}", f"l{i}", f"g{i}", adb.G_HEALTHY)
+    bot = FakeBot(_accounts(4))
+    ex = FakeExecutor([], {})
+    orig = ex.send
+
+    async def restricted(acc, guid, text):
+        if acc["id"] == 2:
+            return {"ok": False, "code": core.ACC_RESTRICTED,
+                    "error": "کاربر گرامی، حساب شما موقتا محدود شده است"}
+        return await orig(acc, guid, text)
+    ex.send = restricted
+    eng.ACC_LIMIT_COOLDOWN = 0.05
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=1.5))
+    ok(2 not in eng.engine.quarantined,
+       "a restricted account is NOT quarantined")
+    kept = len(adb.groups_of(2, adb.G_JOINED)) + len(adb.groups_of(2, adb.G_ASSIGNED))
+    ok(kept > 0, f"its groups are KEPT for when the restriction lifts ({kept})")
+    ok(any("ACC_RESTRICTED" in t for t in bot.logs),
+       "the owner sees the real reason, not 'session invalid'")
+
+
+def test_single_auth_error_does_not_quarantine():
+    """The OLD automation never killed an account on a send error. One real
+    auth error must only be a strike; it takes AUTH_STRIKES to quarantine."""
+    _fresh_db()
+    adb.add_text("ad")
+    adb.set("channels", "@s")
+    adb.set("groups_per", 2)
+    for i in range(6):
+        adb.upsert_group(f"G{i}", f"l{i}", f"g{i}", adb.G_HEALTHY)
+    bot = FakeBot(_accounts(4))
+    ex = FakeExecutor([], {})
+    eng.ACC_LIMIT_COOLDOWN = 0.05
+    hits = {"n": 0}
+    orig = ex.send
+
+    async def one_bad(acc, guid, text):
+        if acc["id"] == 2 and hits["n"] < 1:
+            hits["n"] += 1
+            return {"ok": False, "code": core.ACC_DEAD, "error": "INVALID_AUTH"}
+        return await orig(acc, guid, text)
+    ex.send = one_bad
+    _arun(_run_engine(bot, ex, [1, 2, 3, 4], seconds=1.5))
+    ok(2 not in eng.engine.quarantined,
+       "a SINGLE auth error does not quarantine (old-automation behaviour)")
+    eq(eng.AUTH_STRIKES, 3, "three strikes before giving up")
+
+
 def test_empty_scan_is_reported():
     """A scan that yields nothing must SAY so — the 0/0 card was the most
     confusing state in production."""
@@ -468,6 +543,8 @@ def main():
                test_busy_accounts_skipped,
                test_broken_executor_never_leaves_engine_half_started,
                test_banked_reserve_is_handed_out_at_start,
+               test_rubika_restriction_is_not_a_dead_session,
+               test_single_auth_error_does_not_quarantine,
                test_empty_scan_is_reported,
                test_stats_start_from_zero_each_run,
                test_live_state_shape):

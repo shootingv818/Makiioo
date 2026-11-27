@@ -154,9 +154,21 @@ async def send_to(phone: str, guid: str, text: str) -> dict:
     try:
         await account_conn.call(pn, _do, timeout=SEND_TIMEOUT + 15)
         return {"ok": True}
-    except account_conn.InvalidAuthError:
+    except account_conn.InvalidAuthError as e:
+        # Rubika also returns INVALID_AUTH for a TEMPORARY restriction, with a
+        # user-facing alert attached. That is NOT a dead session: the old
+        # automation never killed an account on a send error, and the accounts
+        # seen in production were healthy again afterwards.
+        msg = core.alert_message(e)
+        if msg:
+            return {"ok": False, "code": core.ACC_RESTRICTED, "error": msg,
+                    "alert": msg}
         return {"ok": False, "code": core.ACC_DEAD, "error": "session invalid"}
     except Exception as e:  # noqa: BLE001
+        msg = core.alert_message(e)
+        if msg:
+            return {"ok": False, "code": core.ACC_RESTRICTED, "error": msg,
+                    "alert": msg}
         return {"ok": False, "code": core.classify_error(e, context="send"),
                 "error": repr(e)[:160]}
 

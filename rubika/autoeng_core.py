@@ -142,6 +142,10 @@ WORKER_TOKENS = ("WORKER", "502", "503", "504", "BEARER", "UNAUTHORIZED",
 
 # engine-specific codes
 ACC_DEAD = "ACC_SESSION"      # session invalid -> quarantine
+ACC_RESTRICTED = "ACC_RESTRICTED"   # Rubika showed a user-facing alert: the
+#                                     account is TEMPORARILY restricted, not
+#                                     dead. Cool down and retry; never
+#                                     quarantine on this alone.
 ACC_LIMIT = "ACC_LIMIT"       # rate limited -> cool down, NOT a group fault
 GRP_BLOCKED = "GRP_BLOCKED"   # muted / banned / cannot send here
 GRP_APPROVAL = "GRP_APPROVAL"  # join needs admin approval -> skip
@@ -184,6 +188,48 @@ def classify_error(err, *, context: str = "send") -> str:
     if any(t in text for t in NET_TOKENS):
         return NET_ERR
     return SYS_ERR
+
+
+def alert_message(err) -> str:
+    """Rubika's own user-facing text, when it ships one.
+
+    A real sample from production:
+      InvalidAuth({'status':'ERROR_GENERIC','status_det':'INVALID_AUTH',
+                   'client_show_message':{'link':{'type':'alert',
+                   'alert_data':{'message':'کاربر گرامی، ...'}}}})
+
+    When this is present the account is being RESTRICTED (Rubika wants to show
+    the user a message), not logged out — so it must not be treated as a dead
+    session. Returns "" when there is no such message.
+    """
+    text = str(err) or ""
+    if "client_show_message" not in text:
+        return ""
+    # pull out the 'message': '...' value without eval'ing anything
+    key = "'message':"
+    i = text.find(key)
+    if i < 0:
+        key = '"message":'
+        i = text.find(key)
+    if i < 0:
+        return "restricted (no message text)"
+    rest = text[i + len(key):].lstrip()
+    if not rest:
+        return "restricted"
+    quote = rest[0]
+    if quote not in ("'", '"'):
+        return "restricted"
+    out = []
+    for ch in rest[1:]:
+        if ch == quote:
+            break
+        out.append(ch)
+    return "".join(out).strip()[:300] or "restricted"
+
+
+def is_restricted(err) -> bool:
+    """True when an auth-looking error is really a temporary restriction."""
+    return bool(alert_message(err))
 
 
 def is_fatal_account(code: str) -> bool:
