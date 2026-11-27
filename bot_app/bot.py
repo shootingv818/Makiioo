@@ -1421,6 +1421,8 @@ async def message_router(event):
         await handle_brain_file(event, st)
     elif step == "await_set_maxerr":
         await handle_set_maxerr(event, st)
+    elif step == "await_set_switches":
+        await handle_set_switches(event, st)
     elif step == "await_set_resume":
         await handle_set_resume(event, st)
     elif step == "await_set_senddelay":
@@ -1850,19 +1852,25 @@ async def send_prepare_cb(event):
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
 
+    # Two-phase send: strangers (no chat) first, then contacts we DO have a
+    # chat with. `mutual` already exists on send_order's records — it used to be
+    # thrown away here. `twoway_from` is the index where the two-way block
+    # starts, so the engine can jump there after 5 consecutive errors.
+    _ph_recips, _ph_from = _phase_order(ordered)
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
         "saved_guid": saved_guid,
         "mid": mid,
-        "recipients": [r["guid"] for r in ordered],
+        "recipients": _ph_recips,
+        "twoway_from": _ph_from,
     }
 
     await safe_edit(event, 
         card("🚀 READY TO SEND", [
             f"• Content   : marked message '{marker}' ✅",
             f"• Recipients: {len(ordered)} contacts",
-            "• Order     : with-chat -> online -> Last Seen",
+            f"• Phases    : 🔸 {_ph_from} one-way → 🔹 {len(_ph_recips) - _ph_from} two-way",
             LINE,
             "Send to these contacts?",
         ]),
@@ -1919,6 +1927,7 @@ async def send_text_prepare_cb(event):
         await safe_edit(event, "No contacts were found to send to.",
                          buttons=[[Button.inline("🔙 Back", f"acc_{account_id}".encode())]])
         return
+    _ph_recips, _ph_from = _phase_order(ordered)
     pending_send[event.sender_id] = {
         "account_id": account_id,
         "phone": acc["phone"],
@@ -1926,7 +1935,8 @@ async def send_text_prepare_cb(event):
         "text": body,
         "saved_guid": "",
         "mid": "",
-        "recipients": [r["guid"] for r in ordered],
+        "recipients": _ph_recips,
+        "twoway_from": _ph_from,
     }
     await safe_edit(event, 
         card("✍️ READY TO SEND PLAIN TEXT", [
@@ -1974,6 +1984,39 @@ async def stop_cb(event):
     await event.answer("Stop requested. It will stop after the current message.", alert=True)
 
 
+# Internal stop reason that asks the post-send hook to rotate the server
+# automatically and continue the remaining list there.
+_ROTATE_REASON = "ROTATE_SERVER: 5 consecutive errors on two-way contacts"
+
+
+def _self_mod():
+    """This module, for passing to the isolated helpers (same idiom as the
+    project's `import bot as _self`)."""
+    import bot as _self
+    return _self
+
+
+def _sp_streak_limit() -> int:
+    """The owner's FIXED 5 consecutive errors. Read from send_phase so the one
+    definition is shared with its tests; falls back to 5 if unavailable."""
+    try:
+        import send_phase
+        return int(send_phase.STREAK_LIMIT)
+    except Exception:  # noqa: BLE001
+        return 5
+
+
+def _phase_order(ordered_records):
+    """(guids, twoway_from) — one-way first, then two-way. Guarded: on ANY
+    failure it falls back to the previous behaviour (plain order, no phases),
+    so a send can never be blocked by the phase logic."""
+    try:
+        import send_integrate
+        return send_integrate.phase_split(ordered_records)
+    except Exception:  # noqa: BLE001
+        return [r["guid"] for r in ordered_records], 0
+
+
 class _HiddenSendImpossible(RuntimeError):
     """A hidden-sender run could not read its source post.
 
@@ -2018,6 +2061,14 @@ async def run_send(owner_id: int, payload: dict):
     delay = db.get_delay()
     max_errors = db.get_max_errors()
     resume_wait = db.get_resume_wait()
+    # Two-phase send: `twoway_from` is the index where the two-way block starts
+    # (set at prepare time). When phases are active the consecutive-error cap
+    # is the owner's FIXED 5, and hitting it means "switch phase / rotate"
+    # instead of the old cooldown-and-retry.
+    twoway_from = int(payload.get("twoway_from") or 0)
+    phases_on = 0 < twoway_from < len(recipients)
+    if phases_on:
+        max_errors = _sp_streak_limit()
     # YoudonoaAx UPDATE (step 5): optional Rubika SECOND text, sent (as plain
     # text) to the SAME recipient right AFTER the marker/forward. Always text.
     rb_text2 = db.get_rb_text2()
@@ -2044,7 +2095,23 @@ async def run_send(owner_id: int, payload: dict):
         f"🧯 Max consecutive errors : {max_errors}",
         (f"✍️ Mode : Custom text" if mode == "text"
          else f"📌 Marker : «{marker}» Found ✅"),
-    ]))
+    ] + ([f"🔸 One-way : {twoway_from}   🔹 Two-way : {total - twoway_from}"]
+         if phases_on else [])))
+
+    # ONE live card for the whole run, edited as it progresses (replaces the
+    # old "a new log message every 50 recipients" spam).
+    try:
+        import send_integrate as _si
+        _acc_now = db.get_account(account_id)
+        _wtag, _wip = _si.srot.current_server(_acc_now)
+        _si.live_begin(account_id, phone,
+                       total_oneway=(twoway_from if phases_on else 0),
+                       total_twoway=((total - twoway_from) if phases_on
+                                     else total),
+                       worker_tag=_wtag, worker_ip=_wip, tag=tag.strip("# "))
+        await _si.live_push(_self_mod(), account_id, force=True)
+    except Exception:  # noqa: BLE001
+        pass
 
     n = total
     idx = start_idx
@@ -2136,19 +2203,38 @@ async def run_send(owner_id: int, payload: dict):
                         except Exception:
                             pass
                     attempt_fail = 0          # count CONSECUTIVE errors only
-                    done_ok = base_ok + ok
-                    if config.SEND_LOG_EVERY > 0 and done_ok % config.SEND_LOG_EVERY == 0:
-                        grand_total = base_ok + total
-                        pct = int(done_ok * 100 / grand_total) if grand_total else 0
-                        await log(card("📊 SEND PROGRESS", [
-                            f"{_lbl()}📱 {phone}",
-                            f"✅ {done_ok} of {grand_total} — {pct}%",
-                            f"⏳ Remaining : {max(0, grand_total - done_ok)}",
-                            f"🕒 {now()}",
-                        ]))
+                    # live card instead of a new message every N recipients
+                    try:
+                        import send_integrate as _si
+                        _st = _si.live_state(account_id)
+                        if _st is not None:
+                            _st.record_ok(_si._live.get(account_id, {})
+                                          .get("worker_tag", "local"))
+                        _si.live_mark(account_id)
+                        await _si.live_push(_self_mod(), account_id)
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception as e:  # noqa: BLE001
                     fail += 1
                     attempt_fail += 1
+                    # live card + precise auth classification + raw capture
+                    try:
+                        import send_integrate as _si
+                        _st = _si.live_state(account_id)
+                        if _st is not None:
+                            _st.record_fail(_si._live.get(account_id, {})
+                                            .get("worker_tag", "local"))
+                        _si.live_mark(account_id)
+                        await _si.live_push(_self_mod(), account_id)
+                        await _si.note_auth_error(
+                            _self_mod(), e, stage="send", phone=phone,
+                            worker_tag=_si._live.get(account_id, {})
+                                               .get("worker_tag", "local"),
+                            worker_ip=_si._live.get(account_id, {})
+                                              .get("worker_ip", ""),
+                            action="verifying the session")
+                    except Exception:  # noqa: BLE001
+                        pass
                     if account_conn.is_auth_error(e):
                         try:
                             if await account_conn.verify_session_dead(phone):
@@ -2176,6 +2262,39 @@ async def run_send(owner_id: int, payload: dict):
                 break
             if not hit_max:                  # whole list finished
                 break
+            # ---- two-phase rule (owner): 5 consecutive errors ---------------
+            # in the ONE-WAY block -> Rubika is refusing strangers, the IP is
+            # fine: skip straight to the TWO-WAY block on the SAME server.
+            if phases_on and idx < twoway_from:
+                skipped = twoway_from - idx
+                idx = twoway_from
+                await log(card("🔸→🔹 SEND PHASE CHANGE", [
+                    f"{_lbl()}📱 {phone}",
+                    f"• One-way stopped after {max_errors} consecutive errors",
+                    f"• Skipped {skipped} remaining strangers",
+                    f"• Now sending to two-way contacts (same server)",
+                    f"🕒 {now()}"]))
+                try:
+                    import send_integrate as _si
+                    _st = _si.live_state(account_id)
+                    if _st is not None:
+                        _st.go_twoway()
+                        await _si.live_push(_self_mod(), account_id, force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+                continue
+            # ---- in the TWO-WAY block -> the IP is the suspect: ask for an
+            # automatic server rotation. We stop this leg and let the
+            # post-send hook do the (existing, proven) transfer + resume.
+            if phases_on:
+                try:
+                    import send_integrate as _si
+                    if _si.should_rotate(account_id, dead=False,
+                                         reason="consecutive send errors"):
+                        reason = _ROTATE_REASON
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
             if (not config.RESUME_UNLIMITED) and retry_count >= config.RESUME_MAX_RETRIES:
                 reason = f"Reached error cap ({max_errors})"
                 break
@@ -2223,6 +2342,14 @@ async def run_send(owner_id: int, payload: dict):
         except Exception:
             pass
         active_jobs.discard(account_id)
+
+    # final edit of the live card + the per-phase / per-server summary, before
+    # the stop/finish cards so the log reads in the right order.
+    try:
+        import send_integrate as _si
+        await _si.live_finish(_self_mod(), account_id)
+    except Exception:  # noqa: BLE001
+        pass
 
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
@@ -3844,7 +3971,14 @@ async def run_send_remote(owner_id: int, payload: dict):
         ]))
 
     prev_retry = 0
-    last_log_mark = 0
+    # ONE live card for this remote run too (same renderer as the local path).
+    try:
+        import send_integrate as _si
+        _si.live_begin(account_id, phone, total_oneway=0, total_twoway=total,
+                       worker_tag=w.get("tag") or "", worker_ip=w.get("ip") or "")
+        await _si.live_push(_self_mod(), account_id, force=True)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         res = await worker.api_call(w, "POST", "/send/start", {
             "phone": phone, "marker": marker, "delay": delay,
@@ -3894,16 +4028,25 @@ async def run_send_remote(owner_id: int, payload: dict):
                                 db.pool_mark_contact_sent(pool_job_id, g)
                             except Exception:
                                 pass
-                # progress log every SEND_LOG_EVERY successful sends (+ percent)
-                if config.SEND_LOG_EVERY > 0 and ok // config.SEND_LOG_EVERY > last_log_mark:
-                    last_log_mark = ok // config.SEND_LOG_EVERY
-                    pct = int(ok * 100 / total) if total else 0
-                    await log(card("📊 SEND PROGRESS", [
-                        f"📱 {phone} (worker {w['tag']})",
-                        f"✅ {ok} of {total} — {pct}%",
-                        f"⏳ Remaining : {max(0, total - ok - fail)}",
-                        f"🕒 {now()}",
-                    ]))
+                # ONE live card, edited as the worker progresses (replaces the
+                # every-50-recipients messages). The worker reports cumulative
+                # ok/fail, so we sync the card to those totals.
+                try:
+                    import send_integrate as _si
+                    _st = _si.live_state(account_id)
+                    if _st is not None:
+                        _tot = _st.stats[_si.sp.PHASE_ONEWAY]["sent"] + \
+                               _st.stats[_si.sp.PHASE_TWOWAY]["sent"]
+                        _tfa = _st.stats[_si.sp.PHASE_ONEWAY]["fail"] + \
+                               _st.stats[_si.sp.PHASE_TWOWAY]["fail"]
+                        for _ in range(max(0, ok - _tot)):
+                            _st.record_ok(w.get("tag") or "")
+                        for _ in range(max(0, fail - _tfa)):
+                            _st.record_fail(w.get("tag") or "")
+                        _si.live_mark(account_id)
+                        await _si.live_push(_self_mod(), account_id)
+                except Exception:  # noqa: BLE001
+                    pass
                 # auto-resume happening on the worker -> master posts the ALERT
                 rc = stt.get("retry_count", 0)
                 if rc > prev_retry:
@@ -3942,6 +4085,13 @@ async def run_send_remote(owner_id: int, payload: dict):
     dur = str(datetime.now() - started).split(".")[0]
     pending_send.pop(owner_id, None)
     is_owner_user = owner_id == config.OWNER_ID
+
+    # final edit of the live card + per-server summary (same as the local path)
+    try:
+        import send_integrate as _si
+        await _si.live_finish(_self_mod(), account_id)
+    except Exception:  # noqa: BLE001
+        pass
 
     if reason:
         await log(card("🔁 RESUME STOPPED ⛔" if is_resume else "⛔ SEND STOPPED", [
@@ -6486,6 +6636,48 @@ async def _offer_resume_after_send(owner_id: int, info: dict):
     remaining = info.get("recipients") or []
     dead = info.get("dead")
     is_remote = bool(info.get("remote"))
+    # AUTOMATIC server rotation. This is the single point BOTH the local and
+    # the remote send path reach when a run stops with work left, so hooking
+    # here covers both. It performs exactly what the manual
+    # "🔁 Login to New Worker & Continue" button does (resume_relogin_cb),
+    # without asking: pick an untried worker -> code-free /session/import ->
+    # continue the remaining list. Guarded end-to-end: on ANY problem we fall
+    # through to the normal manual panel below.
+    if remaining and not dead:
+        try:
+            import send_integrate as _si
+            _reason = str(info.get("reason") or "")
+            if _si.should_rotate(account_id, dead=bool(dead), reason=_reason):
+                _self = _self_mod()
+                # persist the remaining list FIRST so the resume has it even if
+                # the transfer or the restart goes wrong.
+                _payload = {
+                    "saved_guid": info.get("saved_guid"), "mid": info.get("mid"),
+                    "recipients": remaining,
+                    "base_ok": int(info.get("base_ok") or 0),
+                    "tag": info.get("tag") or "", "remote": is_remote,
+                    "worker_id": info.get("worker_id"),
+                    "tried_workers": worker_transfer.get_tried(account_id),
+                    "mode": (info.get("mode") or "").lower()
+                            or ("text" if info.get("text") else "marker"),
+                    "text": info.get("text") or "",
+                    "text2": info.get("text2") or "",
+                    "twoway_from": 0,     # the remaining list is already two-way
+                }
+                try:
+                    db.save_paused_send(account_id, owner_id, phone, _payload)
+                except Exception:  # noqa: BLE001
+                    pass
+                if await _si.auto_rotate(_self, account_id, phone,
+                                         reason=_reason or "consecutive send errors",
+                                         resume_at=int(info.get("base_ok") or 0)):
+                    await _do_resume(owner_id, account_id)
+                    return
+        except Exception as _re:  # noqa: BLE001
+            await log(card("⚠️ AUTO ROTATION — skipped", [
+                f"📱 {phone}", f"• {repr(_re)[:150]}",
+                "• Falling back to the manual transfer panel.",
+                f"🕒 {now()}"]))
     if remaining or is_remote:
         # worker-transfer bug fix: ALWAYS store the send method explicitly so a
         # later resume/transfer never falls back to the marker default. `mode`
@@ -9525,12 +9717,128 @@ def _settings_buttons():
          Button.inline("⏸ Pause Duration", b"set_resume")],
         [Button.inline("⏱ Send Speed", b"set_senddelay"),
          Button.inline("📇 Contact Speed", b"set_cspeed")],
+        [Button.inline("🔄 Server Switches", b"set_switches"),
+         Button.inline("🔍 Curiosity", b"curio")],
         [Button.inline("🧠 Brain Cap", b"set_braincap")],
         [Button.inline("🔎 Friend-discovery Cap", b"set_disctarget")],
         [Button.inline("🔎 Discovery Attempts Cap", b"set_discattempts")],
         [Button.inline("📢 Campaign", b"campaign")],
         [Button.inline("🔙 Back", b"home")],
     ]
+
+
+@bot.on(events.CallbackQuery(data=b"set_switches"))
+async def set_switches_cb(event):
+    """How many times a send may move the account to another server."""
+    if not is_owner(event):
+        return
+    state[event.sender_id] = {"step": "await_set_switches"}
+    try:
+        import send_rotate
+        cur = send_rotate.max_switches()
+    except Exception:  # noqa: BLE001
+        cur = 3
+    await safe_edit(event, card("🔄 Automatic Server Switches", [
+        f"• Current : {cur}",
+        LINE,
+        "After 5 consecutive errors on two-way contacts the send moves the",
+        "account to another server (no code needed) and continues from where",
+        "it stopped. There is a 3-minute gap between switches.",
+        "Send the number of switches allowed (0 disables it):"]),
+        buttons=[[Button.inline("🔙 Back", b"settings")]])
+
+
+async def handle_set_switches(event, st):
+    val = (event.raw_text or "").strip()
+    state.pop(event.sender_id, None)
+    if not val.isdigit():
+        await event.respond("Send a number, please.",
+                            buttons=[[Button.inline("🔙 Back", b"settings")]])
+        return
+    try:
+        import send_rotate
+        send_rotate.set_max_switches(int(val))
+    except Exception as e:  # noqa: BLE001
+        await event.respond(f"Could not save: {repr(e)[:120]}")
+        return
+    await event.respond(card("🔄 Saved ✅", [f"• Server switches : {int(val)}",
+                                            f"🕒 {now()}"]),
+                        buttons=[[Button.inline("🔙 Settings", b"settings")]])
+
+
+# --------------------------------------------------------------------------- #
+# Curiosity mode: silent collection of RAW Rubika answers + a .txt export.
+# Always on in the background; it never posts to the log group.
+# --------------------------------------------------------------------------- #
+@bot.on(events.CallbackQuery(data=b"curio"))
+async def curiosity_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        st = curiosity.stats()
+    except Exception as e:  # noqa: BLE001
+        await safe_edit(event, card("🔍 Curiosity — error", [repr(e)[:160]]),
+                        buttons=[[Button.inline("🔙 Back", b"settings")]])
+        return
+    kinds = ", ".join(f"{k}:{v}" for k, v in sorted(st["kinds"].items())) or "—"
+    await safe_edit(event, card("🔍 Curiosity Mode", [
+        f"• Status  : {'🟢 collecting' if st['enabled'] else '⚪ off'}",
+        f"• Records : {st['records']}",
+        f"• Accounts: {st['accounts']}",
+        f"• Size    : {st['bytes']} bytes",
+        f"• Kinds   : {kinds}",
+        LINE,
+        "Silently stores the RAW answers Rubika gives (sessions, auth bodies,",
+        "unknown errors). Nothing is posted to the log group.",
+        "Export it as a .txt to look for things we don't know yet."]),
+        buttons=[[Button.inline("📄 Get .txt", b"curio_txt")],
+                 [Button.inline("⚪ Turn off" if st["enabled"] else "🟢 Turn on",
+                                b"curio_tog")],
+                 [Button.inline("🗑 Clear data", b"curio_clear")],
+                 [Button.inline("🔙 Back", b"settings")]])
+
+
+@bot.on(events.CallbackQuery(data=b"curio_tog"))
+async def curiosity_toggle_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        curiosity.set_enabled(not curiosity.is_enabled())
+    except Exception:  # noqa: BLE001
+        pass
+    await curiosity_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"curio_clear"))
+async def curiosity_clear_cb(event):
+    if not is_owner(event):
+        return
+    try:
+        import curiosity
+        curiosity.clear()
+        await event.answer("Cleared.")
+    except Exception:  # noqa: BLE001
+        pass
+    await curiosity_cb(event)
+
+
+@bot.on(events.CallbackQuery(data=b"curio_txt"))
+async def curiosity_txt_cb(event):
+    if not is_owner(event):
+        return
+    await event.answer("Building the file ...")
+    try:
+        import curiosity
+        path = curiosity.export_txt()
+        await bot.send_file(event.sender_id, path,
+                            caption=card("🔍 Curiosity export", [
+                                f"• Records : {curiosity.stats()['records']}",
+                                f"🕒 {now()}"]))
+    except Exception as e:  # noqa: BLE001
+        await bot.send_message(event.sender_id,
+                               f"❌ Export failed: {repr(e)[:160]}")
 
 
 @bot.on(events.CallbackQuery(data=b"settings"))
