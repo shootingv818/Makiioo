@@ -2066,7 +2066,13 @@ async def run_send(owner_id: int, payload: dict):
     # is the owner's FIXED 5, and hitting it means "switch phase / rotate"
     # instead of the old cooldown-and-retry.
     twoway_from = int(payload.get("twoway_from") or 0)
-    phases_on = 0 < twoway_from < len(recipients)
+    # a phase order was applied at prepare time (there are one-way contacts)
+    has_split = twoway_from > 0
+    # ... and there is an actual two-way block to fall back to. When every
+    # contact is one-way these differ, and jumping would land on the END of the
+    # list — which silently "finished" a run with the rest never tried.
+    can_jump = 0 < twoway_from < len(recipients)
+    phases_on = has_split
     if phases_on:
         max_errors = _sp_streak_limit()
     # YoudonoaAx UPDATE (step 5): optional Rubika SECOND text, sent (as plain
@@ -2265,14 +2271,15 @@ async def run_send(owner_id: int, payload: dict):
             # ---- two-phase rule (owner): 5 consecutive errors ---------------
             # in the ONE-WAY block -> Rubika is refusing strangers, the IP is
             # fine: skip straight to the TWO-WAY block on the SAME server.
-            if phases_on and idx < twoway_from:
+            if can_jump and idx < twoway_from:
                 skipped = twoway_from - idx
                 idx = twoway_from
                 await log(card("🔸→🔹 SEND PHASE CHANGE", [
                     f"{_lbl()}📱 {phone}",
                     f"• One-way stopped after {max_errors} consecutive errors",
                     f"• Skipped {skipped} remaining strangers",
-                    f"• Now sending to two-way contacts (same server)",
+                    f"• Now sending to {n - twoway_from} two-way contacts "
+                    "(same server)",
                     f"🕒 {now()}"]))
                 try:
                     import send_integrate as _si
@@ -2283,10 +2290,19 @@ async def run_send(owner_id: int, payload: dict):
                 except Exception:  # noqa: BLE001
                     pass
                 continue
-            # ---- in the TWO-WAY block -> the IP is the suspect: ask for an
-            # automatic server rotation. We stop this leg and let the
-            # post-send hook do the (existing, proven) transfer + resume.
+            # ---- no phase fallback left (we are in the two-way block, or this
+            # account has NO two-way contacts at all) -> the IP is the suspect:
+            # ask for an automatic server rotation. We stop this leg and let the
+            # post-send hook do the (existing, proven) transfer + resume, which
+            # continues the UNTRIED remainder on the new server.
             if phases_on:
+                if not can_jump:
+                    await log(card("🔸 ONE-WAY BLOCKED — no two-way contacts", [
+                        f"{_lbl()}📱 {phone}",
+                        f"• {max_errors} consecutive errors and this account has",
+                        "  no contacts with an existing chat to fall back to.",
+                        f"• {max(0, n - idx)} recipients left",
+                        f"🕒 {now()}"]))
                 try:
                     import send_integrate as _si
                     if _si.should_rotate(account_id, dead=False,

@@ -170,11 +170,45 @@ def test_live_sync_remote_mirrors_worker_phases():
     eq(st2.total_fail(), 3, "old worker's failures still counted")
 
 
+def test_no_twoway_contacts_asks_for_rotation():
+    """PRODUCTION 2026-11-27 18:14: the account had 1699 contacts and ZERO
+    two-way ones, so twoway_from == n. The jump landed on the END of the list:
+    the run 'FINISHED' with 1508 recipients never tried and no rotation. Now
+    the jump is refused in that case and a rotation is requested instead."""
+    # the pure helper always knew this; the call sites did not use it
+    eq(sp.PhaseState([1, 2, 3], []).next_action.__self__.two_way, [],
+       "a state with no two-way block has an empty two-way list")
+    st = sp.PhaseState([1, 2, 3, 4, 5, 6], [])     # strangers only
+    for _ in range(5):
+        st.record_fail()
+    eq(st.next_action(), sp.ACT_STOP,
+       "no two-way list -> never claim a phase jump is possible")
+
+    # worker: only jumps when the two-way block really exists
+    ok("idx < _tw < n" in WAPI,
+       "the worker jumps ONLY when a two-way block exists")
+    ok("_tw >= n and idx < n" in WAPI,
+       "with no two-way contacts the worker stops so the master can rotate")
+    ok("ONE-WAY BLOCKED" in WAPI, "the worker says why it stopped")
+
+    # master: same guard, and rotation is no longer gated on being able to jump
+    b = _fn_src(BOT, "run_send")
+    ok("can_jump" in b, "the master distinguishes 'a split exists' from 'can jump'")
+    ok("if can_jump and idx < twoway_from" in b,
+       "the master jumps only when there IS a two-way block")
+    ok("ONE-WAY BLOCKED" in b, "the master reports the no-fallback case")
+    i_jump = b.find("if can_jump and idx < twoway_from")
+    i_rot = b.find("_ROTATE_REASON")
+    ok(i_jump != -1 and i_rot != -1 and i_rot > i_jump,
+       "rotation is requested AFTER the jump option is exhausted")
+
+
 def main():
     if "--selftest" not in sys.argv:
         print("usage: send_remote_phase_test.py --selftest")
         return 0
-    for fn in (test_worker_accepts_and_applies_phase_order,
+    for fn in (test_no_twoway_contacts_asks_for_rotation,
+               test_worker_accepts_and_applies_phase_order,
                test_master_requests_phase_order_only_for_fresh_runs,
                test_worker_phase_jump, test_live_begin_after_total_is_known,
                test_counters_never_vanish_in_done_state,

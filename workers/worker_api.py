@@ -1782,7 +1782,12 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
             # block instead of cooling down. The master sees the phase flip via
             # /send/status and only rotates the server if THIS block fails too.
             _tw = job.get("twoway_from") or 0
-            if _tw and idx < _tw:
+            # Only jump when there IS a two-way block to jump to. When every
+            # contact is one-way, `twoway_from == n`, and jumping landed on the
+            # END of the list: the run "finished" with the rest never tried and
+            # no server rotation attempted. In that case fall through so the
+            # master sees the error stop and can rotate the IP instead.
+            if _tw and idx < _tw < n:
                 _skipped = _tw - idx
                 idx = _tw
                 job["phase"] = "twoway"
@@ -1791,8 +1796,18 @@ async def _run_send(client, job: dict, saved_guid, mid, recipients, body):
                     f"📱 {job.get('phone')}",
                     f"• One-way stopped after {body.max_errors} consecutive errors",
                     f"• Skipped {_skipped} remaining strangers",
-                    "• Now sending to two-way contacts (same server)"]))
+                    f"• Now sending to {n - _tw} two-way contacts (same server)"]))
                 continue
+            if _tw and _tw >= n and idx < n:
+                # no two-way contacts at all -> this is an IP/account problem
+                job["reason"] = f"max_errors({body.max_errors})"
+                job["phase"] = "oneway"
+                _qlog(_wcard("🔸 ONE-WAY BLOCKED — no two-way contacts", [
+                    f"📱 {job.get('phone')}",
+                    f"• {body.max_errors} consecutive errors and this account",
+                    "  has no contacts with an existing chat to fall back to.",
+                    f"• {n - idx} recipients left — asking the master to rotate"]))
+                break
             # max_retries <= 0 means UNLIMITED resume (keep going until done)
             if body.max_retries > 0 and job["retry_count"] >= body.max_retries:
                 job["reason"] = f"max_errors({body.max_errors})"
