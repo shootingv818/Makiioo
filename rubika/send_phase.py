@@ -45,16 +45,29 @@ def split_recipients(ordered_records: list) -> tuple:
     """Split send_order's ordered records into (one_way, two_way) guid lists,
     PRESERVING the existing order inside each group.
 
-    `mutual` is send_order.classify()'s own flag: True means a real two-way
-    conversation. Anything else is a stranger (one-way). Records already
-    excluded by send_order are expected to be filtered out by the caller.
+    The owner's definition decides the split:
+        one-way = we have NO chat with them  (send_order's `has_chat` is False)
+        two-way = a chat exists              (`has_chat` is True)
+
+    NOT `mutual`, which is stricter (a chat PLUS they wrote or read). Using
+    `mutual` put "has a chat but never replied" into the one-way bucket, so the
+    send still went to chat contacts early — the exact symptom reported.
+
+    `has_chat` is additive, so a record from an older build that lacks it falls
+    back to `mutual` (previous behaviour) rather than being misclassified.
     """
     one_way, two_way = [], []
     for r in ordered_records or []:
-        guid = r.get("guid") if isinstance(r, dict) else None
+        if not isinstance(r, dict):
+            continue
+        guid = r.get("guid")
         if not guid:
             continue
-        (two_way if (isinstance(r, dict) and r.get("mutual")) else one_way).append(guid)
+        if "has_chat" in r:
+            is_two = bool(r.get("has_chat"))
+        else:
+            is_two = bool(r.get("mutual"))
+        (two_way if is_two else one_way).append(guid)
     return one_way, two_way
 
 

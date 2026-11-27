@@ -45,16 +45,43 @@ def eq(a, b, msg):
 # --------------------------------------------------------------------------- #
 def test_split():
     recs = [
-        {"guid": "s1", "mutual": False},
-        {"guid": "m1", "mutual": True},
-        {"guid": "s2", "mutual": False},
-        {"guid": "m2", "mutual": True},
-        {"guid": "", "mutual": True},        # no guid -> dropped
+        {"guid": "s1", "has_chat": False, "mutual": False},
+        {"guid": "m1", "has_chat": True, "mutual": True},
+        {"guid": "s2", "has_chat": False, "mutual": False},
+        {"guid": "m2", "has_chat": True, "mutual": True},
+        {"guid": "", "has_chat": True, "mutual": True},   # no guid -> dropped
     ]
     one, two = sp.split_recipients(recs)
     eq(one, ["s1", "s2"], "one-way = no chat, order preserved")
     eq(two, ["m1", "m2"], "two-way = has chat, order preserved")
     eq(sp.split_recipients([]), ([], []), "empty input safe")
+    ok(sp.split_recipients([None, 5, "x"]) == ([], []),
+       "non-dict rows are ignored safely")
+
+
+def test_split_uses_has_chat_not_mutual():
+    """REGRESSION: the owner's rule is 'one-way = we have NO chat with them'.
+    Using `mutual` (a chat PLUS they wrote/read) put 'has a chat but never
+    replied' into the one-way bucket, so the send still hit chat contacts
+    early — the symptom reported after the first fix."""
+    recs = [
+        {"guid": "stranger", "has_chat": False, "mutual": False},
+        # a chat exists, but they never wrote and never read -> mutual False
+        {"guid": "chat_no_reply", "has_chat": True, "mutual": False},
+        {"guid": "chat_replied", "has_chat": True, "mutual": True},
+    ]
+    one, two = sp.split_recipients(recs)
+    eq(one, ["stranger"], "ONLY the no-chat contact is one-way")
+    eq(two, ["chat_no_reply", "chat_replied"],
+       "every contact WITH a chat is two-way, answered or not")
+    ok("chat_no_reply" not in one,
+       "a chat contact that never replied is NOT treated as a stranger")
+
+    # records from an older build (no has_chat) fall back to mutual
+    old = [{"guid": "a", "mutual": False}, {"guid": "b", "mutual": True}]
+    one2, two2 = sp.split_recipients(old)
+    eq((one2, two2), (["a"], ["b"]),
+       "records without has_chat fall back to the previous behaviour")
 
 
 def test_streak_resets_on_success():
@@ -195,7 +222,8 @@ def main():
     if "--selftest" not in sys.argv:
         print("usage: send_phase_test.py --selftest")
         return 0
-    for fn in (test_split, test_streak_resets_on_success,
+    for fn in (test_split, test_split_uses_has_chat_not_mutual,
+               test_streak_resets_on_success,
                test_phase1_five_errors_goes_twoway_same_server,
                test_phase1_exhausted_goes_twoway,
                test_phase2_five_errors_switches_server,

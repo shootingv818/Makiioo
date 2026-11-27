@@ -307,6 +307,11 @@ def classify(user, sig: dict | None) -> dict:
         "tier": tier,
         "excluded": excluded,
         "mutual": mutual,
+        # ADDITIVE: does a chat with this contact exist at all? `mutual` is
+        # stricter (a chat PLUS they wrote/read), so it cannot answer "do we
+        # have a chat with them". The two-phase send needs exactly this
+        # distinction: one-way = no chat, two-way = a chat exists.
+        "has_chat": has_chat,
         "exact": pres["exact"],
         "ts": pres["ts"],
         "bucket": pres["bucket"],
